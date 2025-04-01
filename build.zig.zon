@@ -1,0 +1,20 @@
+.{
+    .name = .horizon,
+    .version = "0.0.0",
+    .fingerprint = 0x8a2bde448f7b7c4,
+
+    .minimum_zig_version = "0.14.0",
+
+    .dependencies = .{
+        .zeit = .{
+            .url = "git+https://github.com/rockorager/zeit#175cf91a641790799e9d676878a9fe814aaed134",
+            .hash = "zeit-0.6.0-5I6bk5daAgC-P60TjxRqW0bYknfCGxJp-03eS9UjGrO7",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
