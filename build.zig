@@ -20,63 +20,52 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
-    {
-        // Horizon bench
-        const hz_exe = b.addExecutable(.{
-            .name = "horizon",
-            .root_source_file = b.path("bench/horizon.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        hz_exe.root_module.addImport("horizon", horizon_module);
-        b.installArtifact(hz_exe);
+    const bench_server = b.option(BenchServer, "bench-server", "Run a bench server") orelse .horizon;
+    const run_cmd: *std.Build.Step.Run = switch (bench_server) {
+        .go => b.addSystemCommand(&.{ "go", "run", "bench/main.go" }),
 
-        const run_cmd = b.addRunArtifact(hz_exe);
+        .horizon => blk: {
+            // Horizon bench
+            const hz_exe = b.addExecutable(.{
+                .name = "horizon",
+                .root_source_file = b.path("bench/horizon.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            hz_exe.root_module.addImport("horizon", horizon_module);
+            b.installArtifact(hz_exe);
 
-        run_cmd.step.dependOn(b.getInstallStep());
+            break :blk b.addRunArtifact(hz_exe);
+        },
 
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
+        .httpz => blk: {
+            // http.zig bench
+            const httpz_exe = b.addExecutable(.{
+                .name = "http.zig",
+                .root_source_file = b.path("bench/http.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            const httpz = b.lazyDependency("httpz", .{ .target = target, .optimize = optimize });
+            httpz_exe.root_module.addImport("httpz", httpz.?.module("httpz"));
+            b.installArtifact(httpz_exe);
 
-        const run_step = b.step("bench-horizon", "Run horizon bench server");
-        run_step.dependOn(&run_cmd.step);
+            break :blk b.addRunArtifact(httpz_exe);
+        },
+    };
+
+    run_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
     }
-    {
-        // Go bench
-        const run_cmd = b.addSystemCommand(&.{ "go", "run", "bench/main.go" });
 
-        run_cmd.step.dependOn(b.getInstallStep());
-
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("bench-go", "Run golang bench server");
-        run_step.dependOn(&run_cmd.step);
-    }
-
-    {
-        // http.zig bench
-        const httpz_exe = b.addExecutable(.{
-            .name = "http.zig",
-            .root_source_file = b.path("bench/http.zig"),
-            .target = target,
-            .optimize = optimize,
-        });
-        const httpz = b.lazyDependency("httpz", .{ .target = target, .optimize = optimize });
-        httpz_exe.root_module.addImport("httpz", httpz.?.module("httpz"));
-        b.installArtifact(httpz_exe);
-
-        const run_cmd = b.addRunArtifact(httpz_exe);
-
-        run_cmd.step.dependOn(b.getInstallStep());
-
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-
-        const run_step = b.step("bench-httpz", "Run http.zig bench server");
-        run_step.dependOn(&run_cmd.step);
-    }
+    const run_step = b.step("bench", "Run a bench server");
+    run_step.dependOn(&run_cmd.step);
 }
+
+const BenchServer = enum {
+    go,
+    horizon,
+    httpz,
+};

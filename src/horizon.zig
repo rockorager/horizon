@@ -439,10 +439,14 @@ const Connection = struct {
         // We never write the phrase
         writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
 
-        writer.print("Content-Length: {d}\r\n", .{resp.body.items.len}) catch unreachable;
+        if (resp.headers.get("Content-Length") == null) {
+            writer.print("Content-Length: {d}\r\n", .{resp.body.items.len}) catch unreachable;
+        }
 
-        // TODO: sniff content type
-        writer.print("Content-Type: {s}\r\n", .{"text/plain"}) catch unreachable;
+        if (resp.headers.get("Content-Type") == null) {
+            // TODO: sniff content type
+            writer.print("Content-Type: {s}\r\n", .{"text/plain"}) catch unreachable;
+        }
 
         var iter = resp.headers.iterator();
         while (iter.next()) |h| {
@@ -512,20 +516,22 @@ const Connection = struct {
 
         self.written += @intCast(cqe.res);
 
-        // If the response didn't finish sending, try again
-        if (!self.responseComplete()) {
-            return self.send(ring);
-        }
+        switch (self.responseComplete()) {
+            // If the response didn't finish sending, try again
+            false => return self.send(ring),
 
-        switch (self.request.keepAlive()) {
-            false => return self.close(ring),
-            true => {
-                self.reset();
-                // prep another recv
-                const sqe = try getSqe(ring);
-                self.active += 1;
-                sqe.prep_recv(self.fd, &self.buf, 0);
-                sqe.user_data = @intFromPtr(&self.recv_c);
+            // Response sent. Decide if we should close the connection or keep it alive
+            true => switch (self.request.keepAlive()) {
+                false => return self.close(ring),
+
+                true => {
+                    self.reset();
+                    // prep another recv
+                    const sqe = try getSqe(ring);
+                    self.active += 1;
+                    sqe.prep_recv(self.fd, &self.buf, 0);
+                    sqe.user_data = @intFromPtr(&self.recv_c);
+                },
             },
         }
     }
