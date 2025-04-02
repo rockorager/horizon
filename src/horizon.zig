@@ -20,7 +20,7 @@ pub fn threadRun(
 ) !void {
     {
         // Initialize the ring
-        const flags2: u32 =
+        const flags: u32 =
             linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
             linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
             linux.IORING_SETUP_ATTACH_WQ | // Share work queue
@@ -28,16 +28,15 @@ pub fn threadRun(
             linux.IORING_SETUP_COOP_TASKRUN | // Don't interupt userspace when task is complete
             linux.IORING_SETUP_SINGLE_ISSUER; // Only a single thread will issue tasks
 
-        var params2 = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = flags2,
-            .sq_thread_idle = 1000,
+        var params = std.mem.zeroInit(linux.io_uring_params, .{
+            .flags = flags,
             .wq_fd = @as(u32, @intCast(wq_fd)),
         });
 
-        ring.* = try .init_params(64, &params2);
+        ring.* = try .init_params(64, &params);
     }
 
-    var cqes: [128]linux.io_uring_cqe = undefined;
+    var cqes: [32]linux.io_uring_cqe = undefined;
     while (true) {
         _ = try ring.submit();
 
@@ -53,6 +52,14 @@ pub fn threadRun(
         }
     }
 }
+
+fn getSqe(ring: *IoUring) !*linux.io_uring_sqe {
+    return ring.get_sqe() catch {
+        _ = ring.submit() catch 0;
+        return ring.get_sqe();
+    };
+}
+
 pub const Server = struct {
     ring: IoUring,
 
@@ -67,7 +74,7 @@ pub const Server = struct {
     msg_ring_c: Completion,
 
     pub const Options = struct {
-        entries: u16 = 256,
+        entries: u16 = 32,
         addr: ?net.Address = null,
     };
 
@@ -82,7 +89,6 @@ pub const Server = struct {
             net.Address.parseIp4("127.0.0.1", 8080) catch unreachable;
 
         const io_uring_flags: u32 =
-            // linux.IORING_SETUP_SQPOLL |
             linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
             linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
             linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks
@@ -102,7 +108,7 @@ pub const Server = struct {
 
         self.* = .{
             .ring = ring,
-            .rings = try gpa.alloc(IoUring, 13),
+            .rings = try gpa.alloc(IoUring, 12),
             .fd = fd,
             .addr = addr,
             .addr_len = addr.getOsSockLen(),
@@ -111,9 +117,9 @@ pub const Server = struct {
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
-        try posix.listen(fd, 512);
+        try posix.listen(fd, 64);
 
-        const sqe = try self.ring.get_sqe();
+        const sqe = try getSqe(&self.ring);
         const accept_flags: u32 = 0;
 
         sqe.prep_multishot_accept(self.fd, &self.addr.any, &self.addr_len, accept_flags);
@@ -123,6 +129,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.ring.deinit();
+        // TODO: proper shutdown of threads
     }
 
     pub fn run(self: *Server, gpa: Allocator) !void {
@@ -157,18 +164,20 @@ pub const Server = struct {
         switch (cqe.err()) {
             .SUCCESS => {},
             .INVAL => @panic("invalid submission"),
-            else => unreachable,
+            .CANCELED => return,
+            else => log.err("accept returned err={}", .{cqe.err()}),
         }
 
-        // Check if this is the last accept.
         if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-            // TODO: requeue the accept?
-            log.err("accept completion complete", .{});
-            log.err("cqe error: {}", .{cqe.err()});
+            // Multishot accept will return if it wasn't able to accept the next connection. Requeue it
+            const sqe = try getSqe(ring);
+            sqe.prep_multishot_accept(self.fd, &self.addr.any, &self.addr_len, 0);
+            sqe.user_data = @intFromPtr(&self.accept_c);
+            self.accept_c.active = true;
         }
 
         // Send the fd to another thread for handling
-        const sqe = try ring.get_sqe();
+        const sqe = try getSqe(ring);
         sqe.prep_rw(.MSG_RING, target_fd, 0, @intCast(cqe.res), @intFromPtr(&self.accept_c));
         sqe.user_data = @intFromPtr(&self.msg_ring_c);
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -189,8 +198,7 @@ pub fn handleCqe(
                 const srv: *Server = @alignCast(@fieldParentPtr("accept_c", c));
                 if (server) |s| {
                     const target = s.rings[s.next_ring].fd;
-                    s.next_ring += 1;
-                    if (s.next_ring == s.rings.len) s.next_ring = 0;
+                    s.next_ring = (s.next_ring + 1) % (s.rings.len);
                     try srv.acceptAndSend(ring, cqe, target);
                 } else {
                     try handleAccept(gpa, ring, cqe);
@@ -285,10 +293,6 @@ fn handleAccept(
     );
 }
 
-pub fn getBufferFromCqe(bg: *IoUring.BufferGroup, cqe: linux.io_uring_cqe) error{NoBufferSelected}![]u8 {
-    return @errorCast(bg.get_cqe(cqe));
-}
-
 const Connection = struct {
     arena: std.heap.ArenaAllocator,
 
@@ -315,9 +319,6 @@ const Connection = struct {
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
-    const response_fixed = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
-    const body_fixed = "hey";
-
     pub fn init(self: *Connection, gpa: Allocator, ring: *IoUring, fd: posix.socket_t) CallbackError!void {
         self.* = .{
             .arena = .init(gpa),
@@ -328,7 +329,7 @@ const Connection = struct {
 
         self.response = .{ .arena = self.arena.allocator() };
 
-        var sqe = try ring.get_sqe();
+        const sqe = try getSqe(ring);
         sqe.prep_recv(self.fd, &self.buf, 0);
         sqe.user_data = @intFromPtr(&self.recv_c);
 
@@ -338,10 +339,8 @@ const Connection = struct {
 
     pub fn maybeDestroy(self: *Connection, gpa: Allocator) void {
         if (self.active > 0) return;
-        const fd = self.fd;
         self.deinit();
         gpa.destroy(self);
-        log.debug("connection destroyed: fd={d}", .{fd});
     }
 
     pub fn deinit(self: *Connection) void {
@@ -351,16 +350,15 @@ const Connection = struct {
 
     fn close(self: *Connection, ring: *IoUring) !void {
         if (self.recv_c.active) {
-            // Cancel downstream fd requests
-            const sqe = try ring.get_sqe();
+            const sqe = try getSqe(ring);
             self.active += 1;
-            // Cancel any requests for this fd
-            sqe.prep_cancel_fd(self.fd, linux.IORING_ASYNC_CANCEL_ALL);
+            // Cancel recv_c if we have one out there
+            sqe.prep_cancel(@intFromPtr(&self.recv_c), 0);
             sqe.user_data = @intFromPtr(&self.cancel_c);
             self.cancel_c.active = true;
         }
         // Close downstream
-        const sqe = try ring.get_sqe();
+        const sqe = try getSqe(ring);
         self.active += 1;
         sqe.prep_close(self.fd);
         sqe.user_data = @intFromPtr(&self.close_c);
@@ -395,12 +393,21 @@ const Connection = struct {
 
         try self.request.appendSlice(self.arena.allocator(), self.buf[0..@intCast(cqe.res)]);
 
-        // if (self.request.head_len) |_| {
-        //     // Call the handler
+        if (self.request.head_len == null) {
+            // We haven't received a full HEAD. prep another recv
+            const sqe = try getSqe(ring);
+            sqe.prep_recv(self.fd, &self.buf, 0);
+            sqe.user_data = @intFromPtr(&self.recv_c);
+
+            self.active += 1;
+            self.recv_c.active = true;
+            return;
+        }
+
+        // We've received a full HEAD, call the handler now
         try handler(self.request, &self.response);
         try self.prepareHeader();
         try self.send(ring);
-        // }
     }
 
     fn reset(self: *Connection) void {
@@ -445,27 +452,54 @@ const Connection = struct {
         writer.writeAll("\r\n") catch unreachable;
     }
 
-    fn responseSendDone(self: *Connection) bool {
+    fn responseComplete(self: *Connection) bool {
         return self.written == (self.write_buf.items.len + self.response.body.items.len);
     }
 
     fn send(self: *Connection, ring: *IoUring) !void {
-        self.vecs[0] = .{
-            .base = self.write_buf.items.ptr,
-            .len = self.write_buf.items.len,
-        };
-        self.vecs[1] = .{
-            .base = self.response.body.items.ptr,
-            .len = self.response.body.items.len,
-        };
-        const sqe = try ring.get_sqe();
+        // Pending headers, no body
+        if (self.written < self.write_buf.items.len and self.response.body.items.len == 0) {
+            const sqe = try getSqe(ring);
+            self.active += 1;
+            sqe.prep_write(self.fd, self.write_buf.items[self.written..], 0);
+            sqe.user_data = @intFromPtr(&self.send_c);
+            self.send_c.active = true;
+
+            return;
+        }
+
+        // Pending headers + body
+        if (self.written < self.write_buf.items.len) {
+            const headers = self.write_buf.items[self.written..];
+            self.vecs[0] = .{
+                .base = headers.ptr,
+                .len = headers.len,
+            };
+            self.vecs[1] = .{
+                .base = self.response.body.items.ptr,
+                .len = self.response.body.items.len,
+            };
+
+            const sqe = try getSqe(ring);
+            self.active += 1;
+            sqe.prep_writev(self.fd, &self.vecs, 0);
+            sqe.user_data = @intFromPtr(&self.send_c);
+            self.send_c.active = true;
+
+            return;
+        }
+
+        // Pending body
+        const offset = self.written - self.write_buf.items.len;
+        const body = self.response.body.items[offset..];
+        const sqe = try getSqe(ring);
         self.active += 1;
-        sqe.prep_writev(self.fd, &self.vecs, 0);
+        sqe.prep_write(self.fd, body, 0);
         sqe.user_data = @intFromPtr(&self.send_c);
         self.send_c.active = true;
     }
 
-    pub fn handleSend(self: *Connection, ring: *IoUring, cqe: linux.io_uring_cqe) CallbackError!void {
+    fn handleSend(self: *Connection, ring: *IoUring, cqe: linux.io_uring_cqe) CallbackError!void {
         self.active -= 1;
         self.send_c.active = false;
         switch (cqe.err()) {
@@ -478,36 +512,50 @@ const Connection = struct {
 
         self.written += @intCast(cqe.res);
 
-        assert(self.responseSendDone());
+        // If the response didn't finish sending, try again
+        if (!self.responseComplete()) {
+            return self.send(ring);
+        }
 
-        self.reset();
-        // prep another recv
-        var sqe = try ring.get_sqe();
-        self.active += 1;
-        sqe.prep_recv(self.fd, &self.buf, 0);
-        sqe.user_data = @intFromPtr(&self.recv_c);
+        switch (self.request.keepAlive()) {
+            false => return self.close(ring),
+            true => {
+                self.reset();
+                // prep another recv
+                const sqe = try getSqe(ring);
+                self.active += 1;
+                sqe.prep_recv(self.fd, &self.buf, 0);
+                sqe.user_data = @intFromPtr(&self.recv_c);
+            },
+        }
     }
 };
 
 pub const Request = struct {
-    /// The raw bytes of the request
+    /// The raw bytes of the request. This may not be the full request - handlers are called when we
+    /// have received the headers. At that point, callers can instruct the response to read the full
+    /// body. In this case, the callback will be called again when the full body has been read
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
     /// Length of the head section. When null, we have not received enough bytes to finish the head.
     /// This includes the trailing empty line terminators
     head_len: ?usize = null,
 
-    /// /// The parsed head section. Only valid if head_len is not null
-    /// head: ?http.Server.Request.Head = null,
     /// Body of the request. This is null if we haven't received the full body, or there is no body
     body: ?[]const u8 = null,
 
     // add the slice to the internal buffer, attempt to parse a Head
     pub fn appendSlice(self: *Request, gpa: Allocator, bytes: []const u8) !void {
         try self.bytes.appendSlice(gpa, bytes);
-        if (std.mem.indexOf(u8, self.bytes.items, "\r\n\r\n")) |idx| {
-            assert(idx + 4 == self.bytes.items.len);
-            self.head_len = idx + 4;
+
+        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n\r\n") orelse return;
+        assert(idx + 4 == self.bytes.items.len);
+        self.head_len = idx + 4;
+
+        const cl = self.contentLength() orelse return;
+
+        if (cl + idx + 4 == self.bytes.items.len) {
+            self.body = self.bytes.items[idx + 4 ..];
         }
     }
 
@@ -516,10 +564,18 @@ pub const Request = struct {
         return .init(self.bytes.items[0..self.head_len.?]);
     }
 
-    pub fn getHeader(self: Request, name: []const u8) ?[]const u8 {
+    pub fn getHeader(self: Request, key: []const u8) ?[]const u8 {
         var iter = self.headerIterator();
         while (iter.next()) |header| {
-            if (std.ascii.equalIgnoreCase(header.key, name)) return header.value;
+            // Check lengths
+            if (header.name.len != key.len) continue;
+
+            // Fast path for canonical case matched headers. We use those exclusively in this
+            // library when getting headers
+            if (std.mem.eql(u8, header.name, key) or
+                // Slow path for case matching
+                std.ascii.eqlIgnoreCase(header.name, key))
+                return header.value;
         }
         return null;
     }
@@ -532,6 +588,22 @@ pub const Request = struct {
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
         const val = http.Method.parse(line[0..space]);
         return @enumFromInt(val);
+    }
+
+    pub fn contentLength(self: Request) ?u64 {
+        const value = self.getHeader("Content-Length") orelse return null;
+        return std.fmt.parseUnsigned(u64, value, 10) catch @panic("TODO: bad content length");
+    }
+
+    pub fn host(self: Request) []const u8 {
+        return self.getHeader("Host") orelse @panic("TODO: no host header");
+    }
+
+    pub fn keepAlive(self: Request) bool {
+        const value = self.getHeader("Connection") orelse return true;
+        // fast and slow paths for case matching
+        return std.mem.eql(u8, value, "keep-alive") or
+            std.ascii.eqlIgnoreCase(value, "keep-alive");
     }
 };
 
@@ -583,5 +655,4 @@ pub const Response = struct {
 fn handler(req: Request, resp: *Response) !void {
     _ = req;
     try resp.writeAll("hey");
-    // try resp.any().writeAll("Hey");
 }
