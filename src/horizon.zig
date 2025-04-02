@@ -82,6 +82,7 @@ pub const Server = struct {
             net.Address.parseIp4("127.0.0.1", 8080) catch unreachable;
 
         const io_uring_flags: u32 =
+            // linux.IORING_SETUP_SQPOLL |
             linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
             linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
             linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks
@@ -101,7 +102,7 @@ pub const Server = struct {
 
         self.* = .{
             .ring = ring,
-            .rings = try gpa.alloc(IoUring, 12),
+            .rings = try gpa.alloc(IoUring, 13),
             .fd = fd,
             .addr = addr,
             .addr_len = addr.getOsSockLen(),
@@ -112,14 +113,12 @@ pub const Server = struct {
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
         try posix.listen(fd, 512);
 
-        const sqe = try getSqeWithRetry(&self.ring, 16);
+        const sqe = try self.ring.get_sqe();
         const accept_flags: u32 = 0;
 
         sqe.prep_multishot_accept(self.fd, &self.addr.any, &self.addr_len, accept_flags);
         sqe.user_data = @intFromPtr(&self.accept_c);
         self.accept_c.active = true;
-
-        log.info("listening on {}", .{self.addr});
     }
 
     pub fn deinit(self: *Server) void {
@@ -133,7 +132,7 @@ pub const Server = struct {
 
         var cqes: [128]linux.io_uring_cqe = undefined;
         while (true) {
-            _ = try self.ring.submit_and_wait(1);
+            _ = try self.ring.submit();
 
             const n = self.ring.copy_cqes(&cqes, 1) catch |err| {
                 switch (err) {
@@ -168,10 +167,8 @@ pub const Server = struct {
             log.err("cqe error: {}", .{cqe.err()});
         }
 
-        log.debug("sending fd={d} to ring_fd={d}", .{ cqe.res, target_fd });
-
         // Send the fd to another thread for handling
-        const sqe = try getSqeWithRetry(ring, 16);
+        const sqe = try ring.get_sqe();
         sqe.prep_rw(.MSG_RING, target_fd, 0, @intCast(cqe.res), @intFromPtr(&self.accept_c));
         sqe.user_data = @intFromPtr(&self.msg_ring_c);
         sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
@@ -195,7 +192,6 @@ pub fn handleCqe(
                     s.next_ring += 1;
                     if (s.next_ring == s.rings.len) s.next_ring = 0;
                     try srv.acceptAndSend(ring, cqe, target);
-                    // try handleAccept(gpa, ring, cqe, bg.group_id);
                 } else {
                     try handleAccept(gpa, ring, cqe);
                 }
@@ -213,7 +209,7 @@ pub fn handleCqe(
                 .recv => {
                     const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
                     defer conn.maybeDestroy(gpa);
-                    try conn.handleRecv(gpa, ring, cqe);
+                    try conn.handleRecv(ring, cqe);
                 },
 
                 .send => {
@@ -226,7 +222,7 @@ pub fn handleCqe(
                     const conn: *Connection = @alignCast(@fieldParentPtr("close_c", c));
                     defer conn.maybeDestroy(gpa);
                     switch (cqe.err()) {
-                        .SUCCESS => log.debug("connection closed: fd={d}, ring_fd={d}", .{ conn.fd, ring.fd }),
+                        .SUCCESS => {},
                         else => log.err("connection closed with error: {}", .{cqe.err()}),
                     }
                     conn.active -= 1;
@@ -242,19 +238,6 @@ pub fn handleCqe(
             }
         },
     }
-}
-
-fn getSqeWithRetry(ring: *IoUring, retries: u6) error{SubmissionQueueFull}!*linux.io_uring_sqe {
-    var i: usize = 0;
-    while (i < retries) : (i += 1) {
-        const sqe = ring.get_sqe() catch {
-            _ = ring.submit() catch {};
-            continue;
-        };
-        return sqe;
-    }
-    @panic("SubmissionQueueFull");
-    // return error.SubmissionQueueFull;
 }
 
 /// A Completion Entry
@@ -300,7 +283,6 @@ fn handleAccept(
         ring,
         cqe.res,
     );
-    log.info("connection accepted: fd={d}, ring_fd={d}", .{ cqe.res, ring.fd });
 }
 
 pub fn getBufferFromCqe(bg: *IoUring.BufferGroup, cqe: linux.io_uring_cqe) error{NoBufferSelected}![]u8 {
@@ -330,28 +312,28 @@ const Connection = struct {
 
     response: Response,
 
+    vecs: [2]posix.iovec_const,
+    written: usize = 0,
+
+    const response_fixed = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+    const body_fixed = "hey";
+
     pub fn init(self: *Connection, gpa: Allocator, ring: *IoUring, fd: posix.socket_t) CallbackError!void {
         self.* = .{
             .arena = .init(gpa),
             .fd = fd,
             .response = undefined,
+            .vecs = undefined,
         };
 
         self.response = .{ .arena = self.arena.allocator() };
 
-        {
-            // Prep multishot recv
-            var sqe = try getSqeWithRetry(ring, 16);
-            sqe.prep_recv(self.fd, &self.buf, 0);
-            // sqe.prep_rw(.RECV, fd, 0, 0, 0);
-            // sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-            // sqe.buf_index = id;
-            sqe.user_data = @intFromPtr(&self.recv_c);
-            // sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+        var sqe = try ring.get_sqe();
+        sqe.prep_recv(self.fd, &self.buf, 0);
+        sqe.user_data = @intFromPtr(&self.recv_c);
 
-            self.active += 1;
-            self.recv_c.active = true;
-        }
+        self.active += 1;
+        self.recv_c.active = true;
     }
 
     pub fn maybeDestroy(self: *Connection, gpa: Allocator) void {
@@ -370,7 +352,7 @@ const Connection = struct {
     fn close(self: *Connection, ring: *IoUring) !void {
         if (self.recv_c.active) {
             // Cancel downstream fd requests
-            const sqe = try getSqeWithRetry(ring, 16);
+            const sqe = try ring.get_sqe();
             self.active += 1;
             // Cancel any requests for this fd
             sqe.prep_cancel_fd(self.fd, linux.IORING_ASYNC_CANCEL_ALL);
@@ -378,7 +360,7 @@ const Connection = struct {
             self.cancel_c.active = true;
         }
         // Close downstream
-        const sqe = try getSqeWithRetry(ring, 16);
+        const sqe = try ring.get_sqe();
         self.active += 1;
         sqe.prep_close(self.fd);
         sqe.user_data = @intFromPtr(&self.close_c);
@@ -387,14 +369,13 @@ const Connection = struct {
 
     pub fn handleRecv(
         self: *Connection,
-        gpa: Allocator,
         ring: *IoUring,
         cqe: linux.io_uring_cqe,
     ) !void {
         self.active -= 1;
         self.recv_c.active = false;
         if (cqe.res == 0) {
-            log.err("recv returned 0", .{});
+            // Peer gracefully closed connection
             return self.close(ring);
         }
 
@@ -412,123 +393,81 @@ const Connection = struct {
             },
         }
 
-        // // Get the buffer from the buffer group
-        // const buf = getBufferFromCqe(bg, cqe) catch {
-        //     // If we have no buffer selected, it's probably because the peer closed the connection.
-        //     // This function only returns one error but we assert here because other errors could be
-        //     // added in the future and we need to know that
-        //     log.err("get buffer from cqe error", .{});
-        //     return self.close(ring);
-        // };
-        // defer bg.put_cqe(cqe) catch unreachable; // Would have errored on previous call
+        try self.request.appendSlice(self.arena.allocator(), self.buf[0..@intCast(cqe.res)]);
 
-        try self.request.appendSlice(gpa, self.buf[0..@intCast(cqe.res)]);
-
-        if (self.request.head_len) |_| {
-            // Call the handler
-            log.debug("parsed head", .{});
-            var arena: std.heap.ArenaAllocator = .init(gpa);
-            self.response = .{ .arena = arena.allocator() };
-            try handler(self.request, &self.response);
-            try self.prepResponse();
-            try self.send(ring);
-        }
-        var sqe = try getSqeWithRetry(ring, 16);
-        self.active += 1;
-        sqe.prep_recv(self.fd, &self.buf, 0);
-        // sqe.prep_rw(.RECV, fd, 0, 0, 0);
-        // sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-        // sqe.buf_index = id;
-        sqe.user_data = @intFromPtr(&self.recv_c);
+        // if (self.request.head_len) |_| {
+        //     // Call the handler
+        try handler(self.request, &self.response);
+        try self.prepareHeader();
+        try self.send(ring);
+        // }
     }
 
     fn reset(self: *Connection) void {
-        _ = self.arena.reset(.free_all);
+        _ = self.arena.reset(.retain_capacity);
         self.request = .{};
+        self.write_buf = .empty;
         self.response = .{ .arena = self.arena.allocator() };
+        self.written = 0;
     }
 
-    fn prepResponse(self: *Connection) !void {
+    /// Writes the header into write_buf
+    fn prepareHeader(self: *Connection) !void {
         var headers = &self.write_buf;
         const resp = self.response;
         const status = resp.status orelse .ok;
 
-        if (status.phrase()) |phrase| {
-            try headers.writer(self.arena.allocator()).print(
-                "HTTP/1.1 {d} {s}\r\n",
-                .{ @intFromEnum(status), phrase },
-            );
-        } else {
-            try headers.writer(self.arena.allocator()).print(
-                "HTTP/1.1 {d}\r\n",
-                .{@intFromEnum(status)},
-            );
+        // Base amount to cover start line, content-length, content-type, and trailing \r\n
+        var len: usize = 128;
+        {
+            var iter = resp.headers.iterator();
+            while (iter.next()) |entry| {
+                len += entry.key_ptr.len + entry.value_ptr.len + 2;
+            }
         }
 
-        try headers.writer(self.arena.allocator()).print(
-            "Content-Length: {d}\r\n",
-            .{resp.body.items.len},
-        );
+        try headers.ensureTotalCapacity(self.arena.allocator(), len);
+        var writer = headers.fixedWriter();
+
+        // We never write the phrase
+        writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
+
+        writer.print("Content-Length: {d}\r\n", .{resp.body.items.len}) catch unreachable;
+
         // TODO: sniff content type
-        try headers.writer(self.arena.allocator()).print(
-            "Content-Type: {d}\r\n",
-            .{"text/plain"},
-        );
+        writer.print("Content-Type: {s}\r\n", .{"text/plain"}) catch unreachable;
 
         var iter = resp.headers.iterator();
-        while (iter.next()) |header| {
-            try headers.writer(self.arena.allocator()).print(
-                "{s}: {s}\r\n",
-                .{ header.key_ptr.*, header.value_ptr.* },
-            );
+        while (iter.next()) |h| {
+            writer.print("{s}: {s}\r\n", .{ h.key_ptr.*, h.value_ptr.* }) catch unreachable;
         }
-        try headers.appendSlice(self.arena.allocator(), "\r\n");
 
-        try headers.appendSlice(self.arena.allocator(), self.response.body.items);
-        self.response.body.clearRetainingCapacity();
+        writer.writeAll("\r\n") catch unreachable;
     }
 
     fn responseSendDone(self: *Connection) bool {
-        return self.write_buf.items.len == 0 and
-            self.response.body.items.len == 0;
+        return self.written == (self.write_buf.items.len + self.response.body.items.len);
     }
 
     fn send(self: *Connection, ring: *IoUring) !void {
-        if (self.responseSendDone()) {
-            self.reset();
-            return;
-        }
-
-        if (self.send_c.active) return;
-
-        const bytes = if (self.write_buf.items.len > 0)
-            self.write_buf.items
-        else
-            self.response.body.items;
-
-        const sqe = try getSqeWithRetry(ring, 16);
+        self.vecs[0] = .{
+            .base = self.write_buf.items.ptr,
+            .len = self.write_buf.items.len,
+        };
+        self.vecs[1] = .{
+            .base = self.response.body.items.ptr,
+            .len = self.response.body.items.len,
+        };
+        const sqe = try ring.get_sqe();
         self.active += 1;
-        // sqe.prep_send(self.fd, bytes, 0);
-        sqe.prep_send_zc(self.fd, bytes, 0, 0);
+        sqe.prep_writev(self.fd, &self.vecs, 0);
         sqe.user_data = @intFromPtr(&self.send_c);
         self.send_c.active = true;
     }
 
     pub fn handleSend(self: *Connection, ring: *IoUring, cqe: linux.io_uring_cqe) CallbackError!void {
-        log.info("send completion: flags={d}", .{cqe.flags});
-        if (cqe.flags & linux.IORING_CQE_F_MORE != 0) {
-            if (self.write_buf.items.len > 0) {
-                self.write_buf.replaceRangeAssumeCapacity(0, @intCast(cqe.res), "");
-            } else {
-                self.response.body.replaceRangeAssumeCapacity(0, @intCast(cqe.res), "");
-            }
-            return;
-        }
         self.active -= 1;
         self.send_c.active = false;
-        // if (self.active == 0) {
-        //     try self.close(ring);
-        // }
         switch (cqe.err()) {
             .SUCCESS => {},
             else => {
@@ -537,8 +476,16 @@ const Connection = struct {
             },
         }
 
-        // Trigger a send again, this will return if we don't have anything to send
-        try self.send(ring);
+        self.written += @intCast(cqe.res);
+
+        assert(self.responseSendDone());
+
+        self.reset();
+        // prep another recv
+        var sqe = try ring.get_sqe();
+        self.active += 1;
+        sqe.prep_recv(self.fd, &self.buf, 0);
+        sqe.user_data = @intFromPtr(&self.recv_c);
     }
 };
 
@@ -546,37 +493,45 @@ pub const Request = struct {
     /// The raw bytes of the request
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-    /// Length of the head section. When null, we have not received enough bytes to finish the head
+    /// Length of the head section. When null, we have not received enough bytes to finish the head.
+    /// This includes the trailing empty line terminators
     head_len: ?usize = null,
 
-    /// The parsed head section. Only valid if head_len is not null
-    head: http.Server.Request.Head = undefined,
-
+    /// /// The parsed head section. Only valid if head_len is not null
+    /// head: ?http.Server.Request.Head = null,
     /// Body of the request. This is null if we haven't received the full body, or there is no body
     body: ?[]const u8 = null,
-
-    pub fn reset(self: *Request) void {
-        self.* = .{};
-    }
 
     // add the slice to the internal buffer, attempt to parse a Head
     pub fn appendSlice(self: *Request, gpa: Allocator, bytes: []const u8) !void {
         try self.bytes.appendSlice(gpa, bytes);
-
-        var hp: HeadParser = .{};
-        const head_len = hp.feed(self.bytes.items);
-
-        // Not enough bytes to finish the head
-        if (head_len > self.bytes.items.len) return;
-
-        // We have enough bytes to finish the head
-        self.head_len = head_len;
-        self.head = try .parse(bytes[0..head_len]);
-
-        if (self.head.content_length) |cl| {
-            // If we have a content length, we'll set the body if we have enough bytes
-            if (head_len + cl == self.bytes.items.len) self.body = self.bytes.items[head_len..];
+        if (std.mem.indexOf(u8, self.bytes.items, "\r\n\r\n")) |idx| {
+            assert(idx + 4 == self.bytes.items.len);
+            self.head_len = idx + 4;
         }
+    }
+
+    pub fn headerIterator(self: Request) http.HeaderIterator {
+        assert(self.head_len != null);
+        return .init(self.bytes.items[0..self.head_len.?]);
+    }
+
+    pub fn getHeader(self: Request, name: []const u8) ?[]const u8 {
+        var iter = self.headerIterator();
+        while (iter.next()) |header| {
+            if (std.ascii.equalIgnoreCase(header.key, name)) return header.value;
+        }
+        return null;
+    }
+
+    /// Returns the HTTP method of this request
+    pub fn method(self: Request) http.Method {
+        assert(self.head_len != null);
+        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n") orelse unreachable;
+        const line = self.bytes.items[0..idx];
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
+        const val = http.Method.parse(line[0..space]);
+        return @enumFromInt(val);
     }
 };
 
