@@ -1,7 +1,7 @@
 const std = @import("std");
 const tls = @import("tls");
 
-const log = @import("log.zig");
+const log = std.log.scoped(.horizon);
 
 const http = std.http;
 const linux = std.os.linux;
@@ -16,7 +16,6 @@ const assert = std.debug.assert;
 pub fn threadRun(
     gpa: Allocator,
     ring: *IoUring,
-    id: u16,
     wq_fd: posix.fd_t,
 ) !void {
     {
@@ -38,13 +37,6 @@ pub fn threadRun(
         ring.* = try .init_params(64, &params2);
     }
 
-    // Initialize a buffer group
-    const bg_count: u16 = 1024;
-    const bg_size: u32 = 2048;
-    const buffers = try gpa.alloc(u8, bg_count * bg_size);
-    const bg = try gpa.create(IoUring.BufferGroup);
-    bg.* = try .init(ring, id, buffers, bg_size, bg_count);
-
     var cqes: [128]linux.io_uring_cqe = undefined;
     while (true) {
         _ = try ring.submit();
@@ -57,7 +49,7 @@ pub fn threadRun(
             continue;
         };
         for (cqes[0..n]) |cqe| {
-            try handleCqe(ring, gpa, cqe, null, bg);
+            try handleCqe(ring, gpa, cqe, null);
         }
     }
 }
@@ -109,7 +101,7 @@ pub const Server = struct {
 
         self.* = .{
             .ring = ring,
-            .rings = try gpa.alloc(IoUring, 15),
+            .rings = try gpa.alloc(IoUring, 12),
             .fd = fd,
             .addr = addr,
             .addr_len = addr.getOsSockLen(),
@@ -118,7 +110,7 @@ pub const Server = struct {
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
-        try posix.listen(fd, 128);
+        try posix.listen(fd, 512);
 
         const sqe = try getSqeWithRetry(&self.ring, 16);
         const accept_flags: u32 = 0;
@@ -135,20 +127,13 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server, gpa: Allocator) !void {
-        for (self.rings, 1..) |*ring, i| {
-            const id: u16 = @intCast(i);
-            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, id, self.ring.fd });
+        for (self.rings) |*ring| {
+            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring.fd });
         }
-
-        const bg_count: u16 = 256;
-        const bg_size: u32 = 2048;
-        const buffers = try gpa.alloc(u8, bg_count * bg_size);
-        const bg = try gpa.create(IoUring.BufferGroup);
-        bg.* = try .init(&self.ring, 0, buffers, bg_size, bg_count);
 
         var cqes: [128]linux.io_uring_cqe = undefined;
         while (true) {
-            _ = try self.ring.submit();
+            _ = try self.ring.submit_and_wait(1);
 
             const n = self.ring.copy_cqes(&cqes, 1) catch |err| {
                 switch (err) {
@@ -158,7 +143,7 @@ pub const Server = struct {
                 continue;
             };
             for (cqes[0..n]) |cqe| {
-                try handleCqe(&self.ring, gpa, cqe, self, bg);
+                try handleCqe(&self.ring, gpa, cqe, self);
             }
         }
     }
@@ -199,7 +184,6 @@ pub fn handleCqe(
     gpa: Allocator,
     cqe: linux.io_uring_cqe,
     server: ?*Server,
-    bg: *IoUring.BufferGroup,
 ) !void {
     const c: *Completion = @ptrFromInt(cqe.user_data);
     switch (c.parent) {
@@ -211,8 +195,9 @@ pub fn handleCqe(
                     s.next_ring += 1;
                     if (s.next_ring == s.rings.len) s.next_ring = 0;
                     try srv.acceptAndSend(ring, cqe, target);
+                    // try handleAccept(gpa, ring, cqe, bg.group_id);
                 } else {
-                    try handleAccept(gpa, ring, cqe, bg.group_id);
+                    try handleAccept(gpa, ring, cqe);
                 }
             },
             .msg_ring => {
@@ -228,7 +213,7 @@ pub fn handleCqe(
                 .recv => {
                     const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
                     defer conn.maybeDestroy(gpa);
-                    try conn.handleRecv(gpa, ring, cqe, bg);
+                    try conn.handleRecv(gpa, ring, cqe);
                 },
 
                 .send => {
@@ -302,7 +287,6 @@ fn handleAccept(
     gpa: Allocator,
     ring: *IoUring,
     cqe: linux.io_uring_cqe,
-    group_id: u16,
 ) CallbackError!void {
     switch (cqe.err()) {
         .SUCCESS => {},
@@ -315,7 +299,6 @@ fn handleAccept(
         gpa,
         ring,
         cqe.res,
-        group_id,
     );
     log.info("connection accepted: fd={d}, ring_fd={d}", .{ cqe.res, ring.fd });
 }
@@ -326,6 +309,8 @@ pub fn getBufferFromCqe(bg: *IoUring.BufferGroup, cqe: linux.io_uring_cqe) error
 
 const Connection = struct {
     arena: std.heap.ArenaAllocator,
+
+    buf: [1024]u8 = undefined,
 
     fd: posix.socket_t,
 
@@ -345,7 +330,7 @@ const Connection = struct {
 
     response: Response,
 
-    pub fn init(self: *Connection, gpa: Allocator, ring: *IoUring, fd: posix.socket_t, id: u16) CallbackError!void {
+    pub fn init(self: *Connection, gpa: Allocator, ring: *IoUring, fd: posix.socket_t) CallbackError!void {
         self.* = .{
             .arena = .init(gpa),
             .fd = fd,
@@ -357,11 +342,12 @@ const Connection = struct {
         {
             // Prep multishot recv
             var sqe = try getSqeWithRetry(ring, 16);
-            sqe.prep_rw(.RECV, fd, 0, 0, 0);
-            sqe.flags |= linux.IOSQE_BUFFER_SELECT;
-            sqe.buf_index = id;
+            sqe.prep_recv(self.fd, &self.buf, 0);
+            // sqe.prep_rw(.RECV, fd, 0, 0, 0);
+            // sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+            // sqe.buf_index = id;
             sqe.user_data = @intFromPtr(&self.recv_c);
-            sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
+            // sqe.ioprio |= linux.IORING_RECV_MULTISHOT;
 
             self.active += 1;
             self.recv_c.active = true;
@@ -404,11 +390,11 @@ const Connection = struct {
         gpa: Allocator,
         ring: *IoUring,
         cqe: linux.io_uring_cqe,
-        bg: *IoUring.BufferGroup,
     ) !void {
-        if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-            self.active -= 1;
-            self.recv_c.active = false;
+        self.active -= 1;
+        self.recv_c.active = false;
+        if (cqe.res == 0) {
+            log.err("recv returned 0", .{});
             return self.close(ring);
         }
 
@@ -417,8 +403,8 @@ const Connection = struct {
             .CANCELED => return,
             .CONNRESET => {
                 // This fd was closed by the peer
-                log.err("connection reset: active={}", .{self.recv_c.active});
-                @panic("TODO");
+                try self.close(ring);
+                return;
             },
             else => {
                 log.err("recv error: {}", .{cqe.err()});
@@ -426,17 +412,17 @@ const Connection = struct {
             },
         }
 
-        // Get the buffer from the buffer group
-        const buf = getBufferFromCqe(bg, cqe) catch {
-            // If we have no buffer selected, it's probably because the peer closed the connection.
-            // This function only returns one error but we assert here because other errors could be
-            // added in the future and we need to know that
-            log.err("get buffer from cqe error", .{});
-            return self.close(ring);
-        };
-        defer bg.put_cqe(cqe) catch unreachable; // Would have errored on previous call
+        // // Get the buffer from the buffer group
+        // const buf = getBufferFromCqe(bg, cqe) catch {
+        //     // If we have no buffer selected, it's probably because the peer closed the connection.
+        //     // This function only returns one error but we assert here because other errors could be
+        //     // added in the future and we need to know that
+        //     log.err("get buffer from cqe error", .{});
+        //     return self.close(ring);
+        // };
+        // defer bg.put_cqe(cqe) catch unreachable; // Would have errored on previous call
 
-        try self.request.appendSlice(gpa, buf);
+        try self.request.appendSlice(gpa, self.buf[0..@intCast(cqe.res)]);
 
         if (self.request.head_len) |_| {
             // Call the handler
@@ -447,6 +433,13 @@ const Connection = struct {
             try self.prepResponse();
             try self.send(ring);
         }
+        var sqe = try getSqeWithRetry(ring, 16);
+        self.active += 1;
+        sqe.prep_recv(self.fd, &self.buf, 0);
+        // sqe.prep_rw(.RECV, fd, 0, 0, 0);
+        // sqe.flags |= linux.IOSQE_BUFFER_SELECT;
+        // sqe.buf_index = id;
+        sqe.user_data = @intFromPtr(&self.recv_c);
     }
 
     fn reset(self: *Connection) void {
@@ -490,6 +483,9 @@ const Connection = struct {
             );
         }
         try headers.appendSlice(self.arena.allocator(), "\r\n");
+
+        try headers.appendSlice(self.arena.allocator(), self.response.body.items);
+        self.response.body.clearRetainingCapacity();
     }
 
     fn responseSendDone(self: *Connection) bool {
@@ -530,10 +526,9 @@ const Connection = struct {
         }
         self.active -= 1;
         self.send_c.active = false;
-        if (self.active == 0) {
-            log.err("no active connections in send", .{});
-            try self.close(ring);
-        }
+        // if (self.active == 0) {
+        //     try self.close(ring);
+        // }
         switch (cqe.err()) {
             .SUCCESS => {},
             else => {
@@ -632,5 +627,6 @@ pub const Response = struct {
 
 fn handler(req: Request, resp: *Response) !void {
     _ = req;
-    try resp.any().writeAll("Hey");
+    try resp.writeAll("hey");
+    // try resp.any().writeAll("Hey");
 }

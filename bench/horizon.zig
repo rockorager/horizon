@@ -1,11 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-
-const log = @import("log.zig");
-const hz = @import("horizon.zig");
+const horizon = @import("horizon");
 
 pub fn main() !void {
-    log.init(.err);
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     const gpa, const is_debug = gpa: {
         break :gpa switch (builtin.mode) {
@@ -16,7 +13,7 @@ pub fn main() !void {
     defer if (is_debug) {
         _ = debug_allocator.deinit();
     };
-    var s: hz.Server = undefined;
+    var s: horizon.Server = undefined;
     try s.init(gpa, .{});
 
     try s.run(gpa);
