@@ -348,7 +348,7 @@ const Connection = struct {
         }
 
         // We've received a full HEAD, call the handler now
-        try handler.serveHttp(self.request, self.response.responseWriter());
+        try handler.serveHttp(self.response.responseWriter(), self.request);
         try self.prepareHeader();
         try self.send(ring);
     }
@@ -545,7 +545,8 @@ pub const Request = struct {
 
     /// Returns the HTTP method of this request
     pub fn method(self: Request) http.Method {
-        assert(self.head_len != null);
+        assert(self.receivedHeader());
+        // GET / HTTP/1.1
         const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf) orelse unreachable;
         const line = self.bytes.items[0..idx];
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
@@ -567,6 +568,15 @@ pub const Request = struct {
         // fast and slow paths for case matching
         return std.mem.eql(u8, value, "keep-alive") or
             std.ascii.eqlIgnoreCase(value, "keep-alive");
+    }
+
+    pub fn path(self: Request) []const u8 {
+        assert(self.receivedHeader());
+        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf) orelse unreachable;
+        const line = self.bytes.items[0..idx];
+        var iter = std.mem.splitScalar(u8, line, ' ');
+        _ = iter.first();
+        return iter.next() orelse unreachable;
     }
 };
 
@@ -707,14 +717,14 @@ pub const HeaderIterator = struct {
 
 pub const Handler = struct {
     ptr: *anyopaque,
-    serveFn: *const fn (*anyopaque, Request, ResponseWriter) anyerror!void,
+    serveFn: *const fn (*anyopaque, ResponseWriter, Request) anyerror!void,
 
     /// Initialize a handler from a Type which has a serveHttp method
     pub fn init(comptime T: type, ptr: *T) Handler {
         return .{ .ptr = ptr, .serveFn = T.serveHttp };
     }
 
-    pub fn serveHttp(self: Handler, req: Request, resp: ResponseWriter) anyerror!void {
-        return self.serveFn(self.ptr, req, resp);
+    pub fn serveHttp(self: Handler, w: ResponseWriter, r: Request) anyerror!void {
+        return self.serveFn(self.ptr, w, r);
     }
 };

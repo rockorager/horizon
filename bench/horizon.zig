@@ -16,13 +16,13 @@ pub fn main() !void {
     var s: horizon.Server = undefined;
     try s.init(gpa, .{});
 
-    var gzip_handler: gzip.Handler = .{ .next = .{ .ptr = undefined, .serveFn = serveHttp } };
+    var gzip_handler: gzip.Handler = .init(.{ .ptr = undefined, .serveFn = serveHttp });
 
-    try s.run(gpa, .init(gzip.Handler, &gzip_handler));
+    try s.run(gpa, gzip_handler.handler());
 }
 
-pub fn serveHttp(_: *anyopaque, req: horizon.Request, resp: horizon.ResponseWriter) anyerror!void {
-    _ = req;
+pub fn serveHttp(_: *anyopaque, resp: horizon.ResponseWriter, req: horizon.Request) anyerror!void {
+    std.log.debug("path={s}", .{req.path()});
     try resp.any().print("hello, world", .{});
 }
 
@@ -30,25 +30,32 @@ const gzip = struct {
     const Handler = struct {
         next: horizon.Handler,
 
-        pub fn init(handler: horizon.Handler) Handler {
-            return .{ .next = handler };
+        pub fn init(next: horizon.Handler) Handler {
+            return .{ .next = next };
+        }
+
+        pub fn handler(self: *Handler) horizon.Handler {
+            return .init(Handler, self);
         }
 
         pub fn serveHttp(
             ptr: *anyopaque,
-            req: horizon.Request,
-            resp: horizon.ResponseWriter,
+            w: horizon.ResponseWriter,
+            r: horizon.Request,
         ) anyerror!void {
             const self: *Handler = @ptrCast(@alignCast(ptr));
 
-            const hdr = req.getHeader("Accept-Encoding") orelse
-                return self.next.serveHttp(req, resp);
+            const hdr = r.getHeader("Accept-Encoding") orelse
+                return self.next.serveHttp(w, r);
 
             if (std.mem.indexOf(u8, hdr, "gzip") == null)
-                return self.next.serveHttp(req, resp);
+                return self.next.serveHttp(w, r);
 
-            var gz: ResponseWriter = .{ .rw = resp };
-            try self.next.serveHttp(req, gz.responseWriter());
+            var gz: ResponseWriter = .{ .rw = w };
+            try self.next.serveHttp(
+                gz.responseWriter(),
+                r,
+            );
             try gz.flush();
         }
     };
