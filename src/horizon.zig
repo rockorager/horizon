@@ -321,7 +321,7 @@ const Connection = struct {
 
         try self.request.appendSlice(self.arena.allocator(), self.buf[0..result]);
 
-        if (self.request.head_len == null) {
+        if (!self.request.receivedHeader()) {
             // We haven't received a full HEAD. prep another recv
             try ring.recv(self.fd, &self.buf, &self.recv_c);
             self.active += 1;
@@ -468,31 +468,45 @@ pub const Request = struct {
     /// body. In this case, the callback will be called again when the full body has been read
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-    /// Length of the head section. When null, we have not received enough bytes to finish the head.
-    /// This includes the trailing empty line terminators
-    head_len: ?usize = null,
-
-    /// Body of the request. This is null if we haven't received the full body, or there is no body
-    body: ?[]const u8 = null,
-
     // add the slice to the internal buffer, attempt to parse a Head
     pub fn appendSlice(self: *Request, gpa: Allocator, bytes: []const u8) !void {
         try self.bytes.appendSlice(gpa, bytes);
-
-        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf ++ strings.crlf) orelse return;
-        assert(idx + 4 == self.bytes.items.len);
-        self.head_len = idx + 4;
-
-        const cl = self.contentLength() orelse return;
-
-        if (cl + idx + 4 == self.bytes.items.len) {
-            self.body = self.bytes.items[idx + 4 ..];
-        }
     }
 
-    pub fn headerIterator(self: Request) http.HeaderIterator {
-        assert(self.head_len != null);
-        return .init(self.bytes.items[0..self.head_len.?]);
+    pub fn headLen(self: Request) ?usize {
+        const idx = std.mem.indexOf(
+            u8,
+            self.bytes.items,
+            strings.crlf ++ strings.crlf,
+        ) orelse return null;
+
+        return idx + 4;
+    }
+
+    /// Returns true if we have received the full header
+    pub fn receivedHeader(self: Request) bool {
+        return self.headLen() != null;
+    }
+
+    /// Returns the body of the request. Null indicates there is a body and we haven't read the
+    /// entirety of it. An empty string indicates the request has no body and is not expecting one
+    pub fn body(self: Request) ?[]const u8 {
+        const head_len = self.headLen() orelse return null;
+
+        const cl = self.contentLength() orelse {
+            // TODO: we need to also check for chunked transfer encoding
+            return "";
+        };
+
+        if (cl + head_len == self.bytes.items.len) return self.bytes.items[head_len..];
+
+        return null;
+    }
+
+    /// iterates over headers and trailers
+    pub fn headerIterator(self: Request) HeaderIterator {
+        assert(self.receivedHeader());
+        return .init(self.bytes.items);
     }
 
     pub fn getHeader(self: Request, key: []const u8) ?[]const u8 {
@@ -580,6 +594,57 @@ pub const Response = struct {
             .context = self,
             .writeFn = typeErasedWrite,
         };
+    }
+};
+
+pub const HeaderIterator = struct {
+    bytes: []const u8,
+    index: usize,
+    is_trailer: bool,
+
+    pub fn init(bytes: []const u8) HeaderIterator {
+        return .{
+            .bytes = bytes,
+            .index = std.mem.indexOfPos(u8, bytes, 0, "\r\n").? + 2,
+            .is_trailer = false,
+        };
+    }
+
+    pub fn next(it: *HeaderIterator) ?std.http.Header {
+        const end = std.mem.indexOfPosLinear(u8, it.bytes, it.index, "\r\n").?;
+        if (it.index == end) { // found the trailer boundary (\r\n\r\n)
+            if (it.is_trailer) return null;
+
+            const next_end = std.mem.indexOfPos(u8, it.bytes, end + 2, "\r\n") orelse
+                return null;
+
+            var kv_it = std.mem.splitScalar(u8, it.bytes[end + 2 .. next_end], ':');
+            const name = kv_it.first();
+            const value = kv_it.rest();
+
+            it.is_trailer = true;
+            it.index = next_end + 2;
+            if (name.len == 0)
+                return null;
+
+            return .{
+                .name = name,
+                .value = std.mem.trim(u8, value, " \t"),
+            };
+        } else { // normal header
+            var kv_it = std.mem.splitScalar(u8, it.bytes[it.index..end], ':');
+            const name = kv_it.first();
+            const value = kv_it.rest();
+
+            it.index = end + 2;
+            if (name.len == 0)
+                return null;
+
+            return .{
+                .name = name,
+                .value = std.mem.trim(u8, value, " \t"),
+            };
+        }
     }
 };
 
