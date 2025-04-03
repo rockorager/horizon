@@ -47,8 +47,17 @@ pub const Server = struct {
     msg_ring_c: Completion,
 
     pub const Options = struct {
-        entries: u16 = 32,
+        /// Number of entries in the completion queues
+        entries: u16 = 64,
+
+        /// Address to listen on
         addr: ?net.Address = null,
+
+        /// Number of worker threads to spawn. If null, we will spawn at least 1 worker, and up to
+        /// threadcount - 1 workers. We require one worker because one thread is exclusively used
+        /// for the accept loop. Another is used to handle requests. We always need at least 2, but
+        /// no more than the core count
+        workers: ?u16 = null,
     };
 
     pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
@@ -65,9 +74,15 @@ pub const Server = struct {
         const fd = try posix.socket(addr.any.family, flags, 0);
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
+        const worker_count: usize = blk: {
+            const cpu_count = std.Thread.getCpuCount() catch 1;
+            const base = opts.workers orelse @max(1, cpu_count -| 1);
+            break :blk @max(base, 1);
+        };
+
         self.* = .{
             .ring = try .init(opts.entries),
-            .rings = try gpa.alloc(io.Ring, 12),
+            .rings = try gpa.alloc(io.Ring, worker_count),
             .fd = fd,
             .addr = addr,
             .addr_len = addr.getOsSockLen(),
