@@ -13,6 +13,12 @@ const IoUring = linux.IoUring;
 
 const assert = std.debug.assert;
 
+const strings = struct {
+    const crlf = "\r\n";
+    const content_length = "Content-Length";
+    const content_type = "Content-Type";
+};
+
 pub fn threadRun(
     gpa: Allocator,
     ring: *IoUring,
@@ -439,21 +445,21 @@ const Connection = struct {
         // We never write the phrase
         writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
 
-        if (resp.headers.get("Content-Length") == null) {
-            writer.print("Content-Length: {d}\r\n", .{resp.body.items.len}) catch unreachable;
+        if (resp.headers.get(strings.content_length) == null) {
+            writer.print(strings.content_length ++ ": {d}" ++ strings.crlf, .{resp.body.items.len}) catch unreachable;
         }
 
-        if (resp.headers.get("Content-Type") == null) {
+        if (resp.headers.get(strings.content_type) == null) {
             // TODO: sniff content type
-            writer.print("Content-Type: {s}\r\n", .{"text/plain"}) catch unreachable;
+            writer.print(strings.content_type ++ ": {s}" ++ strings.crlf, .{"text/plain"}) catch unreachable;
         }
 
         var iter = resp.headers.iterator();
         while (iter.next()) |h| {
-            writer.print("{s}: {s}\r\n", .{ h.key_ptr.*, h.value_ptr.* }) catch unreachable;
+            writer.print("{s}: {s}" ++ strings.crlf, .{ h.key_ptr.*, h.value_ptr.* }) catch unreachable;
         }
 
-        writer.writeAll("\r\n") catch unreachable;
+        writer.writeAll(strings.crlf) catch unreachable;
     }
 
     fn responseComplete(self: *Connection) bool {
@@ -554,7 +560,7 @@ pub const Request = struct {
     pub fn appendSlice(self: *Request, gpa: Allocator, bytes: []const u8) !void {
         try self.bytes.appendSlice(gpa, bytes);
 
-        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n\r\n") orelse return;
+        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf ++ strings.crlf) orelse return;
         assert(idx + 4 == self.bytes.items.len);
         self.head_len = idx + 4;
 
@@ -589,7 +595,7 @@ pub const Request = struct {
     /// Returns the HTTP method of this request
     pub fn method(self: Request) http.Method {
         assert(self.head_len != null);
-        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n") orelse unreachable;
+        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf) orelse unreachable;
         const line = self.bytes.items[0..idx];
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
         const val = http.Method.parse(line[0..space]);
@@ -597,7 +603,7 @@ pub const Request = struct {
     }
 
     pub fn contentLength(self: Request) ?u64 {
-        const value = self.getHeader("Content-Length") orelse return null;
+        const value = self.getHeader(strings.content_length) orelse return null;
         return std.fmt.parseUnsigned(u64, value, 10) catch @panic("TODO: bad content length");
     }
 
