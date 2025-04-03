@@ -98,18 +98,6 @@ pub const Server = struct {
             while (self.ring.nextCompletion()) |cqe| {
                 try handleCqe(&self.ring, gpa, cqe, self);
             }
-            // _ = try self.ring.submitAndWait();
-            //
-            // const n = self.ring.ring.copy_cqes(&cqes, 1) catch |err| {
-            //     switch (err) {
-            //         error.SignalInterrupt => {},
-            //         else => log.err("copying cqes: {}", .{err}),
-            //     }
-            //     continue;
-            // };
-            // for (cqes[0..n]) |cqe| {
-            //     try handleCqe(&self.ring, gpa, cqe, self);
-            // }
         }
     }
 
@@ -234,11 +222,7 @@ fn handleAccept(
     };
 
     const conn = try gpa.create(Connection);
-    try conn.init(
-        gpa,
-        ring,
-        result,
-    );
+    try conn.init(gpa, ring, result);
 }
 
 const Connection = struct {
@@ -381,17 +365,26 @@ const Connection = struct {
         writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
 
         if (resp.headers.get(strings.content_length) == null) {
-            writer.print(strings.content_length ++ ": {d}" ++ strings.crlf, .{resp.body.items.len}) catch unreachable;
+            writer.print(
+                strings.content_length ++ ": {d}" ++ strings.crlf,
+                .{resp.body.items.len},
+            ) catch unreachable;
         }
 
         if (resp.headers.get(strings.content_type) == null) {
             // TODO: sniff content type
-            writer.print(strings.content_type ++ ": {s}" ++ strings.crlf, .{"text/plain"}) catch unreachable;
+            writer.print(
+                strings.content_type ++ ": {s}" ++ strings.crlf,
+                .{"text/plain"},
+            ) catch unreachable;
         }
 
         var iter = resp.headers.iterator();
         while (iter.next()) |h| {
-            writer.print("{s}: {s}" ++ strings.crlf, .{ h.key_ptr.*, h.value_ptr.* }) catch unreachable;
+            writer.print(
+                "{s}: {s}" ++ strings.crlf,
+                .{ h.key_ptr.*, h.value_ptr.* },
+            ) catch unreachable;
         }
 
         writer.writeAll(strings.crlf) catch unreachable;
