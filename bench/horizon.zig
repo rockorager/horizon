@@ -16,5 +16,96 @@ pub fn main() !void {
     var s: horizon.Server = undefined;
     try s.init(gpa, .{});
 
-    try s.run(gpa);
+    var gzip_handler: gzip.Handler = .{ .next = .{ .ptr = undefined, .serveFn = serveHttp } };
+
+    try s.run(gpa, .init(gzip.Handler, &gzip_handler));
 }
+
+pub fn serveHttp(_: *anyopaque, req: horizon.Request, resp: horizon.ResponseWriter) anyerror!void {
+    _ = req;
+    try resp.any().print("hello, world", .{});
+}
+
+const gzip = struct {
+    const Handler = struct {
+        next: horizon.Handler,
+
+        pub fn init(handler: horizon.Handler) Handler {
+            return .{ .next = handler };
+        }
+
+        pub fn serveHttp(
+            ptr: *anyopaque,
+            req: horizon.Request,
+            resp: horizon.ResponseWriter,
+        ) anyerror!void {
+            const self: *Handler = @ptrCast(@alignCast(ptr));
+
+            const hdr = req.getHeader("Accept-Encoding") orelse
+                return self.next.serveHttp(req, resp);
+
+            if (std.mem.indexOf(u8, hdr, "gzip") == null)
+                return self.next.serveHttp(req, resp);
+
+            var gz: ResponseWriter = .{ .rw = resp };
+            try self.next.serveHttp(req, gz.responseWriter());
+            try gz.flush();
+        }
+    };
+
+    const ResponseWriter = struct {
+        buffer: [4096]u8 = undefined,
+        idx: usize = 0,
+        rw: horizon.ResponseWriter,
+
+        fn responseWriter(self: *ResponseWriter) horizon.ResponseWriter {
+            return .init(ResponseWriter, self);
+        }
+
+        pub fn setHeader(ptr: *anyopaque, key: []const u8, value: ?[]const u8) std.mem.Allocator.Error!void {
+            const self: *ResponseWriter = @ptrCast(@alignCast(ptr));
+            return self.rw.setHeader(key, value);
+        }
+
+        pub fn setStatus(ptr: *anyopaque, status: std.http.Status) void {
+            const self: *ResponseWriter = @ptrCast(@alignCast(ptr));
+            self.rw.setStatus(status);
+        }
+
+        pub fn write(ptr: *const anyopaque, bytes: []const u8) anyerror!usize {
+            const self: *ResponseWriter = @constCast(@ptrCast(@alignCast(ptr)));
+
+            // If this write is longer than our buffer, we flush then directly compress the bytes
+            if (bytes.len > self.buffer.len) {
+                try self.flush();
+                var fbs = std.io.fixedBufferStream(bytes);
+                try std.compress.gzip.compress(fbs.reader(), self.rw.any(), .{});
+                return bytes.len;
+            }
+
+            // If we have room for the full amount, we memcpy and return
+            if (self.idx + bytes.len <= self.buffer.len) {
+                @memcpy(self.buffer[self.idx..][0..bytes.len], bytes);
+                self.idx += bytes.len;
+                return bytes.len;
+            }
+
+            const writeable_len = self.buffer.len - self.idx;
+            @memcpy(self.buffer[self.idx..][0..writeable_len], bytes[0..writeable_len]);
+            self.idx += writeable_len;
+            try self.flush();
+            const remainder = bytes.len - writeable_len;
+            @memcpy(self.buffer[0..remainder], bytes[remainder..]);
+            self.idx += remainder;
+            return bytes.len;
+        }
+
+        fn flush(self: *ResponseWriter) anyerror!void {
+            if (self.idx == 0) return;
+
+            var fbs = std.io.fixedBufferStream(self.buffer[0..self.idx]);
+            try std.compress.gzip.compress(fbs.reader(), self.rw.any(), .{});
+            self.idx = 0;
+        }
+    };
+};

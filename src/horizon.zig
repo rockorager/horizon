@@ -21,6 +21,7 @@ pub fn threadRun(
     gpa: Allocator,
     ring: *io.Ring,
     main: io.Ring,
+    handler: Handler,
 ) !void {
     ring.* = try main.initChild();
 
@@ -28,7 +29,7 @@ pub fn threadRun(
         try ring.submitAndWait();
 
         while (ring.nextCompletion()) |cqe| {
-            try handleCqe(ring, gpa, cqe, null);
+            try handleCqe(ring, gpa, cqe, null, handler);
         }
     }
 }
@@ -102,16 +103,16 @@ pub const Server = struct {
         // TODO: proper shutdown of threads
     }
 
-    pub fn run(self: *Server, gpa: Allocator) !void {
+    pub fn run(self: *Server, gpa: Allocator, handler: Handler) !void {
         for (self.rings) |*ring| {
-            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring });
+            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring, handler });
         }
 
         while (true) {
             try self.ring.submitAndWait();
 
             while (self.ring.nextCompletion()) |cqe| {
-                try handleCqe(&self.ring, gpa, cqe, self);
+                try handleCqe(&self.ring, gpa, cqe, self, handler);
             }
         }
     }
@@ -147,6 +148,7 @@ pub fn handleCqe(
     gpa: Allocator,
     cqe: io.Completion,
     server: ?*Server,
+    handler: Handler,
 ) !void {
     const c: *Completion = @ptrFromInt(cqe.userdata);
     switch (c.parent) {
@@ -171,7 +173,7 @@ pub fn handleCqe(
                 .recv => {
                     const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
                     defer conn.maybeDestroy(gpa);
-                    try conn.handleRecv(ring, cqe);
+                    try conn.handleRecv(ring, cqe, handler);
                 },
 
                 .send => {
@@ -315,6 +317,7 @@ const Connection = struct {
         self: *Connection,
         ring: *io.Ring,
         cqe: io.Completion,
+        handler: Handler,
     ) !void {
         self.active -= 1;
         self.recv_c.active = false;
@@ -345,7 +348,7 @@ const Connection = struct {
         }
 
         // We've received a full HEAD, call the handler now
-        try handler(self.request, &self.response);
+        try handler.serveHttp(self.request, self.response.responseWriter());
         try self.prepareHeader();
         try self.send(ring);
     }
@@ -567,6 +570,48 @@ pub const Request = struct {
     }
 };
 
+pub const ResponseWriter = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        setHeader: *const fn (*anyopaque, []const u8, ?[]const u8) Allocator.Error!void,
+        setStatus: *const fn (*anyopaque, status: http.Status) void,
+        write: *const fn (*const anyopaque, []const u8) anyerror!usize,
+
+        pub fn init(comptime T: type) *const VTable {
+            return &.{
+                .setHeader = T.setHeader,
+                .setStatus = T.setStatus,
+                .write = T.write,
+            };
+        }
+    };
+
+    pub fn init(comptime T: type, ptr: *T) ResponseWriter {
+        return .{
+            .ptr = ptr,
+            .vtable = .init(T),
+        };
+    }
+
+    pub fn setHeader(self: ResponseWriter, name: []const u8, value: ?[]const u8) Allocator.Error!void {
+        return self.vtable.setHeader(self.ptr, name, value);
+    }
+
+    pub fn setStatus(self: ResponseWriter, status: http.Status) void {
+        return self.vtable.setStatus(self.ptr, status);
+    }
+
+    pub fn write(self: ResponseWriter, bytes: []const u8) Allocator.Error!usize {
+        return self.vtable.write(self.ptr, bytes);
+    }
+
+    pub fn any(self: ResponseWriter) std.io.AnyWriter {
+        return .{ .context = self.ptr, .writeFn = self.vtable.write };
+    }
+};
+
 pub const Response = struct {
     arena: Allocator,
 
@@ -576,39 +621,36 @@ pub const Response = struct {
 
     status: ?http.Status = null,
 
-    pub fn setHeader(self: *Response, k: []const u8, v: []const u8) Allocator.Error!void {
-        const k_dupe = try self.arena.dupe(u8, k);
-        const v_dupe = try self.arena.dupe(u8, v);
-        try self.headers.put(self.arena, k_dupe, v_dupe);
+    const VTable: ResponseWriter.VTable = .{
+        .setHeader = Response.setHeader,
+        .setStatus = Response.setStatus,
+        .write = Response.typeErasedWrite,
+    };
+
+    fn responseWriter(self: *Response) ResponseWriter {
+        return .{ .ptr = self, .vtable = &VTable };
     }
 
-    pub fn setStatus(self: *Response, status: http.Status) void {
+    fn setHeader(ptr: *anyopaque, k: []const u8, maybe_v: ?[]const u8) Allocator.Error!void {
+        const self: *Response = @ptrCast(@alignCast(ptr));
+        if (maybe_v) |v| {
+            const k_dupe = try self.arena.dupe(u8, k);
+            const v_dupe = try self.arena.dupe(u8, v);
+            return self.headers.put(self.arena, k_dupe, v_dupe);
+        }
+
+        _ = self.headers.remove(k);
+    }
+
+    fn setStatus(ptr: *anyopaque, status: http.Status) void {
+        const self: *Response = @ptrCast(@alignCast(ptr));
         self.status = status;
-    }
-
-    pub fn write(self: *Response, bytes: []const u8) Allocator.Error!usize {
-        try self.body.appendSlice(self.arena, bytes);
-        return bytes.len;
-    }
-
-    pub fn writeAll(self: *Response, bytes: []const u8) Allocator.Error!void {
-        try self.body.appendSlice(self.arena, bytes);
-    }
-
-    pub fn print(self: *Response, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
-        try self.body.writer(self.arena).print(fmt, args);
     }
 
     fn typeErasedWrite(ptr: *const anyopaque, bytes: []const u8) anyerror!usize {
         const self: *Response = @constCast(@ptrCast(@alignCast(ptr)));
-        return self.write(bytes);
-    }
-
-    pub fn any(self: *Response) std.io.AnyWriter {
-        return .{
-            .context = self,
-            .writeFn = typeErasedWrite,
-        };
+        try self.body.appendSlice(self.arena, bytes);
+        return bytes.len;
     }
 };
 
@@ -663,7 +705,16 @@ pub const HeaderIterator = struct {
     }
 };
 
-fn handler(req: Request, resp: *Response) !void {
-    _ = req;
-    try resp.writeAll("hey");
-}
+pub const Handler = struct {
+    ptr: *anyopaque,
+    serveFn: *const fn (*anyopaque, Request, ResponseWriter) anyerror!void,
+
+    /// Initialize a handler from a Type which has a serveHttp method
+    pub fn init(comptime T: type, ptr: *T) Handler {
+        return .{ .ptr = ptr, .serveFn = T.serveHttp };
+    }
+
+    pub fn serveHttp(self: Handler, req: Request, resp: ResponseWriter) anyerror!void {
+        return self.serveFn(self.ptr, req, resp);
+    }
+};
