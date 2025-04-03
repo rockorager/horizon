@@ -68,7 +68,7 @@ pub fn nextCompletion(self: *Uring) ?io.Completion {
     return .{
         .userdata = cqe.user_data,
         .result = cqe.res,
-        .flags = cqe.flags,
+        .flags = @bitCast(cqe.flags),
     };
 }
 

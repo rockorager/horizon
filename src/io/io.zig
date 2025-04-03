@@ -34,7 +34,28 @@ pub const SubmissionQueueEntry = extern struct {
 pub const Completion = extern struct {
     userdata: u64,
     result: i32,
-    flags: u32,
+    flags: Flags,
+
+    pub const Flags = packed struct(u32) {
+        /// If set, the upper 16 bits are the buffer ID
+        buffer: bool = false,
+
+        /// If set, the parent SQE will generate more CQEs
+        has_more: bool = false,
+
+        /// If set, more data is available in the socket recv
+        socket_nonempty: bool = false,
+
+        /// Set for notification CQEs. Can be used to distinct them from sends for zerocopy
+        notification: bool = false,
+
+        /// The buffer was partially consumed and will get more completions.
+        buffer_more: bool = false,
+
+        _padding: u11 = 0,
+
+        buffer_id: u16 = 0,
+    };
 
     pub const Error = error{
         Canceled,
@@ -126,6 +147,7 @@ pub const Op = enum(u8) {
 test Ring {
     // Ensure the exposed API exists for all backends
     try std.testing.expect(std.meta.hasMethod(Ring, "submitAndWait"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "nextCompletion"));
     try std.testing.expect(std.meta.hasMethod(Ring, "accept"));
     try std.testing.expect(std.meta.hasMethod(Ring, "msgRing"));
     try std.testing.expect(std.meta.hasMethod(Ring, "cancel"));

@@ -4,7 +4,6 @@ const io = @import("io/io.zig");
 const log = std.log.scoped(.horizon);
 
 const http = std.http;
-const linux = std.os.linux;
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
@@ -62,9 +61,9 @@ pub const Server = struct {
         else
             net.Address.parseIp4("127.0.0.1", 8080) catch unreachable;
 
-        const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
+        const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
         const fd = try posix.socket(addr.any.family, flags, 0);
-        try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
         self.* = .{
             .ring = try .init(opts.entries),
@@ -129,7 +128,7 @@ pub const Server = struct {
             return;
         };
 
-        if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+        if (!cqe.flags.has_more) {
             // Multishot accept will return if it wasn't able to accept the next connection. Requeue it
             try ring.accept(self.fd, &self.accept_c);
             self.accept_c.active = true;
