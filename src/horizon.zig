@@ -1,5 +1,5 @@
 const std = @import("std");
-const tls = @import("tls");
+const io = @import("io/io.zig");
 
 const log = std.log.scoped(.horizon);
 
@@ -9,7 +9,6 @@ const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const HeadParser = http.HeadParser;
-const IoUring = linux.IoUring;
 
 const assert = std.debug.assert;
 
@@ -21,55 +20,24 @@ const strings = struct {
 
 pub fn threadRun(
     gpa: Allocator,
-    ring: *IoUring,
-    wq_fd: posix.fd_t,
+    ring: *io.Ring,
+    main: io.Ring,
 ) !void {
-    {
-        // Initialize the ring
-        const flags: u32 =
-            linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
-            linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
-            linux.IORING_SETUP_ATTACH_WQ | // Share work queue
-            linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks
-            linux.IORING_SETUP_COOP_TASKRUN | // Don't interupt userspace when task is complete
-            linux.IORING_SETUP_SINGLE_ISSUER; // Only a single thread will issue tasks
+    ring.* = try main.initChild(64);
 
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = flags,
-            .wq_fd = @as(u32, @intCast(wq_fd)),
-        });
-
-        ring.* = try .init_params(64, &params);
-    }
-
-    var cqes: [32]linux.io_uring_cqe = undefined;
     while (true) {
-        _ = try ring.submit();
+        try ring.submitAndWait();
 
-        const n = ring.copy_cqes(&cqes, 1) catch |err| {
-            switch (err) {
-                error.SignalInterrupt => {},
-                else => log.err("copying cqes: {}", .{err}),
-            }
-            continue;
-        };
-        for (cqes[0..n]) |cqe| {
+        while (ring.nextCompletion()) |cqe| {
             try handleCqe(ring, gpa, cqe, null);
         }
     }
 }
 
-fn getSqe(ring: *IoUring) !*linux.io_uring_sqe {
-    return ring.get_sqe() catch {
-        _ = ring.submit() catch 0;
-        return ring.get_sqe();
-    };
-}
-
 pub const Server = struct {
-    ring: IoUring,
+    ring: io.Ring,
 
-    rings: []IoUring,
+    rings: []io.Ring,
     next_ring: usize = 0,
 
     fd: posix.fd_t,
@@ -94,27 +62,13 @@ pub const Server = struct {
         else
             net.Address.parseIp4("127.0.0.1", 8080) catch unreachable;
 
-        const io_uring_flags: u32 =
-            linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
-            linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
-            linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks
-            linux.IORING_SETUP_COOP_TASKRUN | // Don't interupt userspace when task is complete
-            linux.IORING_SETUP_SINGLE_ISSUER; // Only a single thread will issue tasks
-
-        var params = std.mem.zeroInit(linux.io_uring_params, .{
-            .flags = io_uring_flags,
-            .sq_thread_idle = 1000,
-        });
-
-        const ring: linux.IoUring = try .init_params(opts.entries, &params);
-
         const flags = linux.SOCK.STREAM | linux.SOCK.CLOEXEC;
         const fd = try posix.socket(addr.any.family, flags, 0);
         try posix.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
 
         self.* = .{
-            .ring = ring,
-            .rings = try gpa.alloc(IoUring, 12),
+            .ring = try .init(opts.entries),
+            .rings = try gpa.alloc(io.Ring, 12),
             .fd = fd,
             .addr = addr,
             .addr_len = addr.getOsSockLen(),
@@ -125,11 +79,7 @@ pub const Server = struct {
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
         try posix.listen(fd, 64);
 
-        const sqe = try getSqe(&self.ring);
-        const accept_flags: u32 = 0;
-
-        sqe.prep_multishot_accept(self.fd, &self.addr.any, &self.addr_len, accept_flags);
-        sqe.user_data = @intFromPtr(&self.accept_c);
+        try self.ring.accept(self.fd, &self.accept_c);
         self.accept_c.active = true;
     }
 
@@ -140,81 +90,77 @@ pub const Server = struct {
 
     pub fn run(self: *Server, gpa: Allocator) !void {
         for (self.rings) |*ring| {
-            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring.fd });
+            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring });
         }
 
-        var cqes: [128]linux.io_uring_cqe = undefined;
         while (true) {
-            _ = try self.ring.submit();
+            try self.ring.submitAndWait();
 
-            const n = self.ring.copy_cqes(&cqes, 1) catch |err| {
-                switch (err) {
-                    error.SignalInterrupt => {},
-                    else => log.err("copying cqes: {}", .{err}),
-                }
-                continue;
-            };
-            for (cqes[0..n]) |cqe| {
+            while (self.ring.nextCompletion()) |cqe| {
                 try handleCqe(&self.ring, gpa, cqe, self);
             }
+            // _ = try self.ring.submitAndWait();
+            //
+            // const n = self.ring.ring.copy_cqes(&cqes, 1) catch |err| {
+            //     switch (err) {
+            //         error.SignalInterrupt => {},
+            //         else => log.err("copying cqes: {}", .{err}),
+            //     }
+            //     continue;
+            // };
+            // for (cqes[0..n]) |cqe| {
+            //     try handleCqe(&self.ring, gpa, cqe, self);
+            // }
         }
     }
 
     /// Accept a connection and send it to a thread to work on it
     fn acceptAndSend(
         self: *Server,
-        ring: *IoUring,
-        cqe: linux.io_uring_cqe,
-        target_fd: posix.fd_t,
+        ring: *io.Ring,
+        cqe: io.Completion,
+        target: io.Ring,
     ) CallbackError!void {
-        switch (cqe.err()) {
-            .SUCCESS => {},
-            .INVAL => @panic("invalid submission"),
-            .CANCELED => return,
-            else => log.err("accept returned err={}", .{cqe.err()}),
-        }
+        const result = cqe.unwrap() catch |err| {
+            switch (err) {
+                error.Canceled => {},
+                else => log.err("accept unwrap: {}", .{err}),
+            }
+            return;
+        };
 
         if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
             // Multishot accept will return if it wasn't able to accept the next connection. Requeue it
-            const sqe = try getSqe(ring);
-            sqe.prep_multishot_accept(self.fd, &self.addr.any, &self.addr_len, 0);
-            sqe.user_data = @intFromPtr(&self.accept_c);
+            try ring.accept(self.fd, &self.accept_c);
             self.accept_c.active = true;
         }
 
         // Send the fd to another thread for handling
-        const sqe = try getSqe(ring);
-        sqe.prep_rw(.MSG_RING, target_fd, 0, @intCast(cqe.res), @intFromPtr(&self.accept_c));
-        sqe.user_data = @intFromPtr(&self.msg_ring_c);
-        sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
-        return;
+        try ring.msgRing(target, result, &self.accept_c, &self.msg_ring_c);
     }
 };
 
 pub fn handleCqe(
-    ring: *IoUring,
+    ring: *io.Ring,
     gpa: Allocator,
-    cqe: linux.io_uring_cqe,
+    cqe: io.Completion,
     server: ?*Server,
 ) !void {
-    const c: *Completion = @ptrFromInt(cqe.user_data);
+    const c: *Completion = @ptrFromInt(cqe.userdata);
     switch (c.parent) {
         .server => switch (c.op) {
             .accept => {
                 const srv: *Server = @alignCast(@fieldParentPtr("accept_c", c));
                 if (server) |s| {
-                    const target = s.rings[s.next_ring].fd;
+                    const target = s.rings[s.next_ring];
                     s.next_ring = (s.next_ring + 1) % (s.rings.len);
-                    try srv.acceptAndSend(ring, cqe, target);
+                    try srv.acceptAndSend(&s.ring, cqe, target);
                 } else {
                     try handleAccept(gpa, ring, cqe);
                 }
             },
             .msg_ring => {
-                switch (cqe.err()) {
-                    .SUCCESS => {},
-                    else => log.err("msg not sent to ring: {}", .{cqe.err()}),
-                }
+                _ = cqe.unwrap() catch |err| log.err("msg not sent to ring: {}", .{err});
             },
             else => unreachable,
         },
@@ -235,10 +181,8 @@ pub fn handleCqe(
                 .close => {
                     const conn: *Connection = @alignCast(@fieldParentPtr("close_c", c));
                     defer conn.maybeDestroy(gpa);
-                    switch (cqe.err()) {
-                        .SUCCESS => {},
-                        else => log.err("connection closed with error: {}", .{cqe.err()}),
-                    }
+                    _ = cqe.unwrap() catch |err|
+                        log.err("connection closed with error: {}", .{err});
                     conn.active -= 1;
                 },
 
@@ -282,20 +226,19 @@ const CallbackError = Allocator.Error || error{
 
 fn handleAccept(
     gpa: Allocator,
-    ring: *IoUring,
-    cqe: linux.io_uring_cqe,
+    ring: *io.Ring,
+    cqe: io.Completion,
 ) CallbackError!void {
-    switch (cqe.err()) {
-        .SUCCESS => {},
-        .INVAL => @panic("invalid submission"),
-        else => unreachable,
-    }
+    const result = cqe.unwrap() catch {
+        log.err("accept error: {}", .{cqe.err()});
+        @panic("accept error");
+    };
 
     const conn = try gpa.create(Connection);
     try conn.init(
         gpa,
         ring,
-        cqe.res,
+        result,
     );
 }
 
@@ -325,7 +268,12 @@ const Connection = struct {
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
-    pub fn init(self: *Connection, gpa: Allocator, ring: *IoUring, fd: posix.socket_t) CallbackError!void {
+    pub fn init(
+        self: *Connection,
+        gpa: Allocator,
+        ring: *io.Ring,
+        fd: posix.socket_t,
+    ) CallbackError!void {
         self.* = .{
             .arena = .init(gpa),
             .fd = fd,
@@ -335,9 +283,7 @@ const Connection = struct {
 
         self.response = .{ .arena = self.arena.allocator() };
 
-        const sqe = try getSqe(ring);
-        sqe.prep_recv(self.fd, &self.buf, 0);
-        sqe.user_data = @intFromPtr(&self.recv_c);
+        try ring.recv(self.fd, &self.buf, &self.recv_c);
 
         self.active += 1;
         self.recv_c.active = true;
@@ -354,57 +300,47 @@ const Connection = struct {
         self.* = undefined;
     }
 
-    fn close(self: *Connection, ring: *IoUring) !void {
+    fn close(self: *Connection, ring: *io.Ring) !void {
         if (self.recv_c.active) {
-            const sqe = try getSqe(ring);
-            self.active += 1;
             // Cancel recv_c if we have one out there
-            sqe.prep_cancel(@intFromPtr(&self.recv_c), 0);
-            sqe.user_data = @intFromPtr(&self.cancel_c);
+            try ring.cancel(&self.recv_c, &self.cancel_c);
+            self.active += 1;
             self.cancel_c.active = true;
         }
         // Close downstream
-        const sqe = try getSqe(ring);
+        try ring.close(self.fd, &self.close_c);
         self.active += 1;
-        sqe.prep_close(self.fd);
-        sqe.user_data = @intFromPtr(&self.close_c);
         self.close_c.active = true;
     }
 
     pub fn handleRecv(
         self: *Connection,
-        ring: *IoUring,
-        cqe: linux.io_uring_cqe,
+        ring: *io.Ring,
+        cqe: io.Completion,
     ) !void {
         self.active -= 1;
         self.recv_c.active = false;
-        if (cqe.res == 0) {
+        if (cqe.result == 0) {
             // Peer gracefully closed connection
             return self.close(ring);
         }
 
-        switch (cqe.err()) {
-            .SUCCESS => {},
-            .CANCELED => return,
-            .CONNRESET => {
-                // This fd was closed by the peer
-                try self.close(ring);
-                return;
-            },
-            else => {
-                log.err("recv error: {}", .{cqe.err()});
-                return self.close(ring);
-            },
-        }
+        const result = cqe.unwrap() catch |err| {
+            switch (err) {
+                error.Canceled => return,
+                error.ConnectionResetByPeer => return self.close(ring),
+                else => {
+                    log.err("recv error: {}", .{cqe.err()});
+                    return self.close(ring);
+                },
+            }
+        };
 
-        try self.request.appendSlice(self.arena.allocator(), self.buf[0..@intCast(cqe.res)]);
+        try self.request.appendSlice(self.arena.allocator(), self.buf[0..result]);
 
         if (self.request.head_len == null) {
             // We haven't received a full HEAD. prep another recv
-            const sqe = try getSqe(ring);
-            sqe.prep_recv(self.fd, &self.buf, 0);
-            sqe.user_data = @intFromPtr(&self.recv_c);
-
+            try ring.recv(self.fd, &self.buf, &self.recv_c);
             self.active += 1;
             self.recv_c.active = true;
             return;
@@ -466,15 +402,12 @@ const Connection = struct {
         return self.written == (self.write_buf.items.len + self.response.body.items.len);
     }
 
-    fn send(self: *Connection, ring: *IoUring) !void {
+    fn send(self: *Connection, ring: *io.Ring) !void {
         // Pending headers, no body
         if (self.written < self.write_buf.items.len and self.response.body.items.len == 0) {
-            const sqe = try getSqe(ring);
+            try ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
             self.active += 1;
-            sqe.prep_write(self.fd, self.write_buf.items[self.written..], 0);
-            sqe.user_data = @intFromPtr(&self.send_c);
             self.send_c.active = true;
-
             return;
         }
 
@@ -490,10 +423,8 @@ const Connection = struct {
                 .len = self.response.body.items.len,
             };
 
-            const sqe = try getSqe(ring);
+            try ring.writev(self.fd, &self.vecs, &self.send_c);
             self.active += 1;
-            sqe.prep_writev(self.fd, &self.vecs, 0);
-            sqe.user_data = @intFromPtr(&self.send_c);
             self.send_c.active = true;
 
             return;
@@ -502,14 +433,12 @@ const Connection = struct {
         // Pending body
         const offset = self.written - self.write_buf.items.len;
         const body = self.response.body.items[offset..];
-        const sqe = try getSqe(ring);
         self.active += 1;
-        sqe.prep_write(self.fd, body, 0);
-        sqe.user_data = @intFromPtr(&self.send_c);
+        try ring.write(self.fd, body, &self.send_c);
         self.send_c.active = true;
     }
 
-    fn handleSend(self: *Connection, ring: *IoUring, cqe: linux.io_uring_cqe) CallbackError!void {
+    fn handleSend(self: *Connection, ring: *io.Ring, cqe: io.Completion) CallbackError!void {
         self.active -= 1;
         self.send_c.active = false;
         switch (cqe.err()) {
@@ -520,7 +449,7 @@ const Connection = struct {
             },
         }
 
-        self.written += @intCast(cqe.res);
+        self.written += @intCast(cqe.result);
 
         switch (self.responseComplete()) {
             // If the response didn't finish sending, try again
@@ -533,10 +462,8 @@ const Connection = struct {
                 true => {
                     self.reset();
                     // prep another recv
-                    const sqe = try getSqe(ring);
+                    try ring.recv(self.fd, &self.buf, &self.recv_c);
                     self.active += 1;
-                    sqe.prep_recv(self.fd, &self.buf, 0);
-                    sqe.user_data = @intFromPtr(&self.recv_c);
                 },
             },
         }

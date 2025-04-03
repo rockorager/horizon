@@ -10,15 +10,26 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const io_module = b.addModule("io", .{
+        .root_source_file = b.path("src/io/io.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    horizon_module.addImport("io", io_module);
+
     const zeit_dep = b.dependency("zeit", .{ .target = target, .optimize = optimize });
     horizon_module.addImport("zeit", zeit_dep.module("zeit"));
 
     const unit_tests = b.addTest(.{ .root_module = horizon_module });
-
     const run_unit_tests = b.addRunArtifact(unit_tests);
+
+    const io_tests = b.addTest(.{ .root_module = io_module });
+    const run_io_tests = b.addRunArtifact(io_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    test_step.dependOn(&run_io_tests.step);
 
     const bench_server = b.option(BenchServer, "bench-server", "Run a bench server") orelse .horizon;
     const run_cmd: *std.Build.Step.Run = switch (bench_server) {
