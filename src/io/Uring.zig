@@ -29,8 +29,8 @@ pub fn init(entries: u16) !Uring {
 }
 
 /// Initializes a child Ring which can be woken up by self. This must be called from the thread
-/// which will operate the child ring
-pub fn initChild(self: Uring, entries: u16) !Uring {
+/// which will operate the child ring. Initializes with the same queue size as the parent
+pub fn initChild(self: Uring) !Uring {
     const flags: u32 = common_flags | linux.IORING_SETUP_ATTACH_WQ;
 
     var params = std.mem.zeroInit(linux.io_uring_params, .{
@@ -38,6 +38,8 @@ pub fn initChild(self: Uring, entries: u16) !Uring {
         .sq_thread_idle = 1000,
         .wq_fd = @as(u32, @bitCast(self.ring.fd)),
     });
+
+    const entries: u16 = @intCast(self.ring.sq.sqes.len);
 
     return .{
         .ring = try .init_params(entries, &params),

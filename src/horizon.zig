@@ -22,7 +22,7 @@ pub fn threadRun(
     ring: *io.Ring,
     main: io.Ring,
 ) !void {
-    ring.* = try main.initChild(64);
+    ring.* = try main.initChild();
 
     while (true) {
         try ring.submitAndWait();
