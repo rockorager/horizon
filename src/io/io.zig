@@ -146,6 +146,8 @@ pub const Op = enum(u8) {
 
 test Ring {
     // Ensure the exposed API exists for all backends
+    try std.testing.expect(std.meta.hasMethod(Ring, "init"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "deinit"));
     try std.testing.expect(std.meta.hasMethod(Ring, "submitAndWait"));
     try std.testing.expect(std.meta.hasMethod(Ring, "nextCompletion"));
     try std.testing.expect(std.meta.hasMethod(Ring, "accept"));

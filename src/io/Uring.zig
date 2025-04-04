@@ -28,6 +28,11 @@ pub fn init(entries: u16) !Uring {
     };
 }
 
+pub fn deinit(self: *Uring) void {
+    if (self.ring.fd < 0) return;
+    self.ring.deinit();
+}
+
 /// Initializes a child Ring which can be woken up by self. This must be called from the thread
 /// which will operate the child ring. Initializes with the same queue size as the parent
 pub fn initChild(self: Uring) !Uring {
@@ -59,7 +64,6 @@ pub fn submitAndWait(self: *Uring) !void {
     }
 }
 
-/// Blocks until a completion is available
 pub fn nextCompletion(self: *Uring) ?io.Completion {
     const ready = self.ring.cq_ready();
     if (ready == 0) return null;

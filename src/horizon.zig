@@ -37,6 +37,7 @@ pub fn threadRun(
 pub const Server = struct {
     ring: io.Ring,
 
+    threads: []std.Thread,
     rings: []io.Ring,
     next_ring: usize = 0,
 
@@ -83,6 +84,7 @@ pub const Server = struct {
         self.* = .{
             .ring = try .init(opts.entries),
             .rings = try gpa.alloc(io.Ring, worker_count),
+            .threads = try gpa.alloc(std.Thread, worker_count),
             .fd = fd,
             .addr = addr,
             .accept_c = .{ .parent = .server, .op = .accept },
@@ -99,14 +101,24 @@ pub const Server = struct {
         self.accept_c.active = true;
     }
 
-    pub fn deinit(self: *Server) void {
+    /// Queues a stop of the server
+    pub fn deinit(self: *Server, gpa: Allocator) void {
+        for (self.rings) |*ring| {
+            ring.deinit();
+        }
         self.ring.deinit();
-        // TODO: proper shutdown of threads
+
+        gpa.free(self.rings);
+        gpa.free(self.threads);
     }
 
-    pub fn run(self: *Server, gpa: Allocator, handler: Handler) !void {
-        for (self.rings) |*ring| {
-            _ = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring, handler });
+    pub fn run(
+        self: *Server,
+        gpa: Allocator,
+        handler: Handler,
+    ) !void {
+        for (self.rings, 0..) |*ring, i| {
+            self.threads[i] = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring, handler });
         }
 
         while (true) {
