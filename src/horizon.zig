@@ -26,6 +26,8 @@ pub const Worker = struct {
     /// shutting down
     keep_alive: u8,
 
+    timeout: Server.Timeouts,
+
     fn serve(self: *Worker, gpa: Allocator, server: *Server) !void {
         self.ring = try server.ring.initChild();
         while (!self.should_quit) {
@@ -40,6 +42,27 @@ pub const Worker = struct {
             try self.ring.submitAndWait();
 
             while (self.ring.nextCompletion()) |cqe| {
+                try self.handleCqe(gpa, cqe);
+            }
+        }
+
+        // We've handled all the inflight requests. Now cancel everything that remains to clean up
+        // nicely
+        try self.ring.cancelAll();
+        var total: usize = 1;
+        while (total > 0) {
+            try self.ring.submitAndWait();
+            while (self.ring.nextCompletion()) |cqe| {
+                if (cqe.userdata == 0) {
+                    total -= 1;
+                    // This is our cancellation cqe
+                    const res = cqe.unwrap() catch |err| {
+                        log.err("cancel all error: {}", .{err});
+                        continue;
+                    };
+                    total = res;
+                    continue;
+                }
                 try self.handleCqe(gpa, cqe);
             }
         }
@@ -89,6 +112,8 @@ pub const Worker = struct {
                         conn.active -= 1;
                     },
 
+                    .timeout => {},
+
                     else => unreachable,
                 }
             },
@@ -122,6 +147,8 @@ pub const Server = struct {
     /// Stable completion pointer for messaging threads
     accept_c: Completion = .{ .parent = .server, .op = .accept },
 
+    timeout: Timeouts,
+
     pub const Options = struct {
         /// Number of entries in the completion queues
         entries: u16 = 64,
@@ -139,6 +166,26 @@ pub const Server = struct {
         /// first signal will trigger a graceful shutdown. The second will initiate an immediate
         /// shutdown
         shutdown_signal: u6 = 0,
+
+        /// Timeout from first connection, to when we must receive all headers. A value of 0 is no
+        /// timeout
+        read_header_timeout: u8 = 10,
+
+        /// Timeout from when we have read headers to when we should have read the full body
+        read_body_timeout: u8 = 10,
+
+        /// Timeout from end of response to next request on a keep-alive connection
+        idle_timeout: u8 = 60,
+
+        /// Timeout to complete the write of the response
+        write_timeout: u8 = 20,
+    };
+
+    const Timeouts = struct {
+        read_header: u8,
+        read_body: u8,
+        idle: u8,
+        write: u8,
     };
 
     pub const Op = enum {
@@ -179,6 +226,12 @@ pub const Server = struct {
             .addr = addr,
             .stop_pipe = try posix.pipe2(.{}),
             .shutdown_signal = opts.shutdown_signal,
+            .timeout = .{
+                .read_header = opts.read_header_timeout,
+                .read_body = opts.read_body_timeout,
+                .idle = opts.idle_timeout,
+                .write = opts.write_timeout,
+            },
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
@@ -210,7 +263,6 @@ pub const Server = struct {
         if (self.shutdown_signal > 0) {
             // Listen for the shutdown signal
             sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
-            log.debug("sfd={d}", .{sfd.?});
         }
 
         for (self.workers, 0..) |*worker, i| {
@@ -219,6 +271,7 @@ pub const Server = struct {
                 .ring = undefined,
                 .handler = handler,
                 .keep_alive = 0,
+                .timeout = self.timeout,
             };
             worker.handler = handler;
             self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
@@ -375,6 +428,7 @@ const Completion = struct {
         cancel,
         stop,
         signal,
+        timeout,
     },
 
     /// If the completion has been scheduled
@@ -398,6 +452,7 @@ const Connection = struct {
     send_c: Completion = .{ .parent = .connection, .op = .send },
     close_c: Completion = .{ .parent = .connection, .op = .close },
     cancel_c: Completion = .{ .parent = .connection, .op = .cancel },
+    timeout_c: Completion = .{ .parent = .connection, .op = .timeout },
 
     /// Write buffer
     write_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -413,7 +468,10 @@ const Connection = struct {
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
-    was_idle: bool,
+    idle: bool,
+
+    /// deadline to perform the next action
+    deadline: i64,
 
     pub fn init(
         self: *Connection,
@@ -426,12 +484,23 @@ const Connection = struct {
             .fd = fd,
             .response = undefined,
             .vecs = undefined,
-            .was_idle = false,
+            .idle = false,
+            .deadline = std.time.timestamp() + worker.timeout.read_header,
         };
 
         self.response = .{ .arena = self.arena.allocator() };
 
-        try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+        if (worker.timeout.read_header > 0) {
+            try worker.ring.recvWithDeadline(
+                self.fd,
+                &self.buf,
+                self.deadline,
+                &self.recv_c,
+                &self.timeout_c,
+            );
+        } else {
+            try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+        }
 
         self.active += 1;
         self.recv_c.active = true;
@@ -482,13 +551,30 @@ const Connection = struct {
                     return self.close(&worker.ring);
                 },
             }
+            return;
         };
+
+        if (self.idle and worker.timeout.read_header > 0) {
+            // If we are coming out of idle, we have to update our deadline
+            self.idle = false;
+            self.deadline = std.time.timestamp() + worker.timeout.read_header;
+        }
 
         try self.request.appendSlice(self.arena.allocator(), self.buf[0..result]);
 
         if (!self.request.receivedHeader()) {
             // We haven't received a full HEAD. prep another recv
-            try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+            if (worker.timeout.read_header > 0) {
+                try worker.ring.recvWithDeadline(
+                    self.fd,
+                    &self.buf,
+                    self.deadline,
+                    &self.recv_c,
+                    &self.timeout_c,
+                );
+            } else {
+                try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+            }
             self.active += 1;
             self.recv_c.active = true;
             return;
@@ -499,6 +585,7 @@ const Connection = struct {
         // We've received a full HEAD, call the handler now
         try worker.handler.serveHttp(self.response.responseWriter(), self.request);
         try self.prepareHeader();
+        if (worker.timeout.write > 0) self.deadline = std.time.timestamp() + worker.timeout.write;
         try self.send(worker);
     }
 
@@ -567,7 +654,17 @@ const Connection = struct {
     fn send(self: *Connection, worker: *Worker) !void {
         // Pending headers, no body
         if (self.written < self.write_buf.items.len and self.response.body.items.len == 0) {
-            try worker.ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
+            if (worker.timeout.write > 0) {
+                try worker.ring.writeWithDeadline(
+                    self.fd,
+                    self.write_buf.items[self.written..],
+                    self.deadline,
+                    &self.send_c,
+                    &self.timeout_c,
+                );
+            } else {
+                try worker.ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
+            }
             self.active += 1;
             self.send_c.active = true;
             return;
@@ -584,8 +681,17 @@ const Connection = struct {
                 .base = self.response.body.items.ptr,
                 .len = self.response.body.items.len,
             };
-
-            try worker.ring.writev(self.fd, &self.vecs, &self.send_c);
+            if (worker.timeout.write > 0) {
+                try worker.ring.writevWithDeadline(
+                    self.fd,
+                    &self.vecs,
+                    self.deadline,
+                    &self.send_c,
+                    &self.timeout_c,
+                );
+            } else {
+                try worker.ring.writev(self.fd, &self.vecs, &self.send_c);
+            }
             self.active += 1;
             self.send_c.active = true;
 
@@ -596,7 +702,17 @@ const Connection = struct {
         const offset = self.written - self.write_buf.items.len;
         const body = self.response.body.items[offset..];
         self.active += 1;
-        try worker.ring.write(self.fd, body, &self.send_c);
+        if (worker.timeout.write > 0) {
+            try worker.ring.writeWithDeadline(
+                self.fd,
+                body,
+                self.deadline,
+                &self.send_c,
+                &self.timeout_c,
+            );
+        } else {
+            try worker.ring.write(self.fd, body, &self.send_c);
+        }
         self.send_c.active = true;
     }
 
@@ -630,8 +746,22 @@ const Connection = struct {
                 }
 
                 self.reset();
+
+                self.idle = true;
+
                 // prep another recv
-                try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+                if (worker.timeout.idle > 0) {
+                    self.deadline = std.time.timestamp() + worker.timeout.idle;
+                    try worker.ring.recvWithDeadline(
+                        self.fd,
+                        &self.buf,
+                        self.deadline,
+                        &self.recv_c,
+                        &self.timeout_c,
+                    );
+                } else {
+                    try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+                }
                 self.active += 1;
             },
         }

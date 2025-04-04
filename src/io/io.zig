@@ -60,6 +60,7 @@ pub const Completion = extern struct {
     pub const Error = error{
         Canceled,
         ConnectionResetByPeer,
+        TimedOut,
         Unexpected,
     };
 
@@ -75,6 +76,7 @@ pub const Completion = extern struct {
             .SUCCESS => return @intCast(self.result),
             .CONNRESET => return error.ConnectionResetByPeer,
             .CANCELED => return error.Canceled,
+            .TIME => return error.TimedOut,
             else => {
                 std.log.err("completion error: {}", .{self.err()});
                 return error.Unexpected;
@@ -156,8 +158,11 @@ test Ring {
     try std.testing.expect(std.meta.hasMethod(Ring, "cancel"));
     try std.testing.expect(std.meta.hasMethod(Ring, "close"));
     try std.testing.expect(std.meta.hasMethod(Ring, "recv"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "recvWithDeadline"));
     try std.testing.expect(std.meta.hasMethod(Ring, "write"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "writeWithDeadline"));
     try std.testing.expect(std.meta.hasMethod(Ring, "writev"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "writevWithDeadline"));
     try std.testing.expect(std.meta.hasMethod(Ring, "poll"));
     try std.testing.expect(std.meta.hasMethod(Ring, "signalfd"));
     try std.testing.expect(std.meta.hasMethod(Ring, "timer"));

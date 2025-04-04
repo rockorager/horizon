@@ -111,6 +111,35 @@ pub fn recv(self: *Uring, fd: posix.fd_t, buffer: []u8, userdata: *anyopaque) er
     sqe.user_data = @intFromPtr(userdata);
 }
 
+/// Also performs a submit because we need a stable struct until the SQE is submitted
+pub fn recvWithDeadline(
+    self: *Uring,
+    fd: posix.fd_t,
+    buffer: []u8,
+    deadline: i64,
+    recv_userdata: *anyopaque,
+    timeout_userdata: *anyopaque,
+) error{SubmissionQueueFull}!void {
+    {
+        // prep the recv and set the link flag
+        const sqe = try self.getSqe();
+        sqe.prep_recv(fd, buffer, 0);
+        sqe.user_data = @intFromPtr(recv_userdata);
+        sqe.flags |= linux.IOSQE_IO_LINK;
+    }
+
+    const sqe = try self.getSqe();
+    const timespec: linux.kernel_timespec = .{ .sec = deadline, .nsec = 0 };
+    sqe.prep_link_timeout(&timespec, linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_REALTIME);
+    sqe.user_data = @intFromPtr(timeout_userdata);
+    // Don't send a completion if we didn't trigger the timeout
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    var submitted: u32 = 0;
+    while (submitted < 2) {
+        submitted += self.ring.submit() catch return;
+    }
+}
+
 pub fn cancel(
     self: *Uring,
     /// The userdata field to filter for. The first submission with this value will be cancelled
@@ -140,6 +169,34 @@ pub fn write(
     sqe.user_data = @intFromPtr(userdata);
 }
 
+pub fn writeWithDeadline(
+    self: *Uring,
+    fd: posix.fd_t,
+    buffer: []const u8,
+    deadline: i64,
+    write_userdata: *anyopaque,
+    timeout_userdata: *anyopaque,
+) !void {
+    {
+        // prep the write and set the link flag
+        const sqe = try self.getSqe();
+        sqe.prep_write(fd, buffer, 0);
+        sqe.user_data = @intFromPtr(write_userdata);
+        sqe.flags |= linux.IOSQE_IO_LINK;
+    }
+
+    const sqe = try self.getSqe();
+    const timespec: linux.kernel_timespec = .{ .sec = deadline, .nsec = 0 };
+    sqe.prep_link_timeout(&timespec, linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_REALTIME);
+    sqe.user_data = @intFromPtr(timeout_userdata);
+    // Don't send a completion if we didn't trigger the timeout
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    var submitted: u32 = 0;
+    while (submitted < 2) {
+        submitted += self.ring.submit() catch return;
+    }
+}
+
 pub fn writev(
     self: *Uring,
     fd: posix.fd_t,
@@ -149,6 +206,32 @@ pub fn writev(
     const sqe = try self.getSqe();
     sqe.prep_writev(fd, iovecs, 0);
     sqe.user_data = @intFromPtr(userdata);
+}
+
+pub fn writevWithDeadline(
+    self: *Uring,
+    fd: posix.fd_t,
+    iovecs: []const posix.iovec_const,
+    deadline: i64,
+    writev_userdata: *anyopaque,
+    timeout_userdata: *anyopaque,
+) error{SubmissionQueueFull}!void {
+    {
+        const sqe = try self.getSqe();
+        sqe.prep_writev(fd, iovecs, 0);
+        sqe.user_data = @intFromPtr(writev_userdata);
+        sqe.flags |= linux.IOSQE_IO_LINK;
+    }
+    const sqe = try self.getSqe();
+    const timespec: linux.kernel_timespec = .{ .sec = deadline, .nsec = 0 };
+    sqe.prep_link_timeout(&timespec, linux.IORING_TIMEOUT_ABS | linux.IORING_TIMEOUT_REALTIME);
+    sqe.user_data = @intFromPtr(timeout_userdata);
+    // Don't send a completion if we didn't trigger the timeout
+    sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
+    var submitted: u32 = 0;
+    while (submitted < 2) {
+        submitted += self.ring.submit() catch return;
+    }
 }
 
 pub fn poll(
@@ -198,6 +281,11 @@ pub fn timer(
     while (submitted < 1) {
         submitted += self.ring.submit() catch return;
     }
+}
+
+pub fn cancelAll(self: *Uring) !void {
+    const sqe = try self.getSqe();
+    sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
 }
 
 /// Gets an sqe from the ring. If one isn't available, a submit occurs and we retry
