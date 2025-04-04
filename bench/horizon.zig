@@ -24,7 +24,7 @@ pub fn main() !void {
 }
 
 pub fn serveHttp(_: *anyopaque, resp: horizon.ResponseWriter, req: horizon.Request) anyerror!void {
-    std.log.debug("path={s}", .{req.path()});
+    _ = req;
     try resp.any().print("hello, world", .{});
 }
 
