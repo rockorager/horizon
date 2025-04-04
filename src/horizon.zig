@@ -716,6 +716,21 @@ pub const HeaderIterator = struct {
     }
 };
 
+pub fn errorResponse(
+    w: ResponseWriter,
+    status: http.Status,
+    comptime format: []const u8,
+    args: anytype,
+) anyerror!void {
+    w.setStatus(status);
+    // Clear the Content-Length header
+    try w.setHeader("Content-Length", null);
+    // Set content type
+    try w.setHeader("Content-Type", "text/plain");
+    // Print the body
+    try w.any().print(format, args);
+}
+
 pub const Handler = struct {
     ptr: *anyopaque,
     serveFn: *const fn (*anyopaque, ResponseWriter, Request) anyerror!void,
