@@ -528,8 +528,11 @@ const Connection = struct {
         try headers.ensureTotalCapacity(self.arena.allocator(), len);
         var writer = headers.fixedWriter();
 
-        // We never write the phrase
-        writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
+        if (status.phrase()) |phrase| {
+            writer.print("HTTP/1.1 {d} {s}\r\n", .{ @intFromEnum(status), phrase }) catch unreachable;
+        } else {
+            writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
+        }
 
         if (resp.headers.get(strings.content_length) == null) {
             writer.print(
