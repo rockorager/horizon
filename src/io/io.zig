@@ -148,6 +148,7 @@ test Ring {
     // Ensure the exposed API exists for all backends
     try std.testing.expect(std.meta.hasMethod(Ring, "init"));
     try std.testing.expect(std.meta.hasMethod(Ring, "deinit"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "submit"));
     try std.testing.expect(std.meta.hasMethod(Ring, "submitAndWait"));
     try std.testing.expect(std.meta.hasMethod(Ring, "nextCompletion"));
     try std.testing.expect(std.meta.hasMethod(Ring, "accept"));
@@ -157,4 +158,5 @@ test Ring {
     try std.testing.expect(std.meta.hasMethod(Ring, "recv"));
     try std.testing.expect(std.meta.hasMethod(Ring, "write"));
     try std.testing.expect(std.meta.hasMethod(Ring, "writev"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "poll"));
 }

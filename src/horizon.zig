@@ -25,11 +25,12 @@ pub fn threadRun(
 ) !void {
     ring.* = try main.initChild();
 
-    while (true) {
+    var should_quit: bool = false;
+    while (!should_quit) {
         try ring.submitAndWait();
 
         while (ring.nextCompletion()) |cqe| {
-            try handleCqe(ring, gpa, cqe, null, handler);
+            try handleCqe(ring, gpa, cqe, null, handler, &should_quit);
         }
     }
 }
@@ -46,6 +47,9 @@ pub const Server = struct {
     accept_c: Completion,
 
     msg_ring_c: Completion,
+
+    stop_c: Completion,
+    stop_pipe: [2]posix.fd_t,
 
     pub const Options = struct {
         /// Number of entries in the completion queues
@@ -89,6 +93,8 @@ pub const Server = struct {
             .addr = addr,
             .accept_c = .{ .parent = .server, .op = .accept },
             .msg_ring_c = .{ .parent = .server, .op = .msg_ring },
+            .stop_c = .{ .parent = .server, .op = .stop },
+            .stop_pipe = try posix.pipe2(.{}),
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
@@ -98,6 +104,7 @@ pub const Server = struct {
         try posix.getsockname(fd, &self.addr.any, &sock_len);
 
         try self.ring.accept(self.fd, &self.accept_c);
+        try self.ring.poll(self.stop_pipe[0], &self.stop_c);
         self.accept_c.active = true;
     }
 
@@ -121,12 +128,27 @@ pub const Server = struct {
             self.threads[i] = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring, handler });
         }
 
-        while (true) {
+        var should_quit: bool = false;
+        while (!should_quit) {
             try self.ring.submitAndWait();
 
             while (self.ring.nextCompletion()) |cqe| {
-                try handleCqe(&self.ring, gpa, cqe, self, handler);
+                try handleCqe(&self.ring, gpa, cqe, self, handler, &should_quit);
             }
+        }
+
+        // Shutdown
+        // 1. Cancel accept to prevent new conenctions
+        // 2. Notify all threads of shutdown
+        // 3. Join the threads
+        try self.ring.cancel(&self.accept_c, &self.stop_c);
+        for (self.rings) |ring| {
+            try self.ring.msgRing(ring, 0, &self.stop_c, &self.msg_ring_c);
+        }
+        try self.ring.submit();
+
+        for (self.threads) |thread| {
+            thread.join();
         }
     }
 
@@ -154,6 +176,10 @@ pub const Server = struct {
         // Send the fd to another thread for handling
         try ring.msgRing(target, result, &self.accept_c, &self.msg_ring_c);
     }
+
+    pub fn stop(self: *Server) !void {
+        _ = try posix.write(self.stop_pipe[1], "q");
+    }
 };
 
 pub fn handleCqe(
@@ -162,6 +188,7 @@ pub fn handleCqe(
     cqe: io.Completion,
     server: ?*Server,
     handler: Handler,
+    should_quit: *bool,
 ) !void {
     const c: *Completion = @ptrFromInt(cqe.userdata);
     switch (c.parent) {
@@ -179,6 +206,7 @@ pub fn handleCqe(
             .msg_ring => {
                 _ = cqe.unwrap() catch |err| log.err("msg not sent to ring: {}", .{err});
             },
+            .stop => should_quit.* = true,
             else => unreachable,
         },
         .connection => {
@@ -229,6 +257,7 @@ const Completion = struct {
         send,
         close,
         cancel,
+        stop,
     },
 
     /// If the completion has been scheduled
@@ -756,3 +785,59 @@ pub const Handler = struct {
         return self.serveFn(self.ptr, w, r);
     }
 };
+
+test Server {
+    const addr: net.Address = try .parseIp4("127.0.0.1", 0);
+    const opts: Server.Options = .{ .addr = addr };
+    var server: Server = undefined;
+
+    const TestHandler = struct {
+        got_request: bool = false,
+
+        fn handler(self: *@This()) Handler {
+            return .init(@This(), self);
+        }
+
+        pub fn serveHttp(ptr: *anyopaque, w: ResponseWriter, _: Request) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.got_request = true;
+            w.any().print("hello world", .{}) catch unreachable;
+        }
+    };
+
+    var wg: std.Thread.WaitGroup = .{};
+    wg.start();
+    var handler: TestHandler = .{};
+    const thread = try std.Thread.spawn(.{}, spawnTestServer, .{
+        &server,
+        &wg,
+        opts,
+        std.testing.allocator,
+        handler.handler(),
+    });
+    // Wait until server is init'd so we have it's address
+    wg.wait();
+
+    const stream = try std.net.tcpConnectToAddress(server.addr);
+    defer stream.close();
+    _ = try stream.write("GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
+
+    var buf: [4096]u8 = undefined;
+    const n = try stream.read(&buf);
+
+    try std.testing.expect(handler.got_request);
+    try std.testing.expectStringStartsWith(buf[0..n], "HTTP/1.1 200");
+
+    try server.stop();
+    thread.join();
+}
+
+fn spawnTestServer(server: *Server, wg: *std.Thread.WaitGroup, opts: Server.Options, gpa: Allocator, handler: Handler) !void {
+    {
+        defer wg.finish();
+        try server.init(std.testing.allocator, opts);
+    }
+    defer server.deinit(std.testing.allocator);
+
+    try server.run(gpa, handler);
+}

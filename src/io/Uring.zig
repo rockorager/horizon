@@ -64,6 +64,10 @@ pub fn submitAndWait(self: *Uring) !void {
     }
 }
 
+pub fn submit(self: *Uring) !void {
+    _ = try self.ring.submit();
+}
+
 pub fn nextCompletion(self: *Uring) ?io.Completion {
     const ready = self.ring.cq_ready();
     if (ready == 0) return null;
@@ -144,6 +148,16 @@ pub fn writev(
 ) error{SubmissionQueueFull}!void {
     const sqe = try self.getSqe();
     sqe.prep_writev(fd, iovecs, 0);
+    sqe.user_data = @intFromPtr(userdata);
+}
+
+pub fn poll(
+    self: *Uring,
+    fd: posix.fd_t,
+    userdata: *anyopaque,
+) error{SubmissionQueueFull}!void {
+    const sqe = try self.getSqe();
+    sqe.prep_poll_add(fd, posix.POLL.IN);
     sqe.user_data = @intFromPtr(userdata);
 }
 
