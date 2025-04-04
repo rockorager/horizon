@@ -22,8 +22,12 @@ pub const Worker = struct {
     ring: io.Ring,
     handler: Handler,
 
-    fn serve(self: *Worker, gpa: Allocator, main: io.Ring) !void {
-        self.ring = try main.initChild();
+    /// Number of active completions we have on the queue that we want to wait for before gracefully
+    /// shutting down
+    keep_alive: u8,
+
+    fn serve(self: *Worker, gpa: Allocator, server: *Server) !void {
+        self.ring = try server.ring.initChild();
         while (!self.should_quit) {
             try self.ring.submitAndWait();
 
@@ -31,6 +35,18 @@ pub const Worker = struct {
                 try self.handleCqe(gpa, cqe);
             }
         }
+
+        while (self.keep_alive > 0) {
+            try self.ring.submitAndWait();
+
+            while (self.ring.nextCompletion()) |cqe| {
+                try self.handleCqe(gpa, cqe);
+            }
+        }
+
+        // Notify the main thread we have exited
+        try self.ring.msgRing(server.ring, 0, @intFromEnum(Server.Op.thread_exit), 0);
+        try self.ring.submit();
     }
 
     fn handleCqe(
@@ -50,13 +66,13 @@ pub const Worker = struct {
                     .recv => {
                         const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
                         defer conn.maybeDestroy(gpa);
-                        try conn.handleRecv(self, cqe);
+                        try conn.onRecv(self, cqe);
                     },
 
                     .send => {
                         const conn: *Connection = @alignCast(@fieldParentPtr("send_c", c));
                         defer conn.maybeDestroy(gpa);
-                        try conn.handleSend(self, cqe);
+                        try conn.onSendCompletion(self, cqe);
                     },
 
                     .close => {
@@ -99,12 +115,12 @@ pub const Server = struct {
 
     fd: posix.fd_t,
     addr: net.Address,
-    accept_c: Completion,
 
-    msg_ring_c: Completion,
-
-    stop_c: Completion,
+    shutdown_signal: u6 = 0,
     stop_pipe: [2]posix.fd_t,
+
+    /// Stable completion pointer for messaging threads
+    accept_c: Completion = .{ .parent = .server, .op = .accept },
 
     pub const Options = struct {
         /// Number of entries in the completion queues
@@ -118,6 +134,20 @@ pub const Server = struct {
         /// for the accept loop. Another is used to handle requests. We always need at least 2, but
         /// no more than the core count
         workers: ?u16 = null,
+
+        /// If set, the server will listen for this signal to initiate a graceful shutdown. The
+        /// first signal will trigger a graceful shutdown. The second will initiate an immediate
+        /// shutdown
+        shutdown_signal: u6 = 0,
+    };
+
+    pub const Op = enum {
+        accept,
+        cancel_accept,
+        msg_ring,
+        stop,
+        thread_exit,
+        timeout,
     };
 
     pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
@@ -147,10 +177,8 @@ pub const Server = struct {
             .threads = try gpa.alloc(std.Thread, worker_count),
             .fd = fd,
             .addr = addr,
-            .accept_c = .{ .parent = .server, .op = .accept },
-            .msg_ring_c = .{ .parent = .server, .op = .msg_ring },
-            .stop_c = .{ .parent = .server, .op = .stop },
             .stop_pipe = try posix.pipe2(.{}),
+            .shutdown_signal = opts.shutdown_signal,
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
@@ -158,10 +186,6 @@ pub const Server = struct {
 
         var sock_len = addr.getOsSockLen();
         try posix.getsockname(fd, &self.addr.any, &sock_len);
-
-        try self.ring.accept(self.fd, &self.accept_c);
-        try self.ring.poll(self.stop_pipe[0], &self.stop_c);
-        self.accept_c.active = true;
     }
 
     /// Queues a stop of the server
@@ -180,46 +204,125 @@ pub const Server = struct {
         gpa: Allocator,
         handler: Handler,
     ) !void {
+        // If we have a shutdown_signal, we have to register it before spawning threads. Each thread
+        // inherits the signal mask
+        var sfd: ?posix.fd_t = null;
+        if (self.shutdown_signal > 0) {
+            // Listen for the shutdown signal
+            sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
+            log.debug("sfd={d}", .{sfd.?});
+        }
+
         for (self.workers, 0..) |*worker, i| {
             worker.* = .{
                 .should_quit = false,
                 .ring = undefined,
                 .handler = handler,
+                .keep_alive = 0,
             };
             worker.handler = handler;
-            self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self.ring });
+            self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
         }
+
+        // Start listening for stop signals from the stop pipe
+        try self.ring.poll(self.stop_pipe[0], @intFromEnum(Op.stop));
+
+        // Start accepting connections
+        try self.ring.accept(self.fd, @intFromEnum(Op.accept));
 
         var should_quit: bool = false;
         while (!should_quit) {
             try self.ring.submitAndWait();
 
             while (self.ring.nextCompletion()) |cqe| {
-                const c: *Completion = @ptrFromInt(cqe.userdata);
-                switch (c.parent) {
-                    .server => switch (c.op) {
-                        .accept => try self.acceptAndSend(cqe),
+                const op: Op = @enumFromInt(cqe.userdata);
+                switch (op) {
+                    .accept => try self.acceptAndSend(cqe),
 
-                        .msg_ring => _ = cqe.unwrap() catch |err|
-                            log.err("msg not sent to ring: {}", .{err}),
+                    .msg_ring => _ = cqe.unwrap() catch |err|
+                        log.err("msg not sent to ring: {}", .{err}),
 
-                        .stop => should_quit = true,
-                        else => unreachable,
+                    // When we receive the stop signal, we cancel the accept
+                    .stop => {
+                        if (sfd) |fd| {
+                            var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
+                            _ = try posix.read(fd, &buf);
+                        }
+                        try self.ring.cancel(
+                            @intFromEnum(Op.accept),
+                            @intFromEnum(Op.cancel_accept),
+                        );
                     },
-                    else => unreachable,
+
+                    // When we receive the cancel accept response, we exit the loop
+                    .cancel_accept => should_quit = true,
+
+                    // We don't ever receive this response in this loop
+                    .thread_exit => unreachable,
+
+                    .timeout => unreachable,
                 }
             }
         }
+
+        try self.cleanUp(sfd);
+    }
+
+    fn cleanUp(self: *Server, sfd: ?posix.fd_t) !void {
+        // Reregister the shutdown signal so we can do a quick shutdown
+        // var sfd: ?posix.fd_t = null;
+        // if (self.shutdown_signal > 0) {
+        //     sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
+        // }
         // Shutdown
         //
-        // 1. Cancel accept to prevent new conenctions
+        // 1. Set a timeout for total shutdown time
         // 2. Notify all threads of shutdown
-        // 3. Join the threads
-        try self.ring.cancel(&self.accept_c, &self.stop_c);
+        // 3. Wait for signals from threads that they have closed
+        // 4. If we get another stop signal, detach threads and exit
+        // 5. If we got all our thread exit signals, we close cleanly
+
+        var stop_c: Completion = .{ .parent = .server, .op = .stop };
+
+        // 60 second timeout to gracefully close
+        try self.ring.timer(60, @intFromEnum(Op.timeout));
+
         for (self.workers) |worker| {
-            try self.ring.msgRing(worker.ring, 0, &self.stop_c, &self.msg_ring_c);
+            try self.ring.msgRing(worker.ring, 0, @intFromPtr(&stop_c), @intFromEnum(Op.msg_ring));
         }
-        try self.ring.submit();
+
+        var exited_threads: usize = 0;
+        while (exited_threads < self.workers.len) {
+            try self.ring.submitAndWait();
+
+            while (self.ring.nextCompletion()) |cqe| {
+                const op: Op = @enumFromInt(cqe.userdata);
+                switch (op) {
+                    .accept => unreachable,
+
+                    .msg_ring => _ = cqe.unwrap() catch |err|
+                        log.err("msg not sent to ring: {}", .{err}),
+
+                    // If we receive another stop signal, we return immediately
+                    .stop => {
+                        if (sfd) |fd| {
+                            var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
+                            _ = try posix.read(fd, &buf);
+                            posix.close(fd);
+                        }
+                        return;
+                    },
+
+                    // When we receive the cancel accept response, we exit the loop
+                    .cancel_accept => unreachable,
+
+                    // We don't ever receive this response in this loop
+                    .thread_exit => exited_threads += 1,
+
+                    .timeout => return,
+                }
+            }
+        }
 
         for (self.threads) |thread| {
             thread.join();
@@ -244,12 +347,11 @@ pub const Server = struct {
 
         if (!cqe.flags.has_more) {
             // Multishot accept will return if it wasn't able to accept the next connection. Requeue it
-            try self.ring.accept(self.fd, &self.accept_c);
-            self.accept_c.active = true;
+            try self.ring.accept(self.fd, @intFromEnum(Op.accept));
         }
 
         // Send the fd to another thread for handling
-        try self.ring.msgRing(target.ring, result, &self.accept_c, &self.msg_ring_c);
+        try self.ring.msgRing(target.ring, result, @intFromPtr(&self.accept_c), @intFromEnum(Op.msg_ring));
     }
 
     pub fn stop(self: *Server) !void {
@@ -272,6 +374,7 @@ const Completion = struct {
         close,
         cancel,
         stop,
+        signal,
     },
 
     /// If the completion has been scheduled
@@ -310,6 +413,8 @@ const Connection = struct {
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
+    was_idle: bool,
+
     pub fn init(
         self: *Connection,
         gpa: Allocator,
@@ -321,6 +426,7 @@ const Connection = struct {
             .fd = fd,
             .response = undefined,
             .vecs = undefined,
+            .was_idle = false,
         };
 
         self.response = .{ .arena = self.arena.allocator() };
@@ -345,7 +451,7 @@ const Connection = struct {
     fn close(self: *Connection, ring: *io.Ring) !void {
         if (self.recv_c.active) {
             // Cancel recv_c if we have one out there
-            try ring.cancel(&self.recv_c, &self.cancel_c);
+            try ring.cancel(@intFromPtr(&self.recv_c), @intFromPtr(&self.cancel_c));
             self.active += 1;
             self.cancel_c.active = true;
         }
@@ -355,7 +461,7 @@ const Connection = struct {
         self.close_c.active = true;
     }
 
-    pub fn handleRecv(
+    pub fn onRecv(
         self: *Connection,
         worker: *Worker,
         cqe: io.Completion,
@@ -363,13 +469,13 @@ const Connection = struct {
         self.active -= 1;
         self.recv_c.active = false;
         if (cqe.result == 0) {
-            // Peer gracefully closed connection
+            // Peer closed connection
             return self.close(&worker.ring);
         }
 
         const result = cqe.unwrap() catch |err| {
             switch (err) {
-                error.Canceled => return,
+                error.Canceled => return self.close(&worker.ring),
                 error.ConnectionResetByPeer => return self.close(&worker.ring),
                 else => {
                     log.err("recv error: {}", .{cqe.err()});
@@ -388,6 +494,8 @@ const Connection = struct {
             return;
         }
 
+        // Keep the worker alive since we are now handling this request
+        worker.keep_alive += 1;
         // We've received a full HEAD, call the handler now
         try worker.handler.serveHttp(self.response.responseWriter(), self.request);
         try self.prepareHeader();
@@ -489,12 +597,14 @@ const Connection = struct {
         self.send_c.active = true;
     }
 
-    fn handleSend(self: *Connection, worker: *Worker, cqe: io.Completion) CallbackError!void {
+    fn onSendCompletion(self: *Connection, worker: *Worker, cqe: io.Completion) CallbackError!void {
         self.active -= 1;
         self.send_c.active = false;
         switch (cqe.err()) {
             .SUCCESS => {},
             else => {
+                // Response send error, we can let the worker exit if it wants to
+                worker.keep_alive -= 1;
                 log.err("send error: {}", .{cqe.err()});
                 return self.close(&worker.ring);
             },
@@ -507,15 +617,19 @@ const Connection = struct {
             false => return self.send(worker),
 
             // Response sent. Decide if we should close the connection or keep it alive
-            true => switch (self.request.keepAlive()) {
-                false => return self.close(&worker.ring),
+            true => {
+                // Response has been fully sent, we could exit gracefully
+                worker.keep_alive -= 1;
 
-                true => {
-                    self.reset();
-                    // prep another recv
-                    try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
-                    self.active += 1;
-                },
+                // If the worker is quitting, we can close this connection
+                if (worker.should_quit or !self.request.keepAlive()) {
+                    return self.close(&worker.ring);
+                }
+
+                self.reset();
+                // prep another recv
+                try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+                self.active += 1;
             },
         }
     }

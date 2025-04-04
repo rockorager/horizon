@@ -14,7 +14,8 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
     var s: horizon.Server = undefined;
-    try s.init(gpa, .{});
+    try s.init(gpa, .{ .shutdown_signal = std.posix.SIG.INT });
+    defer s.deinit(gpa);
 
     var my_handler: MyHandler = .{};
 

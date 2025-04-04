@@ -83,10 +83,10 @@ pub fn nextCompletion(self: *Uring) ?io.Completion {
 }
 
 /// Multishot accept
-pub fn accept(self: *Uring, fd: posix.fd_t, userdata: *anyopaque) error{SubmissionQueueFull}!void {
+pub fn accept(self: *Uring, fd: posix.fd_t, userdata: u64) error{SubmissionQueueFull}!void {
     const sqe = try self.getSqe();
     sqe.prep_multishot_accept(fd, null, null, 0);
-    sqe.user_data = @intFromPtr(userdata);
+    sqe.user_data = userdata;
 }
 
 pub fn msgRing(
@@ -95,13 +95,13 @@ pub fn msgRing(
     /// The result that will be placed onto the target Ring
     result: u16,
     /// The userdata field that will be populated on the target Ring
-    target_userdata: *anyopaque,
+    target_userdata: u64,
     /// The userdata associated with the operation to send the message
-    userdata: *anyopaque,
+    userdata: u64,
 ) error{SubmissionQueueFull}!void {
     const sqe = try self.getSqe();
-    sqe.prep_rw(.MSG_RING, target.ring.fd, 0, result, @intFromPtr(target_userdata));
-    sqe.user_data = @intFromPtr(userdata);
+    sqe.prep_rw(.MSG_RING, target.ring.fd, 0, result, target_userdata);
+    sqe.user_data = userdata;
     sqe.flags |= linux.IOSQE_CQE_SKIP_SUCCESS;
 }
 
@@ -114,13 +114,13 @@ pub fn recv(self: *Uring, fd: posix.fd_t, buffer: []u8, userdata: *anyopaque) er
 pub fn cancel(
     self: *Uring,
     /// The userdata field to filter for. The first submission with this value will be cancelled
-    cancel_userdata: *anyopaque,
+    cancel_userdata: u64,
     /// The userdata associated with the cancel submission
-    userdata: *anyopaque,
+    userdata: u64,
 ) error{SubmissionQueueFull}!void {
     const sqe = try self.getSqe();
-    sqe.prep_cancel(@intFromPtr(cancel_userdata), 0);
-    sqe.user_data = @intFromPtr(userdata);
+    sqe.prep_cancel(cancel_userdata, 0);
+    sqe.user_data = userdata;
 }
 
 pub fn close(self: *Uring, fd: posix.fd_t, userdata: *anyopaque) error{SubmissionQueueFull}!void {
@@ -154,11 +154,50 @@ pub fn writev(
 pub fn poll(
     self: *Uring,
     fd: posix.fd_t,
-    userdata: *anyopaque,
+    userdata: u64,
 ) error{SubmissionQueueFull}!void {
     const sqe = try self.getSqe();
     sqe.prep_poll_add(fd, posix.POLL.IN);
-    sqe.user_data = @intFromPtr(userdata);
+    sqe.user_data = userdata;
+}
+
+pub fn signalfd(self: *Uring, sig: u6, userdata: u64) !posix.fd_t {
+    const sqe = try self.getSqe();
+
+    // Set up the signal fd
+    var sigset = linux.empty_sigset;
+    linux.sigaddset(&sigset, sig);
+
+    // Block default delivery
+    const err = linux.sigprocmask(linux.SIG.BLOCK, &sigset, null);
+    if (err < 0) {
+        return error.Signalfd;
+    }
+    const flags: posix.O = .{ .NONBLOCK = true, .CLOEXEC = true };
+    const sfd = try posix.signalfd(-1, &sigset, @bitCast(flags));
+
+    // Prep a multishot poll. Signals we listen for continuously
+    sqe.prep_poll_add(@intCast(sfd), posix.POLL.IN);
+    sqe.user_data = userdata;
+    sqe.len |= linux.IORING_POLL_ADD_MULTI;
+    return sfd;
+}
+
+/// When initiating a timer, we also do a submit because we have to keep the pointer stable until
+/// submission
+pub fn timer(
+    self: *Uring,
+    seconds: u32,
+    userdata: u64,
+) error{SubmissionQueueFull}!void {
+    const sqe = try self.getSqe();
+    const timespec: linux.kernel_timespec = .{ .sec = seconds, .nsec = 0 };
+    sqe.prep_timeout(&timespec, std.math.maxInt(u32), 0);
+    sqe.user_data = userdata;
+    var submitted: u32 = 0;
+    while (submitted < 1) {
+        submitted += self.ring.submit() catch return;
+    }
 }
 
 /// Gets an sqe from the ring. If one isn't available, a submit occurs and we retry

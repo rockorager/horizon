@@ -159,4 +159,6 @@ test Ring {
     try std.testing.expect(std.meta.hasMethod(Ring, "write"));
     try std.testing.expect(std.meta.hasMethod(Ring, "writev"));
     try std.testing.expect(std.meta.hasMethod(Ring, "poll"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "signalfd"));
+    try std.testing.expect(std.meta.hasMethod(Ring, "timer"));
 }
