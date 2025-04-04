@@ -16,17 +16,30 @@ pub fn main() !void {
     var s: horizon.Server = undefined;
     try s.init(gpa, .{});
 
-    var gzip_handler: gzip.Handler = .init(.{ .ptr = undefined, .serveFn = serveHttp });
+    var my_handler: MyHandler = .{};
+
+    // Wrap a handler with middleware. This is the same pattern as go where we nest handlers. We
+    // *could* do this with anonymous functions in zig but that gets very messy to read. This is a
+    // simple gzip middleware which gzips our response if the client accepts gzip encoding
+    var gzip_handler: gzip.Handler = .init(my_handler.handler());
 
     std.log.debug("listening at {}", .{s.addr});
 
-    try s.run(gpa, gzip_handler.handler());
+    try s.serve(gpa, gzip_handler.handler());
 }
 
-pub fn serveHttp(_: *anyopaque, resp: horizon.ResponseWriter, req: horizon.Request) anyerror!void {
-    _ = req;
-    try resp.any().print("hello, world", .{});
-}
+const MyHandler = struct {
+    fn handler(self: *MyHandler) horizon.Handler {
+        // Not much magic here. If your type has a servHttp method, this is a helper to make the
+        // itnerface from the type and pointer
+        return .init(MyHandler, self);
+    }
+
+    pub fn serveHttp(_: *anyopaque, w: horizon.ResponseWriter, r: horizon.Request) anyerror!void {
+        _ = r;
+        try w.any().print("hello, world", .{});
+    }
+};
 
 const gzip = struct {
     const Handler = struct {

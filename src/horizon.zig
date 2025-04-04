@@ -17,29 +17,84 @@ const strings = struct {
     const content_type = "Content-Type";
 };
 
-pub fn threadRun(
-    gpa: Allocator,
-    ring: *io.Ring,
-    main: io.Ring,
+pub const Worker = struct {
+    should_quit: bool,
+    ring: io.Ring,
     handler: Handler,
-) !void {
-    ring.* = try main.initChild();
 
-    var should_quit: bool = false;
-    while (!should_quit) {
-        try ring.submitAndWait();
+    fn serve(self: *Worker, gpa: Allocator, main: io.Ring) !void {
+        self.ring = try main.initChild();
+        while (!self.should_quit) {
+            try self.ring.submitAndWait();
 
-        while (ring.nextCompletion()) |cqe| {
-            try handleCqe(ring, gpa, cqe, null, handler, &should_quit);
+            while (self.ring.nextCompletion()) |cqe| {
+                try self.handleCqe(gpa, cqe);
+            }
         }
     }
-}
+
+    fn handleCqe(
+        self: *Worker,
+        gpa: Allocator,
+        cqe: io.Completion,
+    ) !void {
+        const c: *Completion = @ptrFromInt(cqe.userdata);
+        switch (c.parent) {
+            .server => switch (c.op) {
+                .accept => try self.onAccept(gpa, cqe),
+                .stop => self.should_quit = true,
+                else => unreachable,
+            },
+            .connection => {
+                switch (c.op) {
+                    .recv => {
+                        const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
+                        defer conn.maybeDestroy(gpa);
+                        try conn.handleRecv(self, cqe);
+                    },
+
+                    .send => {
+                        const conn: *Connection = @alignCast(@fieldParentPtr("send_c", c));
+                        defer conn.maybeDestroy(gpa);
+                        try conn.handleSend(self, cqe);
+                    },
+
+                    .close => {
+                        const conn: *Connection = @alignCast(@fieldParentPtr("close_c", c));
+                        defer conn.maybeDestroy(gpa);
+                        _ = cqe.unwrap() catch |err|
+                            log.err("connection closed with error: {}", .{err});
+                        conn.active -= 1;
+                    },
+
+                    .cancel => {
+                        const conn: *Connection = @alignCast(@fieldParentPtr("cancel_c", c));
+                        defer conn.maybeDestroy(gpa);
+                        conn.active -= 1;
+                    },
+
+                    else => unreachable,
+                }
+            },
+        }
+    }
+
+    fn onAccept(self: *Worker, gpa: Allocator, cqe: io.Completion) !void {
+        const result = cqe.unwrap() catch {
+            log.err("accept error: {}", .{cqe.err()});
+            @panic("accept error");
+        };
+
+        const conn = try gpa.create(Connection);
+        try conn.init(gpa, self, result);
+    }
+};
 
 pub const Server = struct {
     ring: io.Ring,
 
     threads: []std.Thread,
-    rings: []io.Ring,
+    workers: []Worker,
     next_ring: usize = 0,
 
     fd: posix.fd_t,
@@ -66,6 +121,7 @@ pub const Server = struct {
     };
 
     pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
+
         // Set the no. open files to system max
         const limit = try posix.getrlimit(posix.rlimit_resource.NOFILE);
         try posix.setrlimit(posix.rlimit_resource.NOFILE, .{ .cur = limit.max, .max = limit.max });
@@ -87,7 +143,7 @@ pub const Server = struct {
 
         self.* = .{
             .ring = try .init(opts.entries),
-            .rings = try gpa.alloc(io.Ring, worker_count),
+            .workers = try gpa.alloc(Worker, worker_count),
             .threads = try gpa.alloc(std.Thread, worker_count),
             .fd = fd,
             .addr = addr,
@@ -110,22 +166,28 @@ pub const Server = struct {
 
     /// Queues a stop of the server
     pub fn deinit(self: *Server, gpa: Allocator) void {
-        for (self.rings) |*ring| {
-            ring.deinit();
+        for (self.workers) |*worker| {
+            worker.ring.deinit();
         }
         self.ring.deinit();
 
-        gpa.free(self.rings);
+        gpa.free(self.workers);
         gpa.free(self.threads);
     }
 
-    pub fn run(
+    pub fn serve(
         self: *Server,
         gpa: Allocator,
         handler: Handler,
     ) !void {
-        for (self.rings, 0..) |*ring, i| {
-            self.threads[i] = try std.Thread.spawn(.{}, threadRun, .{ gpa, ring, self.ring, handler });
+        for (self.workers, 0..) |*worker, i| {
+            worker.* = .{
+                .should_quit = false,
+                .ring = undefined,
+                .handler = handler,
+            };
+            worker.handler = handler;
+            self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self.ring });
         }
 
         var should_quit: bool = false;
@@ -133,17 +195,29 @@ pub const Server = struct {
             try self.ring.submitAndWait();
 
             while (self.ring.nextCompletion()) |cqe| {
-                try handleCqe(&self.ring, gpa, cqe, self, handler, &should_quit);
+                const c: *Completion = @ptrFromInt(cqe.userdata);
+                switch (c.parent) {
+                    .server => switch (c.op) {
+                        .accept => try self.acceptAndSend(cqe),
+
+                        .msg_ring => _ = cqe.unwrap() catch |err|
+                            log.err("msg not sent to ring: {}", .{err}),
+
+                        .stop => should_quit = true,
+                        else => unreachable,
+                    },
+                    else => unreachable,
+                }
             }
         }
-
         // Shutdown
+        //
         // 1. Cancel accept to prevent new conenctions
         // 2. Notify all threads of shutdown
         // 3. Join the threads
         try self.ring.cancel(&self.accept_c, &self.stop_c);
-        for (self.rings) |ring| {
-            try self.ring.msgRing(ring, 0, &self.stop_c, &self.msg_ring_c);
+        for (self.workers) |worker| {
+            try self.ring.msgRing(worker.ring, 0, &self.stop_c, &self.msg_ring_c);
         }
         try self.ring.submit();
 
@@ -155,9 +229,7 @@ pub const Server = struct {
     /// Accept a connection and send it to a thread to work on it
     fn acceptAndSend(
         self: *Server,
-        ring: *io.Ring,
         cqe: io.Completion,
-        target: io.Ring,
     ) CallbackError!void {
         const result = cqe.unwrap() catch |err| {
             switch (err) {
@@ -167,81 +239,23 @@ pub const Server = struct {
             return;
         };
 
+        const target = self.workers[self.next_ring];
+        self.next_ring = (self.next_ring + 1) % (self.workers.len);
+
         if (!cqe.flags.has_more) {
             // Multishot accept will return if it wasn't able to accept the next connection. Requeue it
-            try ring.accept(self.fd, &self.accept_c);
+            try self.ring.accept(self.fd, &self.accept_c);
             self.accept_c.active = true;
         }
 
         // Send the fd to another thread for handling
-        try ring.msgRing(target, result, &self.accept_c, &self.msg_ring_c);
+        try self.ring.msgRing(target.ring, result, &self.accept_c, &self.msg_ring_c);
     }
 
     pub fn stop(self: *Server) !void {
         _ = try posix.write(self.stop_pipe[1], "q");
     }
 };
-
-pub fn handleCqe(
-    ring: *io.Ring,
-    gpa: Allocator,
-    cqe: io.Completion,
-    server: ?*Server,
-    handler: Handler,
-    should_quit: *bool,
-) !void {
-    const c: *Completion = @ptrFromInt(cqe.userdata);
-    switch (c.parent) {
-        .server => switch (c.op) {
-            .accept => {
-                const srv: *Server = @alignCast(@fieldParentPtr("accept_c", c));
-                if (server) |s| {
-                    const target = s.rings[s.next_ring];
-                    s.next_ring = (s.next_ring + 1) % (s.rings.len);
-                    try srv.acceptAndSend(&s.ring, cqe, target);
-                } else {
-                    try handleAccept(gpa, ring, cqe);
-                }
-            },
-            .msg_ring => {
-                _ = cqe.unwrap() catch |err| log.err("msg not sent to ring: {}", .{err});
-            },
-            .stop => should_quit.* = true,
-            else => unreachable,
-        },
-        .connection => {
-            switch (c.op) {
-                .recv => {
-                    const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
-                    defer conn.maybeDestroy(gpa);
-                    try conn.handleRecv(ring, cqe, handler);
-                },
-
-                .send => {
-                    const conn: *Connection = @alignCast(@fieldParentPtr("send_c", c));
-                    defer conn.maybeDestroy(gpa);
-                    try conn.handleSend(ring, cqe);
-                },
-
-                .close => {
-                    const conn: *Connection = @alignCast(@fieldParentPtr("close_c", c));
-                    defer conn.maybeDestroy(gpa);
-                    _ = cqe.unwrap() catch |err|
-                        log.err("connection closed with error: {}", .{err});
-                    conn.active -= 1;
-                },
-
-                .cancel => {
-                    const conn: *Connection = @alignCast(@fieldParentPtr("cancel_c", c));
-                    defer conn.maybeDestroy(gpa);
-                    conn.active -= 1;
-                },
-
-                else => unreachable,
-            }
-        },
-    }
-}
 
 /// A Completion Entry
 const Completion = struct {
@@ -269,20 +283,6 @@ const CallbackError = Allocator.Error || error{
     NoBufferSelected,
     SubmissionQueueFull,
 };
-
-fn handleAccept(
-    gpa: Allocator,
-    ring: *io.Ring,
-    cqe: io.Completion,
-) CallbackError!void {
-    const result = cqe.unwrap() catch {
-        log.err("accept error: {}", .{cqe.err()});
-        @panic("accept error");
-    };
-
-    const conn = try gpa.create(Connection);
-    try conn.init(gpa, ring, result);
-}
 
 const Connection = struct {
     arena: std.heap.ArenaAllocator,
@@ -313,7 +313,7 @@ const Connection = struct {
     pub fn init(
         self: *Connection,
         gpa: Allocator,
-        ring: *io.Ring,
+        worker: *Worker,
         fd: posix.socket_t,
     ) CallbackError!void {
         self.* = .{
@@ -325,7 +325,7 @@ const Connection = struct {
 
         self.response = .{ .arena = self.arena.allocator() };
 
-        try ring.recv(self.fd, &self.buf, &self.recv_c);
+        try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
 
         self.active += 1;
         self.recv_c.active = true;
@@ -357,24 +357,23 @@ const Connection = struct {
 
     pub fn handleRecv(
         self: *Connection,
-        ring: *io.Ring,
+        worker: *Worker,
         cqe: io.Completion,
-        handler: Handler,
     ) !void {
         self.active -= 1;
         self.recv_c.active = false;
         if (cqe.result == 0) {
             // Peer gracefully closed connection
-            return self.close(ring);
+            return self.close(&worker.ring);
         }
 
         const result = cqe.unwrap() catch |err| {
             switch (err) {
                 error.Canceled => return,
-                error.ConnectionResetByPeer => return self.close(ring),
+                error.ConnectionResetByPeer => return self.close(&worker.ring),
                 else => {
                     log.err("recv error: {}", .{cqe.err()});
-                    return self.close(ring);
+                    return self.close(&worker.ring);
                 },
             }
         };
@@ -383,16 +382,16 @@ const Connection = struct {
 
         if (!self.request.receivedHeader()) {
             // We haven't received a full HEAD. prep another recv
-            try ring.recv(self.fd, &self.buf, &self.recv_c);
+            try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
             self.active += 1;
             self.recv_c.active = true;
             return;
         }
 
         // We've received a full HEAD, call the handler now
-        try handler.serveHttp(self.response.responseWriter(), self.request);
+        try worker.handler.serveHttp(self.response.responseWriter(), self.request);
         try self.prepareHeader();
-        try self.send(ring);
+        try self.send(worker);
     }
 
     fn reset(self: *Connection) void {
@@ -454,10 +453,10 @@ const Connection = struct {
         return self.written == (self.write_buf.items.len + self.response.body.items.len);
     }
 
-    fn send(self: *Connection, ring: *io.Ring) !void {
+    fn send(self: *Connection, worker: *Worker) !void {
         // Pending headers, no body
         if (self.written < self.write_buf.items.len and self.response.body.items.len == 0) {
-            try ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
+            try worker.ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
             self.active += 1;
             self.send_c.active = true;
             return;
@@ -475,7 +474,7 @@ const Connection = struct {
                 .len = self.response.body.items.len,
             };
 
-            try ring.writev(self.fd, &self.vecs, &self.send_c);
+            try worker.ring.writev(self.fd, &self.vecs, &self.send_c);
             self.active += 1;
             self.send_c.active = true;
 
@@ -486,18 +485,18 @@ const Connection = struct {
         const offset = self.written - self.write_buf.items.len;
         const body = self.response.body.items[offset..];
         self.active += 1;
-        try ring.write(self.fd, body, &self.send_c);
+        try worker.ring.write(self.fd, body, &self.send_c);
         self.send_c.active = true;
     }
 
-    fn handleSend(self: *Connection, ring: *io.Ring, cqe: io.Completion) CallbackError!void {
+    fn handleSend(self: *Connection, worker: *Worker, cqe: io.Completion) CallbackError!void {
         self.active -= 1;
         self.send_c.active = false;
         switch (cqe.err()) {
             .SUCCESS => {},
             else => {
                 log.err("send error: {}", .{cqe.err()});
-                return self.close(ring);
+                return self.close(&worker.ring);
             },
         }
 
@@ -505,16 +504,16 @@ const Connection = struct {
 
         switch (self.responseComplete()) {
             // If the response didn't finish sending, try again
-            false => return self.send(ring),
+            false => return self.send(worker),
 
             // Response sent. Decide if we should close the connection or keep it alive
             true => switch (self.request.keepAlive()) {
-                false => return self.close(ring),
+                false => return self.close(&worker.ring),
 
                 true => {
                     self.reset();
                     // prep another recv
-                    try ring.recv(self.fd, &self.buf, &self.recv_c);
+                    try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
                     self.active += 1;
                 },
             },
@@ -528,7 +527,7 @@ pub const Request = struct {
     /// body. In this case, the callback will be called again when the full body has been read
     bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-    // add the slice to the internal buffer, attempt to parse a Head
+    // add the slice to the internal buffer
     pub fn appendSlice(self: *Request, gpa: Allocator, bytes: []const u8) !void {
         try self.bytes.appendSlice(gpa, bytes);
     }
@@ -765,9 +764,9 @@ pub fn errorResponse(
 ) anyerror!void {
     w.setStatus(status);
     // Clear the Content-Length header
-    try w.setHeader("Content-Length", null);
+    try w.setHeader(strings.content_length, null);
     // Set content type
-    try w.setHeader("Content-Type", "text/plain");
+    try w.setHeader(strings.content_type, "text/plain");
     // Print the body
     try w.any().print(format, args);
 }
@@ -839,5 +838,5 @@ fn spawnTestServer(server: *Server, wg: *std.Thread.WaitGroup, opts: Server.Opti
     }
     defer server.deinit(std.testing.allocator);
 
-    try server.run(gpa, handler);
+    try server.serve(gpa, handler);
 }
