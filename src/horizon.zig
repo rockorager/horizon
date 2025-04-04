@@ -42,7 +42,6 @@ pub const Server = struct {
 
     fd: posix.fd_t,
     addr: net.Address,
-    addr_len: u32,
     accept_c: Completion,
 
     msg_ring_c: Completion,
@@ -86,13 +85,15 @@ pub const Server = struct {
             .rings = try gpa.alloc(io.Ring, worker_count),
             .fd = fd,
             .addr = addr,
-            .addr_len = addr.getOsSockLen(),
             .accept_c = .{ .parent = .server, .op = .accept },
             .msg_ring_c = .{ .parent = .server, .op = .msg_ring },
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
         try posix.listen(fd, 64);
+
+        var sock_len = addr.getOsSockLen();
+        try posix.getsockname(fd, &self.addr.any, &sock_len);
 
         try self.ring.accept(self.fd, &self.accept_c);
         self.accept_c.active = true;

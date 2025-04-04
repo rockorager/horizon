@@ -18,6 +18,8 @@ pub fn main() !void {
 
     var gzip_handler: gzip.Handler = .init(.{ .ptr = undefined, .serveFn = serveHttp });
 
+    std.log.debug("listening at {}", .{s.addr});
+
     try s.run(gpa, gzip_handler.handler());
 }
 
