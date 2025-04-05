@@ -15,6 +15,11 @@
             .hash = "httpz-0.0.0-PNVzrGu3BgBqTTlJulQxL7nOo3ljwA5MvtGpQ2L0GkHE",
             .lazy = true,
         },
+        .zzz = .{
+            .url = "git+https://github.com/tardy-org/zzz#cda69dd141aa2addb490647aa214104da7b11036",
+            .hash = "zzz-0.3.0-4HoaJrBQAgCXB_66nre0nvYZmAXMxj__gS8sFjpR68Hs",
+            .lazy = true,
+        },
     },
 
     .paths = .{

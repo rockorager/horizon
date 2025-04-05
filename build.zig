@@ -63,6 +63,21 @@ pub fn build(b: *std.Build) void {
 
             break :blk b.addRunArtifact(httpz_exe);
         },
+
+        .zzz => blk: {
+            // zzz bench
+            const zzz_exe = b.addExecutable(.{
+                .name = "zzz",
+                .root_source_file = b.path("bench/zzz.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            const zzz = b.lazyDependency("zzz", .{ .target = target, .optimize = optimize });
+            zzz_exe.root_module.addImport("zzz", zzz.?.module("zzz"));
+            b.installArtifact(zzz_exe);
+
+            break :blk b.addRunArtifact(zzz_exe);
+        },
     };
 
     run_cmd.step.dependOn(b.getInstallStep());
@@ -79,4 +94,5 @@ const BenchServer = enum {
     go,
     horizon,
     httpz,
+    zzz,
 };
