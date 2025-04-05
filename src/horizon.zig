@@ -28,48 +28,75 @@ pub const Worker = struct {
 
     timeout: Server.Timeouts,
 
+    const State = enum {
+        init,
+        running,
+        finishing,
+        canceling,
+        done,
+    };
+
     fn serve(self: *Worker, gpa: Allocator, server: *Server) !void {
-        self.ring = try server.ring.initChild();
-        while (!self.should_quit) {
-            try self.ring.submitAndWait();
+        state: switch (State.init) {
+            .init => {
+                self.ring = try server.ring.initChild();
+                continue :state .running;
+            },
 
-            while (self.ring.nextCompletion()) |cqe| {
-                try self.handleCqe(gpa, cqe);
-            }
-        }
+            .running => {
+                while (!self.should_quit) {
+                    try self.ring.submitAndWait();
 
-        while (self.keep_alive > 0) {
-            try self.ring.submitAndWait();
-
-            while (self.ring.nextCompletion()) |cqe| {
-                try self.handleCqe(gpa, cqe);
-            }
-        }
-
-        // We've handled all the inflight requests. Now cancel everything that remains to clean up
-        // nicely
-        try self.ring.cancelAll();
-        var total: usize = 1;
-        while (total > 0) {
-            try self.ring.submitAndWait();
-            while (self.ring.nextCompletion()) |cqe| {
-                if (cqe.userdata == 0) {
-                    total -= 1;
-                    // This is our cancellation cqe
-                    const res = cqe.unwrap() catch |err| {
-                        log.err("cancel all error: {}", .{err});
-                        continue;
-                    };
-                    total = res;
-                    continue;
+                    while (self.ring.nextCompletion()) |cqe| {
+                        try self.handleCqe(gpa, cqe);
+                    }
                 }
-                try self.handleCqe(gpa, cqe);
-            }
-        }
 
-        // Notify the main thread we have exited
-        try self.ring.msgRing(server.ring, 0, @intFromEnum(Server.Op.thread_exit), 0);
-        try self.ring.submit();
+                continue :state .finishing;
+            },
+
+            .finishing => {
+                while (self.keep_alive > 0) {
+                    try self.ring.submitAndWait();
+
+                    while (self.ring.nextCompletion()) |cqe| {
+                        try self.handleCqe(gpa, cqe);
+                    }
+                }
+
+                continue :state .canceling;
+            },
+
+            .canceling => {
+                try self.ring.cancelAll();
+
+                var total: usize = 1;
+                while (total > 0) {
+                    try self.ring.submitAndWait();
+                    while (self.ring.nextCompletion()) |cqe| {
+                        if (cqe.userdata == 0) {
+                            total -= 1;
+                            // This is our cancellation cqe
+                            const res = cqe.unwrap() catch |err| {
+                                log.err("cancel all error: {}", .{err});
+                                continue;
+                            };
+                            total = res;
+                            continue;
+                        }
+                        try self.handleCqe(gpa, cqe);
+                    }
+                }
+
+                continue :state .done;
+            },
+
+            .done => {
+                // Notify the main thread we have exited
+                try self.ring.msgRing(server.ring, 0, @intFromEnum(Server.Op.thread_exit), 0);
+                try self.ring.submit();
+            },
+        }
     }
 
     fn handleCqe(
