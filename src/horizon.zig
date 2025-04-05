@@ -113,30 +113,15 @@ pub const Worker = struct {
             },
             .connection => {
                 switch (c.op) {
-                    .recv => {
-                        const conn: *Connection = @alignCast(@fieldParentPtr("recv_c", c));
-                        defer conn.maybeDestroy(gpa);
-                        try conn.onRecv(self, cqe);
-                    },
-
-                    .send => {
-                        const conn: *Connection = @alignCast(@fieldParentPtr("send_c", c));
-                        defer conn.maybeDestroy(gpa);
-                        try conn.onSendCompletion(self, cqe);
+                    .recv, .send => {
+                        const conn: *Connection = @alignCast(@fieldParentPtr("op_c", c));
+                        try conn.onEvent(self, cqe, c);
                     },
 
                     .close => {
-                        const conn: *Connection = @alignCast(@fieldParentPtr("close_c", c));
-                        defer conn.maybeDestroy(gpa);
-                        _ = cqe.unwrap() catch |err|
-                            log.err("connection closed with error: {}", .{err});
-                        conn.active -= 1;
-                    },
-
-                    .cancel => {
-                        const conn: *Connection = @alignCast(@fieldParentPtr("cancel_c", c));
-                        defer conn.maybeDestroy(gpa);
-                        conn.active -= 1;
+                        const conn: *Connection = @alignCast(@fieldParentPtr("op_c", c));
+                        conn.deinit();
+                        gpa.destroy(conn);
                     },
 
                     .timeout => {},
@@ -504,9 +489,6 @@ const Completion = struct {
         signal,
         timeout,
     },
-
-    /// If the completion has been scheduled
-    active: bool = false,
 };
 
 const CallbackError = Allocator.Error || error{
@@ -522,17 +504,11 @@ const Connection = struct {
 
     fd: posix.socket_t,
 
-    recv_c: Completion = .{ .parent = .connection, .op = .recv },
-    send_c: Completion = .{ .parent = .connection, .op = .send },
-    close_c: Completion = .{ .parent = .connection, .op = .close },
-    cancel_c: Completion = .{ .parent = .connection, .op = .cancel },
+    op_c: Completion = .{ .parent = .connection, .op = .recv },
     timeout_c: Completion = .{ .parent = .connection, .op = .timeout },
 
     /// Write buffer
     write_buf: std.ArrayListUnmanaged(u8) = .empty,
-
-    /// Number of active completions.
-    active: u8 = 0,
 
     /// An active request
     request: Request = .{},
@@ -542,10 +518,28 @@ const Connection = struct {
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
-    idle: bool,
-
     /// deadline to perform the next action
     deadline: i64,
+
+    state: State = .init,
+
+    const State = enum {
+        init,
+        reading_headers,
+        handling_request,
+        send,
+        send_with_deadline,
+        waiting_send_response,
+        idle,
+        close,
+        waiting_for_destruction,
+    };
+
+    const WriteState = enum {
+        headers_only,
+        headers_and_body,
+        body_only,
+    };
 
     pub fn init(
         self: *Connection,
@@ -558,7 +552,6 @@ const Connection = struct {
             .fd = fd,
             .response = undefined,
             .vecs = undefined,
-            .idle = false,
             .deadline = std.time.timestamp() + worker.timeout.read_header,
         };
 
@@ -569,21 +562,12 @@ const Connection = struct {
                 self.fd,
                 &self.buf,
                 self.deadline,
-                &self.recv_c,
+                &self.op_c,
                 &self.timeout_c,
             );
         } else {
-            try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
+            try worker.ring.recv(self.fd, &self.buf, &self.op_c);
         }
-
-        self.active += 1;
-        self.recv_c.active = true;
-    }
-
-    pub fn maybeDestroy(self: *Connection, gpa: Allocator) void {
-        if (self.active > 0) return;
-        self.deinit();
-        gpa.destroy(self);
     }
 
     pub fn deinit(self: *Connection) void {
@@ -591,76 +575,237 @@ const Connection = struct {
         self.* = undefined;
     }
 
-    fn close(self: *Connection, ring: *io.Ring) !void {
-        if (self.recv_c.active) {
-            // Cancel recv_c if we have one out there
-            try ring.cancel(@intFromPtr(&self.recv_c), @intFromPtr(&self.cancel_c));
-            self.active += 1;
-            self.cancel_c.active = true;
-        }
-        // Close downstream
-        try ring.close(self.fd, &self.close_c);
-        self.active += 1;
-        self.close_c.active = true;
-    }
-
-    pub fn onRecv(
+    fn onEvent(
         self: *Connection,
         worker: *Worker,
         cqe: io.Completion,
+        event: *Completion,
     ) !void {
-        self.active -= 1;
-        self.recv_c.active = false;
-        if (cqe.result == 0) {
-            // Peer closed connection
-            return self.close(&worker.ring);
+        state: switch (self.state) {
+            // Initial state. We are here at first connection, or coming out of idle
+            .init => {
+                assert(event.op == .recv);
+
+                continue :state .reading_headers;
+            },
+
+            // We are consuming bytes until we have read the full header section
+            .reading_headers => {
+                assert(event.op == .recv);
+
+                self.state = .reading_headers;
+
+                const result = cqe.unwrap() catch continue :state .close;
+                if (result == 0) continue :state .close;
+
+                try self.request.appendSlice(self.arena.allocator(), self.buf[0..result]);
+
+                switch (self.request.receivedHeader()) {
+                    // When we receive the full header, we pass it to the handler
+                    true => continue :state .handling_request,
+
+                    false => {
+                        self.op_c.op = .recv;
+                        // We haven't received a full HEAD. prep another recv
+                        if (worker.timeout.read_header > 0) {
+                            try worker.ring.recvWithDeadline(
+                                self.fd,
+                                &self.buf,
+                                self.deadline,
+                                &self.op_c,
+                                &self.timeout_c,
+                            );
+                        } else {
+                            try worker.ring.recv(self.fd, &self.buf, &self.op_c);
+                        }
+                    },
+                }
+            },
+
+            .handling_request => {
+                self.state = .handling_request;
+
+                // Keep the worker alive since we are now handling this request
+                worker.keep_alive += 1;
+
+                // Call the handler
+                try worker.handler.serveHttp(self.response.responseWriter(), self.request);
+
+                // TODO: we need to add some future handling for IO ops here. We want to give the
+                // handler an option to do IO async in our event loop. IE they could call API
+                // endpoints and return without wanting to write the response
+
+                // Prepare the header
+                try self.prepareHeader();
+
+                switch (worker.timeout.write) {
+                    0 => continue :state .send,
+                    else => {
+                        self.deadline = std.time.timestamp() + worker.timeout.write;
+                        continue :state .send_with_deadline;
+                    },
+                }
+            },
+
+            .send => {
+                self.state = .waiting_send_response;
+                self.op_c.op = .send;
+
+                const headers = self.write_buf.items;
+                const body = self.response.body.items;
+
+                const wstate: WriteState =
+                    if (self.written < headers.len and body.len == 0)
+                        .headers_only
+                    else if (self.written < headers.len)
+                        .headers_and_body
+                    else
+                        .body_only;
+
+                switch (wstate) {
+                    .headers_only => {
+                        try worker.ring.write(self.fd, headers[self.written..], &self.op_c);
+                    },
+
+                    .headers_and_body => {
+                        const unwritten = headers[self.written..];
+                        self.vecs[0] = .{
+                            .base = unwritten.ptr,
+                            .len = unwritten.len,
+                        };
+                        self.vecs[1] = .{
+                            .base = body.ptr,
+                            .len = body.len,
+                        };
+                        try worker.ring.writev(self.fd, &self.vecs, &self.op_c);
+                    },
+
+                    .body_only => {
+                        const offset = self.written - headers.len;
+                        const unwritten_body = body[offset..];
+                        try worker.ring.write(self.fd, unwritten_body, &self.op_c);
+                    },
+                }
+            },
+
+            .send_with_deadline => {
+                self.state = .waiting_send_response;
+                self.op_c.op = .send;
+
+                const headers = self.write_buf.items;
+                const body = self.response.body.items;
+
+                const wstate: WriteState =
+                    if (self.written < headers.len and body.len == 0)
+                        .headers_only
+                    else if (self.written < headers.len)
+                        .headers_and_body
+                    else
+                        .body_only;
+
+                switch (wstate) {
+                    .headers_only => {
+                        try worker.ring.writeWithDeadline(
+                            self.fd,
+                            headers[self.written..],
+                            self.deadline,
+                            &self.op_c,
+                            &self.timeout_c,
+                        );
+                    },
+
+                    .headers_and_body => {
+                        const unwritten = headers[self.written..];
+                        self.vecs[0] = .{
+                            .base = unwritten.ptr,
+                            .len = unwritten.len,
+                        };
+                        self.vecs[1] = .{
+                            .base = body.ptr,
+                            .len = body.len,
+                        };
+                        try worker.ring.writevWithDeadline(
+                            self.fd,
+                            &self.vecs,
+                            self.deadline,
+                            &self.op_c,
+                            &self.timeout_c,
+                        );
+                    },
+
+                    .body_only => {
+                        const offset = self.written - headers.len;
+                        const unwritten_body = body[offset..];
+                        try worker.ring.writeWithDeadline(
+                            self.fd,
+                            unwritten_body,
+                            self.deadline,
+                            &self.op_c,
+                            &self.timeout_c,
+                        );
+                    },
+                }
+            },
+
+            .waiting_send_response => {
+                assert(event.op == .send);
+
+                const result = cqe.unwrap() catch {
+                    // On error we are done and can let the worker softclose if it wants
+                    worker.keep_alive -= 1;
+                    continue :state .close;
+                };
+
+                self.written += result;
+
+                if (!self.responseComplete()) {
+                    if (worker.timeout.write > 0)
+                        continue :state .send_with_deadline
+                    else
+                        continue :state .send;
+                }
+
+                // Response sent. Decide if we should close the connection or keep it alive
+                // We also could allow the worker to exit gracefully now
+                worker.keep_alive -= 1;
+
+                // If the worker is quitting, we can close this connection
+                if (worker.should_quit or !self.request.keepAlive()) {
+                    continue :state .close;
+                }
+
+                continue :state .idle;
+            },
+
+            .idle => {
+                // We'll go back to init state after reinitializing state
+                defer self.state = .init;
+
+                self.reset();
+
+                // prep another recv
+                if (worker.timeout.idle > 0) {
+                    self.deadline = std.time.timestamp() + worker.timeout.idle;
+                    try worker.ring.recvWithDeadline(
+                        self.fd,
+                        &self.buf,
+                        self.deadline,
+                        &self.op_c,
+                        &self.timeout_c,
+                    );
+                } else {
+                    try worker.ring.recv(self.fd, &self.buf, &self.op_c);
+                }
+            },
+
+            .close => {
+                self.state = .waiting_for_destruction;
+                self.op_c.op = .close;
+                try worker.ring.close(self.fd, &self.op_c);
+            },
+
+            .waiting_for_destruction => {},
         }
-
-        const result = cqe.unwrap() catch |err| {
-            switch (err) {
-                error.Canceled => return self.close(&worker.ring),
-                error.ConnectionResetByPeer => return self.close(&worker.ring),
-                else => {
-                    log.err("recv error: {}", .{cqe.err()});
-                    return self.close(&worker.ring);
-                },
-            }
-            return;
-        };
-
-        if (self.idle and worker.timeout.read_header > 0) {
-            // If we are coming out of idle, we have to update our deadline
-            self.idle = false;
-            self.deadline = std.time.timestamp() + worker.timeout.read_header;
-        }
-
-        try self.request.appendSlice(self.arena.allocator(), self.buf[0..result]);
-
-        if (!self.request.receivedHeader()) {
-            // We haven't received a full HEAD. prep another recv
-            if (worker.timeout.read_header > 0) {
-                try worker.ring.recvWithDeadline(
-                    self.fd,
-                    &self.buf,
-                    self.deadline,
-                    &self.recv_c,
-                    &self.timeout_c,
-                );
-            } else {
-                try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
-            }
-            self.active += 1;
-            self.recv_c.active = true;
-            return;
-        }
-
-        // Keep the worker alive since we are now handling this request
-        worker.keep_alive += 1;
-        // We've received a full HEAD, call the handler now
-        try worker.handler.serveHttp(self.response.responseWriter(), self.request);
-        try self.prepareHeader();
-        if (worker.timeout.write > 0) self.deadline = std.time.timestamp() + worker.timeout.write;
-        try self.send(worker);
     }
 
     fn reset(self: *Connection) void {
@@ -669,6 +814,7 @@ const Connection = struct {
         self.write_buf = .empty;
         self.response = .{ .arena = self.arena.allocator() };
         self.written = 0;
+        self.op_c.op = .recv;
     }
 
     /// Writes the header into write_buf
@@ -723,122 +869,6 @@ const Connection = struct {
 
     fn responseComplete(self: *Connection) bool {
         return self.written == (self.write_buf.items.len + self.response.body.items.len);
-    }
-
-    fn send(self: *Connection, worker: *Worker) !void {
-        // Pending headers, no body
-        if (self.written < self.write_buf.items.len and self.response.body.items.len == 0) {
-            if (worker.timeout.write > 0) {
-                try worker.ring.writeWithDeadline(
-                    self.fd,
-                    self.write_buf.items[self.written..],
-                    self.deadline,
-                    &self.send_c,
-                    &self.timeout_c,
-                );
-            } else {
-                try worker.ring.write(self.fd, self.write_buf.items[self.written..], &self.send_c);
-            }
-            self.active += 1;
-            self.send_c.active = true;
-            return;
-        }
-
-        // Pending headers + body
-        if (self.written < self.write_buf.items.len) {
-            const headers = self.write_buf.items[self.written..];
-            self.vecs[0] = .{
-                .base = headers.ptr,
-                .len = headers.len,
-            };
-            self.vecs[1] = .{
-                .base = self.response.body.items.ptr,
-                .len = self.response.body.items.len,
-            };
-            if (worker.timeout.write > 0) {
-                try worker.ring.writevWithDeadline(
-                    self.fd,
-                    &self.vecs,
-                    self.deadline,
-                    &self.send_c,
-                    &self.timeout_c,
-                );
-            } else {
-                try worker.ring.writev(self.fd, &self.vecs, &self.send_c);
-            }
-            self.active += 1;
-            self.send_c.active = true;
-
-            return;
-        }
-
-        // Pending body
-        const offset = self.written - self.write_buf.items.len;
-        const body = self.response.body.items[offset..];
-        self.active += 1;
-        if (worker.timeout.write > 0) {
-            try worker.ring.writeWithDeadline(
-                self.fd,
-                body,
-                self.deadline,
-                &self.send_c,
-                &self.timeout_c,
-            );
-        } else {
-            try worker.ring.write(self.fd, body, &self.send_c);
-        }
-        self.send_c.active = true;
-    }
-
-    fn onSendCompletion(self: *Connection, worker: *Worker, cqe: io.Completion) CallbackError!void {
-        self.active -= 1;
-        self.send_c.active = false;
-        switch (cqe.err()) {
-            .SUCCESS => {},
-            else => {
-                // Response send error, we can let the worker exit if it wants to
-                worker.keep_alive -= 1;
-                log.err("send error: {}", .{cqe.err()});
-                return self.close(&worker.ring);
-            },
-        }
-
-        self.written += @intCast(cqe.result);
-
-        switch (self.responseComplete()) {
-            // If the response didn't finish sending, try again
-            false => return self.send(worker),
-
-            // Response sent. Decide if we should close the connection or keep it alive
-            true => {
-                // Response has been fully sent, we could exit gracefully
-                worker.keep_alive -= 1;
-
-                // If the worker is quitting, we can close this connection
-                if (worker.should_quit or !self.request.keepAlive()) {
-                    return self.close(&worker.ring);
-                }
-
-                self.reset();
-
-                self.idle = true;
-
-                // prep another recv
-                if (worker.timeout.idle > 0) {
-                    self.deadline = std.time.timestamp() + worker.timeout.idle;
-                    try worker.ring.recvWithDeadline(
-                        self.fd,
-                        &self.buf,
-                        self.deadline,
-                        &self.recv_c,
-                        &self.timeout_c,
-                    );
-                } else {
-                    try worker.ring.recv(self.fd, &self.buf, &self.recv_c);
-                }
-                self.active += 1;
-            },
-        }
     }
 };
 
