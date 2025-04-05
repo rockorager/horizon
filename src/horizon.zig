@@ -1216,6 +1216,7 @@ test Server {
         var buf: [4096]u8 = undefined;
         const n = try stream.read(&buf);
 
+        // We shouldn't get called since the request is invalid
         try std.testing.expect(!handler.got_request);
         try std.testing.expectStringStartsWith(buf[0..n], "HTTP/1.1 400");
     }
