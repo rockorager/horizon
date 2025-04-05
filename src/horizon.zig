@@ -11,11 +11,9 @@ const HeadParser = http.HeadParser;
 
 const assert = std.debug.assert;
 
-const strings = struct {
-    const crlf = "\r\n";
-    const content_length = "Content-Length";
-    const content_type = "Content-Type";
-};
+const @"Content-Length" = "Content-Length";
+const @"Content-Type" = "Content-Type";
+const crlf = "\r\n";
 
 pub const Worker = struct {
     should_quit: bool,
@@ -70,18 +68,21 @@ pub const Worker = struct {
             .canceling => {
                 try self.ring.cancelAll();
 
+                // We could get cancelations before we know how many to expect, so we track both the
+                // number of completions and how many we expect
                 var total: usize = 1;
-                while (total > 0) {
+                var canceled: usize = 0;
+                while (canceled < total) {
                     try self.ring.submitAndWait();
                     while (self.ring.nextCompletion()) |cqe| {
+                        canceled += 1;
                         if (cqe.userdata == 0) {
-                            total -= 1;
                             // This is our cancellation cqe
                             const res = cqe.unwrap() catch |err| {
                                 log.err("cancel all error: {}", .{err});
                                 continue;
                             };
-                            total = res;
+                            total += res;
                             continue;
                         }
                         try self.handleCqe(gpa, cqe);
@@ -115,7 +116,7 @@ pub const Worker = struct {
                 switch (c.op) {
                     .recv, .send => {
                         const conn: *Connection = @alignCast(@fieldParentPtr("op_c", c));
-                        try conn.onEvent(self, cqe, c);
+                        try conn.onEvent(gpa, self, cqe, c);
                     },
 
                     .close => {
@@ -308,6 +309,7 @@ pub const Server = struct {
 
                 continue :state .running;
             },
+
             .running => {
                 try self.ring.submitAndWait();
 
@@ -332,6 +334,7 @@ pub const Server = struct {
 
                 continue :state .running;
             },
+
             .stopping => {
                 if (sfd) |fd| {
                     var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
@@ -343,6 +346,7 @@ pub const Server = struct {
                 );
                 continue :state .canceling;
             },
+
             .canceling => {
                 try self.ring.submitAndWait();
 
@@ -352,14 +356,7 @@ pub const Server = struct {
                         .accept => {
                             // it's possible we accepted a connection before the cancelation. Close the
                             // fd if we did
-                            const fd = cqe.unwrap() catch |err| {
-                                switch (err) {
-                                    // move to clean_up when we get the response that accept was
-                                    // canceled
-                                    error.Canceled => continue :state .clean_up,
-                                    else => continue,
-                                }
-                            };
+                            const fd = cqe.unwrap() catch continue :state .clean_up;
                             posix.close(fd);
                         },
 
@@ -373,7 +370,7 @@ pub const Server = struct {
                             return;
                         },
 
-                        .cancel_accept => continue,
+                        .cancel_accept => continue :state .clean_up,
 
                         else => unreachable,
                     }
@@ -381,6 +378,7 @@ pub const Server = struct {
 
                 continue :state .canceling;
             },
+
             .clean_up => try self.cleanUp(sfd),
         }
     }
@@ -410,7 +408,12 @@ pub const Server = struct {
             while (self.ring.nextCompletion()) |cqe| {
                 const op: Op = @enumFromInt(cqe.userdata);
                 switch (op) {
-                    .accept => unreachable,
+                    .accept => {
+                        // it's possible we accepted a connection before the cancelation. Close the
+                        // fd if we did
+                        const fd = cqe.unwrap() catch continue;
+                        posix.close(fd);
+                    },
 
                     .msg_ring => _ = cqe.unwrap() catch |err|
                         log.err("msg not sent to ring: {}", .{err}),
@@ -425,10 +428,8 @@ pub const Server = struct {
                         return;
                     },
 
-                    // When we receive the cancel accept response, we exit the loop
-                    .cancel_accept => unreachable,
+                    .cancel_accept => {},
 
-                    // We don't ever receive this response in this loop
                     .thread_exit => exited_threads += 1,
 
                     .timeout => return,
@@ -515,6 +516,8 @@ const Connection = struct {
 
     response: Response,
 
+    ctx: Context,
+
     vecs: [2]posix.iovec_const,
     written: usize = 0,
 
@@ -532,6 +535,7 @@ const Connection = struct {
         waiting_send_response,
         idle,
         close,
+        destroy,
         waiting_for_destruction,
     };
 
@@ -551,11 +555,17 @@ const Connection = struct {
             .arena = .init(gpa),
             .fd = fd,
             .response = undefined,
+            .ctx = undefined,
             .vecs = undefined,
             .deadline = std.time.timestamp() + worker.timeout.read_header,
         };
 
         self.response = .{ .arena = self.arena.allocator() };
+        self.ctx = .{
+            .arena = self.arena.allocator(),
+            .deadline = 0,
+            .userdata = .empty,
+        };
 
         if (worker.timeout.read_header > 0) {
             try worker.ring.recvWithDeadline(
@@ -577,6 +587,7 @@ const Connection = struct {
 
     fn onEvent(
         self: *Connection,
+        gpa: Allocator,
         worker: *Worker,
         cqe: io.Completion,
         event: *Completion,
@@ -628,12 +639,19 @@ const Connection = struct {
                 // Keep the worker alive since we are now handling this request
                 worker.keep_alive += 1;
 
-                // Call the handler
-                try worker.handler.serveHttp(self.response.responseWriter(), self.request);
+                // validate the request
+                if (try self.request.isValid(self.response.responseWriter())) {
+                    // Call the handler
+                    try worker.handler.serveHttp(
+                        &self.ctx,
+                        self.response.responseWriter(),
+                        self.request,
+                    );
 
-                // TODO: we need to add some future handling for IO ops here. We want to give the
-                // handler an option to do IO async in our event loop. IE they could call API
-                // endpoints and return without wanting to write the response
+                    // TODO: we need to add some future handling for IO ops here. We want to give the
+                    // handler an option to do IO async in our event loop. IE they could call API
+                    // endpoints and return without wanting to write the response
+                }
 
                 // Prepare the header
                 try self.prepareHeader();
@@ -799,12 +817,23 @@ const Connection = struct {
             },
 
             .close => {
+                // If the worker is closing, we don't schedule new SQEs and instead close
+                // synchronously
+                if (worker.should_quit) continue :state .destroy;
+
                 self.state = .waiting_for_destruction;
                 self.op_c.op = .close;
                 try worker.ring.close(self.fd, &self.op_c);
             },
 
             .waiting_for_destruction => {},
+
+            .destroy => {
+                assert(worker.should_quit);
+
+                self.deinit();
+                gpa.destroy(self);
+            },
         }
     }
 
@@ -815,6 +844,9 @@ const Connection = struct {
         self.response = .{ .arena = self.arena.allocator() };
         self.written = 0;
         self.op_c.op = .recv;
+
+        self.ctx.deadline = 0;
+        self.ctx.userdata = .empty;
     }
 
     /// Writes the header into write_buf
@@ -841,17 +873,17 @@ const Connection = struct {
             writer.print("HTTP/1.1 {d}\r\n", .{@intFromEnum(status)}) catch unreachable;
         }
 
-        if (resp.headers.get(strings.content_length) == null) {
+        if (resp.headers.get(@"Content-Length") == null) {
             writer.print(
-                strings.content_length ++ ": {d}" ++ strings.crlf,
+                @"Content-Length" ++ ": {d}" ++ crlf,
                 .{resp.body.items.len},
             ) catch unreachable;
         }
 
-        if (resp.headers.get(strings.content_type) == null) {
+        if (resp.headers.get(@"Content-Type") == null) {
             // TODO: sniff content type
             writer.print(
-                strings.content_type ++ ": {s}" ++ strings.crlf,
+                @"Content-Type" ++ ": {s}" ++ crlf,
                 .{"text/plain"},
             ) catch unreachable;
         }
@@ -859,12 +891,12 @@ const Connection = struct {
         var iter = resp.headers.iterator();
         while (iter.next()) |h| {
             writer.print(
-                "{s}: {s}" ++ strings.crlf,
+                "{s}: {s}" ++ crlf,
                 .{ h.key_ptr.*, h.value_ptr.* },
             ) catch unreachable;
         }
 
-        writer.writeAll(strings.crlf) catch unreachable;
+        writer.writeAll(crlf) catch unreachable;
     }
 
     fn responseComplete(self: *Connection) bool {
@@ -887,7 +919,7 @@ pub const Request = struct {
         const idx = std.mem.indexOf(
             u8,
             self.bytes.items,
-            strings.crlf ++ strings.crlf,
+            crlf ++ crlf,
         ) orelse return null;
 
         return idx + 4;
@@ -922,15 +954,7 @@ pub const Request = struct {
     pub fn getHeader(self: Request, key: []const u8) ?[]const u8 {
         var iter = self.headerIterator();
         while (iter.next()) |header| {
-            // Check lengths
-            if (header.name.len != key.len) continue;
-
-            // Fast path for canonical case matched headers. We use those exclusively in this
-            // library when getting headers
-            if (std.mem.eql(u8, header.name, key) or
-                // Slow path for case matching
-                std.ascii.eqlIgnoreCase(header.name, key))
-                return header.value;
+            if (std.ascii.eqlIgnoreCase(header.name, key)) return header.value;
         }
         return null;
     }
@@ -939,7 +963,7 @@ pub const Request = struct {
     pub fn method(self: Request) http.Method {
         assert(self.receivedHeader());
         // GET / HTTP/1.1
-        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf) orelse unreachable;
+        const idx = std.mem.indexOf(u8, self.bytes.items, crlf) orelse unreachable;
         const line = self.bytes.items[0..idx];
         const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
         const val = http.Method.parse(line[0..space]);
@@ -947,7 +971,7 @@ pub const Request = struct {
     }
 
     pub fn contentLength(self: Request) ?u64 {
-        const value = self.getHeader(strings.content_length) orelse return null;
+        const value = self.getHeader(@"Content-Length") orelse return null;
         return std.fmt.parseUnsigned(u64, value, 10) catch @panic("TODO: bad content length");
     }
 
@@ -958,17 +982,29 @@ pub const Request = struct {
     pub fn keepAlive(self: Request) bool {
         const value = self.getHeader("Connection") orelse return true;
         // fast and slow paths for case matching
-        return std.mem.eql(u8, value, "keep-alive") or
-            std.ascii.eqlIgnoreCase(value, "keep-alive");
+        return std.ascii.eqlIgnoreCase(value, "keep-alive");
     }
 
     pub fn path(self: Request) []const u8 {
         assert(self.receivedHeader());
-        const idx = std.mem.indexOf(u8, self.bytes.items, strings.crlf) orelse unreachable;
+        const idx = std.mem.indexOf(u8, self.bytes.items, crlf) orelse unreachable;
         const line = self.bytes.items[0..idx];
         var iter = std.mem.splitScalar(u8, line, ' ');
         _ = iter.first();
         return iter.next() orelse unreachable;
+    }
+
+    /// Validates a request
+    fn isValid(self: Request, w: ResponseWriter) !bool {
+        const m = self.method();
+        if (m.requestHasBody()) {
+            // We require a content length
+            if (self.contentLength() == null) {
+                try errorResponse(w, .bad_request, @"Content-Length" ++ " is required", .{});
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -1091,30 +1127,48 @@ pub fn errorResponse(
 ) anyerror!void {
     w.setStatus(status);
     // Clear the Content-Length header
-    try w.setHeader(strings.content_length, null);
+    try w.setHeader(@"Content-Length", null);
     // Set content type
-    try w.setHeader(strings.content_type, "text/plain");
+    try w.setHeader(@"Content-Type", "text/plain");
     // Print the body
     try w.any().print(format, args);
 }
 
+pub const Context = struct {
+    /// Arena allocator which will be freed once the response has been written
+    arena: Allocator,
+
+    /// Deadline for the response, in seconds from unix epoch
+    deadline: u64,
+
+    /// Userdata that will live as long as the request. Always use the arena allocator when adding
+    /// data to the hashmap. Keys must be stable for the lifetime of the request - they can be duped
+    /// with the arena if needed
+    userdata: std.StringHashMapUnmanaged(u64),
+
+    pub fn expired(self: Context) bool {
+        if (self.deadline == 0) return false;
+        return std.time.timestamp() > self.deadline;
+    }
+};
+
 pub const Handler = struct {
     ptr: *anyopaque,
-    serveFn: *const fn (*anyopaque, ResponseWriter, Request) anyerror!void,
+    serveFn: *const fn (*anyopaque, *Context, ResponseWriter, Request) anyerror!void,
 
     /// Initialize a handler from a Type which has a serveHttp method
     pub fn init(comptime T: type, ptr: *T) Handler {
         return .{ .ptr = ptr, .serveFn = T.serveHttp };
     }
 
-    pub fn serveHttp(self: Handler, w: ResponseWriter, r: Request) anyerror!void {
-        return self.serveFn(self.ptr, w, r);
+    pub fn serveHttp(self: Handler, ctx: *Context, w: ResponseWriter, r: Request) anyerror!void {
+        return self.serveFn(self.ptr, ctx, w, r);
     }
 };
 
 test Server {
     const addr: net.Address = try .parseIp4("127.0.0.1", 0);
-    const opts: Server.Options = .{ .addr = addr };
+    const opts: Server.Options = .{ .addr = addr, .workers = 1 };
     var server: Server = undefined;
 
     const TestHandler = struct {
@@ -1124,7 +1178,7 @@ test Server {
             return .init(@This(), self);
         }
 
-        pub fn serveHttp(ptr: *anyopaque, w: ResponseWriter, _: Request) anyerror!void {
+        pub fn serveHttp(ptr: *anyopaque, _: *Context, w: ResponseWriter, _: Request) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.got_request = true;
             w.any().print("hello world", .{}) catch unreachable;
@@ -1146,13 +1200,25 @@ test Server {
 
     const stream = try std.net.tcpConnectToAddress(server.addr);
     defer stream.close();
-    _ = try stream.write("GET / HTTP/1.1\r\nConnection: close\r\n\r\n");
 
-    var buf: [4096]u8 = undefined;
-    const n = try stream.read(&buf);
+    {
+        _ = try stream.write("GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+        var buf: [4096]u8 = undefined;
+        const n = try stream.read(&buf);
 
-    try std.testing.expect(handler.got_request);
-    try std.testing.expectStringStartsWith(buf[0..n], "HTTP/1.1 200");
+        try std.testing.expect(handler.got_request);
+        try std.testing.expectStringStartsWith(buf[0..n], "HTTP/1.1 200");
+    }
+
+    {
+        handler.got_request = false;
+        _ = try stream.write("POST / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n");
+        var buf: [4096]u8 = undefined;
+        const n = try stream.read(&buf);
+
+        try std.testing.expect(!handler.got_request);
+        try std.testing.expectStringStartsWith(buf[0..n], "HTTP/1.1 400");
+    }
 
     try server.stop();
     thread.join();

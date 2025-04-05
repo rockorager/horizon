@@ -36,8 +36,7 @@ const MyHandler = struct {
         return .init(MyHandler, self);
     }
 
-    pub fn serveHttp(_: *anyopaque, w: horizon.ResponseWriter, r: horizon.Request) anyerror!void {
-        _ = r;
+    pub fn serveHttp(_: *anyopaque, _: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
         try w.any().print("hello, world", .{});
     }
 };
@@ -56,22 +55,20 @@ const gzip = struct {
 
         pub fn serveHttp(
             ptr: *anyopaque,
+            ctx: *horizon.Context,
             w: horizon.ResponseWriter,
             r: horizon.Request,
         ) anyerror!void {
             const self: *Handler = @ptrCast(@alignCast(ptr));
 
             const hdr = r.getHeader("Accept-Encoding") orelse
-                return self.next.serveHttp(w, r);
+                return self.next.serveHttp(ctx, w, r);
 
             if (std.mem.indexOf(u8, hdr, "gzip") == null)
-                return self.next.serveHttp(w, r);
+                return self.next.serveHttp(ctx, w, r);
 
             var gz: ResponseWriter = .{ .rw = w };
-            try self.next.serveHttp(
-                gz.responseWriter(),
-                r,
-            );
+            try self.next.serveHttp(ctx, gz.responseWriter(), r);
             try gz.flush();
         }
     };
