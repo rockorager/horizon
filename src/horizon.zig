@@ -105,7 +105,7 @@ pub const Worker = struct {
         gpa: Allocator,
         cqe: io.Completion,
     ) !void {
-        const c: *Completion = @ptrFromInt(cqe.userdata);
+        const c: *Event = @ptrFromInt(cqe.userdata);
         switch (c.parent) {
             .server => switch (c.op) {
                 .accept => try self.onAccept(gpa, cqe),
@@ -158,7 +158,7 @@ pub const Server = struct {
     stop_pipe: [2]posix.fd_t,
 
     /// Stable completion pointer for messaging threads
-    accept_c: Completion = .{ .parent = .server, .op = .accept },
+    accept_c: Event = .{ .parent = .server, .op = .accept },
 
     timeout: Timeouts,
 
@@ -254,7 +254,6 @@ pub const Server = struct {
         try posix.getsockname(fd, &self.addr.any, &sock_len);
     }
 
-    /// Queues a stop of the server
     pub fn deinit(self: *Server, gpa: Allocator) void {
         for (self.workers) |*worker| {
             worker.ring.deinit();
@@ -265,11 +264,7 @@ pub const Server = struct {
         gpa.free(self.threads);
     }
 
-    pub fn serve(
-        self: *Server,
-        gpa: Allocator,
-        handler: Handler,
-    ) !void {
+    pub fn serve(self: *Server, gpa: Allocator, handler: Handler) !void {
         // If we have a shutdown_signal, we have to register it before spawning threads. Each thread
         // inherits the signal mask
         var sfd: ?posix.fd_t = null;
@@ -392,7 +387,7 @@ pub const Server = struct {
         // 4. If we get another stop signal, detach threads and exit
         // 5. If we got all our thread exit signals, we close cleanly
 
-        var stop_c: Completion = .{ .parent = .server, .op = .stop };
+        var stop_c: Event = .{ .parent = .server, .op = .stop };
 
         // 60 second timeout to gracefully close
         try self.ring.timer(60, @intFromEnum(Op.timeout));
@@ -473,7 +468,7 @@ pub const Server = struct {
 };
 
 /// A Completion Entry
-const Completion = struct {
+const Event = struct {
     parent: enum {
         server,
         connection,
@@ -505,8 +500,8 @@ const Connection = struct {
 
     fd: posix.socket_t,
 
-    op_c: Completion = .{ .parent = .connection, .op = .recv },
-    timeout_c: Completion = .{ .parent = .connection, .op = .timeout },
+    op_c: Event = .{ .parent = .connection, .op = .recv },
+    timeout_c: Event = .{ .parent = .connection, .op = .timeout },
 
     /// Write buffer
     write_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -590,7 +585,7 @@ const Connection = struct {
         gpa: Allocator,
         worker: *Worker,
         cqe: io.Completion,
-        event: *Completion,
+        event: *Event,
     ) !void {
         state: switch (self.state) {
             // Initial state. We are here at first connection, or coming out of idle
