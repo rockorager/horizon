@@ -1057,53 +1057,29 @@ pub const Response = struct {
 };
 
 pub const HeaderIterator = struct {
-    bytes: []const u8,
-    index: usize,
-    is_trailer: bool,
+    iter: std.mem.SplitIterator(u8, .sequence),
 
     pub fn init(bytes: []const u8) HeaderIterator {
-        return .{
-            .bytes = bytes,
-            .index = std.mem.indexOfPos(u8, bytes, 0, "\r\n").? + 2,
-            .is_trailer = false,
-        };
+        var iter = std.mem.splitSequence(u8, bytes, "\r\n");
+        // Throw away the first line
+        _ = iter.first();
+        return .{ .iter = iter };
     }
 
-    pub fn next(it: *HeaderIterator) ?std.http.Header {
-        const end = std.mem.indexOfPosLinear(u8, it.bytes, it.index, "\r\n").?;
-        if (it.index == end) { // found the trailer boundary (\r\n\r\n)
-            if (it.is_trailer) return null;
-
-            const next_end = std.mem.indexOfPos(u8, it.bytes, end + 2, "\r\n") orelse
-                return null;
-
-            var kv_it = std.mem.splitScalar(u8, it.bytes[end + 2 .. next_end], ':');
-            const name = kv_it.first();
-            const value = kv_it.rest();
-
-            it.is_trailer = true;
-            it.index = next_end + 2;
-            if (name.len == 0)
-                return null;
-
-            return .{
-                .name = name,
-                .value = std.mem.trim(u8, value, " \t"),
-            };
-        } else { // normal header
-            var kv_it = std.mem.splitScalar(u8, it.bytes[it.index..end], ':');
-            const name = kv_it.first();
-            const value = kv_it.rest();
-
-            it.index = end + 2;
-            if (name.len == 0)
-                return null;
-
-            return .{
-                .name = name,
-                .value = std.mem.trim(u8, value, " \t"),
-            };
+    pub fn next(self: *HeaderIterator) ?std.http.Header {
+        const line = self.iter.next() orelse return null;
+        if (line.len == 0) {
+            // When we get to the first empty line we are done
+            self.iter.index = self.iter.buffer.len;
+            return null;
         }
+        var kv_iter = std.mem.splitScalar(u8, line, ':');
+        const name = kv_iter.first();
+        const value = kv_iter.rest();
+        return .{
+            .name = name,
+            .value = std.mem.trim(u8, value, " \t"),
+        };
     }
 };
 
