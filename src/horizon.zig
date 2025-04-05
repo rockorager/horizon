@@ -287,73 +287,120 @@ pub const Server = struct {
         // If we have a shutdown_signal, we have to register it before spawning threads. Each thread
         // inherits the signal mask
         var sfd: ?posix.fd_t = null;
-        if (self.shutdown_signal > 0) {
-            // Listen for the shutdown signal
-            sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
-        }
 
-        for (self.workers, 0..) |*worker, i| {
-            worker.* = .{
-                .should_quit = false,
-                .ring = undefined,
-                .handler = handler,
-                .keep_alive = 0,
-                .timeout = self.timeout,
-            };
-            worker.handler = handler;
-            self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
-        }
+        const State = enum {
+            init,
+            running,
+            stopping,
+            canceling,
+            clean_up,
+        };
 
-        // Start listening for stop signals from the stop pipe
-        try self.ring.poll(self.stop_pipe[0], @intFromEnum(Op.stop));
-
-        // Start accepting connections
-        try self.ring.accept(self.fd, @intFromEnum(Op.accept));
-
-        var should_quit: bool = false;
-        while (!should_quit) {
-            try self.ring.submitAndWait();
-
-            while (self.ring.nextCompletion()) |cqe| {
-                const op: Op = @enumFromInt(cqe.userdata);
-                switch (op) {
-                    .accept => try self.acceptAndSend(cqe),
-
-                    .msg_ring => _ = cqe.unwrap() catch |err|
-                        log.err("msg not sent to ring: {}", .{err}),
-
-                    // When we receive the stop signal, we cancel the accept
-                    .stop => {
-                        if (sfd) |fd| {
-                            var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
-                            _ = try posix.read(fd, &buf);
-                        }
-                        try self.ring.cancel(
-                            @intFromEnum(Op.accept),
-                            @intFromEnum(Op.cancel_accept),
-                        );
-                    },
-
-                    // When we receive the cancel accept response, we exit the loop
-                    .cancel_accept => should_quit = true,
-
-                    // We don't ever receive this response in this loop
-                    .thread_exit => unreachable,
-
-                    .timeout => unreachable,
+        state: switch (State.init) {
+            .init => {
+                if (self.shutdown_signal > 0) {
+                    // Listen for the shutdown signal
+                    sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
                 }
-            }
-        }
 
-        try self.cleanUp(sfd);
+                for (self.workers, 0..) |*worker, i| {
+                    worker.* = .{
+                        .should_quit = false,
+                        .ring = undefined,
+                        .handler = handler,
+                        .keep_alive = 0,
+                        .timeout = self.timeout,
+                    };
+                    worker.handler = handler;
+                    self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
+                }
+
+                // Start listening for stop signals from the stop pipe
+                try self.ring.poll(self.stop_pipe[0], @intFromEnum(Op.stop));
+
+                // Start accepting connections
+                try self.ring.accept(self.fd, @intFromEnum(Op.accept));
+
+                continue :state .running;
+            },
+            .running => {
+                try self.ring.submitAndWait();
+
+                while (self.ring.nextCompletion()) |cqe| {
+                    const op: Op = @enumFromInt(cqe.userdata);
+                    switch (op) {
+                        .accept => try self.acceptAndSend(cqe),
+
+                        .msg_ring => _ = cqe.unwrap() catch |err|
+                            log.err("msg not sent to ring: {}", .{err}),
+
+                        // When we receive the stop signal, we transition to stopping state
+                        .stop => continue :state .stopping,
+
+                        // When we receive the cancel accept response, we exit the loop
+                        .cancel_accept,
+                        .thread_exit,
+                        .timeout,
+                        => unreachable,
+                    }
+                }
+
+                continue :state .running;
+            },
+            .stopping => {
+                if (sfd) |fd| {
+                    var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
+                    _ = try posix.read(fd, &buf);
+                }
+                try self.ring.cancel(
+                    @intFromEnum(Op.accept),
+                    @intFromEnum(Op.cancel_accept),
+                );
+                continue :state .canceling;
+            },
+            .canceling => {
+                try self.ring.submitAndWait();
+
+                while (self.ring.nextCompletion()) |cqe| {
+                    const op: Op = @enumFromInt(cqe.userdata);
+                    switch (op) {
+                        .accept => {
+                            // it's possible we accepted a connection before the cancelation. Close the
+                            // fd if we did
+                            const fd = cqe.unwrap() catch |err| {
+                                switch (err) {
+                                    // move to clean_up when we get the response that accept was
+                                    // canceled
+                                    error.Canceled => continue :state .clean_up,
+                                    else => continue,
+                                }
+                            };
+                            posix.close(fd);
+                        },
+
+                        // If we receive another stop signal, we return immediately
+                        .stop => {
+                            if (sfd) |fd| {
+                                var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
+                                _ = try posix.read(fd, &buf);
+                                posix.close(fd);
+                            }
+                            return;
+                        },
+
+                        .cancel_accept => continue,
+
+                        else => unreachable,
+                    }
+                }
+
+                continue :state .canceling;
+            },
+            .clean_up => try self.cleanUp(sfd),
+        }
     }
 
     fn cleanUp(self: *Server, sfd: ?posix.fd_t) !void {
-        // Reregister the shutdown signal so we can do a quick shutdown
-        // var sfd: ?posix.fd_t = null;
-        // if (self.shutdown_signal > 0) {
-        //     sfd = try self.ring.signalfd(self.shutdown_signal, @intFromEnum(Op.stop));
-        // }
         // Shutdown
         //
         // 1. Set a timeout for total shutdown time
