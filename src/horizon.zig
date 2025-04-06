@@ -7,7 +7,6 @@ const http = std.http;
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const HeadParser = http.HeadParser;
 
 const assert = std.debug.assert;
 
@@ -108,10 +107,18 @@ pub const Worker = struct {
         const c: *Event = @ptrFromInt(cqe.userdata);
         switch (c.parent) {
             .server => switch (c.op) {
-                .accept => try self.onAccept(gpa, cqe),
+                .accept => {
+                    // This accept was sent from the Server, and we handled errors there
+                    const result = cqe.unwrap() catch unreachable;
+
+                    const conn = try gpa.create(Connection);
+                    try conn.init(gpa, self, result);
+                },
+
                 .stop => self.should_quit = true,
                 else => unreachable,
             },
+
             .connection => {
                 switch (c.op) {
                     .recv, .send => {
@@ -131,16 +138,6 @@ pub const Worker = struct {
                 }
             },
         }
-    }
-
-    fn onAccept(self: *Worker, gpa: Allocator, cqe: io.Completion) !void {
-        const result = cqe.unwrap() catch {
-            log.err("accept error: {}", .{cqe.err()});
-            @panic("accept error");
-        };
-
-        const conn = try gpa.create(Connection);
-        try conn.init(gpa, self, result);
     }
 };
 
