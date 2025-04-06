@@ -1,5 +1,6 @@
 const std = @import("std");
 const io = @import("io/io.zig");
+const sniff = @import("sniff.zig");
 
 const log = std.log.scoped(.horizon);
 
@@ -873,10 +874,10 @@ const Connection = struct {
         }
 
         if (resp.headers.get(@"Content-Type") == null) {
-            // TODO: sniff content type
+            const ct = sniff.detectContentType(self.response.body.items);
             writer.print(
                 @"Content-Type" ++ ": {s}" ++ crlf,
-                .{"text/plain"},
+                .{ct},
             ) catch unreachable;
         }
 
