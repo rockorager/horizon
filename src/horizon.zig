@@ -1226,3 +1226,7 @@ fn spawnTestServer(server: *Server, wg: *std.Thread.WaitGroup, opts: Server.Opti
 
     try server.serve(gpa, handler);
 }
+
+test {
+    _ = @import("sniff.zig");
+}
