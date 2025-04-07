@@ -8,6 +8,7 @@ const http = std.http;
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+const MemoryPool = @import("pool.zig").MemoryPool;
 
 const assert = std.debug.assert;
 
@@ -19,7 +20,7 @@ pub const Worker = struct {
     should_quit: bool,
     ring: io.Ring,
     handler: Handler,
-    conn_pool: std.heap.MemoryPool(Connection),
+    conn_pool: MemoryPool(Connection),
 
     /// Number of active completions we have on the queue that we want to wait for before gracefully
     /// shutting down
@@ -36,7 +37,7 @@ pub const Worker = struct {
     };
 
     fn serve(self: *Worker, gpa: Allocator, server: *Server) !void {
-        defer self.conn_pool.deinit();
+        defer self.conn_pool.deinit(gpa);
 
         state: switch (State.init) {
             .init => {
@@ -115,7 +116,7 @@ pub const Worker = struct {
                     // This accept was sent from the Server, and we handled errors there
                     const result = cqe.unwrap() catch unreachable;
 
-                    const conn = try self.conn_pool.create();
+                    const conn = try self.conn_pool.create(gpa);
                     try conn.init(gpa, self, result);
                 },
 
@@ -310,7 +311,7 @@ pub const Server = struct {
                         .handler = handler,
                         .keep_alive = 0,
                         .timeout = self.timeout,
-                        .conn_pool = .init(gpa),
+                        .conn_pool = .empty,
                     };
                     worker.handler = handler;
                     self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
@@ -1233,4 +1234,5 @@ fn spawnTestServer(server: *Server, wg: *std.Thread.WaitGroup, opts: Server.Opti
 
 test {
     _ = @import("sniff.zig");
+    _ = @import("pool.zig");
 }
