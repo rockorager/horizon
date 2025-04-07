@@ -67,7 +67,7 @@ const gzip = struct {
             if (std.mem.indexOf(u8, hdr, "gzip") == null)
                 return self.next.serveHttp(ctx, w, r);
 
-            try w.setHeader("Transfer-Encoding", "gzip");
+            try w.setHeader("Content-Encoding", "gzip");
             var gz: ResponseWriter = .{ .rw = w };
             try self.next.serveHttp(ctx, gz.responseWriter(), r);
             try gz.flush();
