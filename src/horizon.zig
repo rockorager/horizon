@@ -16,6 +16,20 @@ const @"Content-Length" = "Content-Length";
 const @"Content-Type" = "Content-Type";
 const crlf = "\r\n";
 
+pub const Handler = struct {
+    ptr: *anyopaque,
+    serveFn: *const fn (*anyopaque, *Context, ResponseWriter, Request) anyerror!void,
+
+    /// Initialize a handler from a Type which has a serveHttp method
+    pub fn init(comptime T: type, ptr: *T) Handler {
+        return .{ .ptr = ptr, .serveFn = T.serveHttp };
+    }
+
+    pub fn serveHttp(self: Handler, ctx: *Context, w: ResponseWriter, r: Request) anyerror!void {
+        return self.serveFn(self.ptr, ctx, w, r);
+    }
+};
+
 pub const Worker = struct {
     should_quit: bool,
     ring: io.Ring,
@@ -667,7 +681,11 @@ const Connection = struct {
                 self.op_c.op = .send;
 
                 const headers = self.write_buf.items;
-                const body = self.response.body.items;
+                const body = switch (self.response.body) {
+                    .file => @panic("TODO"),
+                    .static => |s| s,
+                    .dynamic => |*d| d.items,
+                };
 
                 const wstate: WriteState =
                     if (self.written < headers.len and body.len == 0)
@@ -708,7 +726,11 @@ const Connection = struct {
                 self.op_c.op = .send;
 
                 const headers = self.write_buf.items;
-                const body = self.response.body.items;
+                const body = switch (self.response.body) {
+                    .file => @panic("TODO"),
+                    .static => |s| s,
+                    .dynamic => |*d| d.items,
+                };
 
                 const wstate: WriteState =
                     if (self.written < headers.len and body.len == 0)
@@ -873,12 +895,16 @@ const Connection = struct {
         if (resp.headers.get(@"Content-Length") == null) {
             writer.print(
                 @"Content-Length" ++ ": {d}" ++ crlf,
-                .{resp.body.items.len},
+                .{resp.body.len()},
             ) catch unreachable;
         }
 
         if (resp.headers.get(@"Content-Type") == null) {
-            const ct = sniff.detectContentType(self.response.body.items);
+            const ct = switch (resp.body) {
+                .file => unreachable,
+                .static => |s| sniff.detectContentType(s),
+                .dynamic => |*d| sniff.detectContentType(d.items),
+            };
             writer.print(
                 @"Content-Type" ++ ": {s}" ++ crlf,
                 .{ct},
@@ -897,7 +923,7 @@ const Connection = struct {
     }
 
     fn responseComplete(self: *Connection) bool {
-        return self.written == (self.write_buf.items.len + self.response.body.items.len);
+        return self.written == (self.write_buf.items.len + self.response.body.len());
     }
 };
 
@@ -1050,7 +1076,7 @@ pub const ResponseWriter = struct {
 pub const Response = struct {
     arena: Allocator,
 
-    body: std.ArrayListUnmanaged(u8) = .empty,
+    body: Body = .{ .dynamic = .empty },
 
     headers: std.StringHashMapUnmanaged([]const u8) = .{},
 
@@ -1060,6 +1086,23 @@ pub const Response = struct {
         .setHeader = Response.setHeader,
         .setStatus = Response.setStatus,
         .write = Response.typeErasedWrite,
+    };
+
+    const Body = union(enum) {
+        file: struct {
+            fd: posix.fd_t,
+            size: usize,
+        },
+        static: []const u8,
+        dynamic: std.ArrayListUnmanaged(u8),
+
+        fn len(self: Body) usize {
+            return switch (self) {
+                .file => |f| f.size,
+                .static => |s| s.len,
+                .dynamic => |d| d.items.len,
+            };
+        }
     };
 
     fn responseWriter(self: *Response) ResponseWriter {
@@ -1082,7 +1125,16 @@ pub const Response = struct {
 
     fn typeErasedWrite(ptr: *const anyopaque, bytes: []const u8) anyerror!usize {
         const self: *Response = @constCast(@ptrCast(@alignCast(ptr)));
-        try self.body.appendSlice(self.arena, bytes);
+        switch (self.body) {
+            .file => |file| {
+                // If we had set a file, we close the descriptor here
+                posix.close(file.fd);
+                self.body = .{ .dynamic = .empty };
+            },
+            .static => self.body = .{ .dynamic = .empty },
+            .dynamic => {},
+        }
+        try self.body.dynamic.appendSlice(self.arena, bytes);
         return bytes.len;
     }
 };
@@ -1114,21 +1166,6 @@ pub const HeaderIterator = struct {
     }
 };
 
-pub fn errorResponse(
-    w: ResponseWriter,
-    status: http.Status,
-    comptime format: []const u8,
-    args: anytype,
-) anyerror!void {
-    w.setStatus(status);
-    // Clear the Content-Length header
-    try w.setHeader(@"Content-Length", null);
-    // Set content type
-    try w.setHeader(@"Content-Type", "text/plain");
-    // Print the body
-    try w.any().print(format, args);
-}
-
 pub const Context = struct {
     /// Arena allocator which will be freed once the response has been written
     arena: Allocator,
@@ -1147,19 +1184,28 @@ pub const Context = struct {
     }
 };
 
-pub const Handler = struct {
-    ptr: *anyopaque,
-    serveFn: *const fn (*anyopaque, *Context, ResponseWriter, Request) anyerror!void,
+pub fn errorResponse(
+    w: ResponseWriter,
+    status: http.Status,
+    comptime format: []const u8,
+    args: anytype,
+) anyerror!void {
+    w.setStatus(status);
+    // Clear the Content-Length header
+    try w.setHeader(@"Content-Length", null);
+    // Set content type
+    try w.setHeader(@"Content-Type", "text/plain");
+    // Print the body
+    try w.any().print(format, args);
+}
 
-    /// Initialize a handler from a Type which has a serveHttp method
-    pub fn init(comptime T: type, ptr: *T) Handler {
-        return .{ .ptr = ptr, .serveFn = T.serveHttp };
-    }
-
-    pub fn serveHttp(self: Handler, ctx: *Context, w: ResponseWriter, r: Request) anyerror!void {
-        return self.serveFn(self.ptr, ctx, w, r);
-    }
-};
+/// Serve a static buffer. The buffer will not be sent through middleware - if using gzip middleware
+/// or something else which modifies the Content-Encoding, this must be handled first. The buffer is
+/// what will exactly be sent to the client
+pub fn serveStaticBuffer(ctx: *Context, _: ResponseWriter, _: Request, buffer: []const u8) !void {
+    const conn: *Connection = @alignCast(@fieldParentPtr("ctx", ctx));
+    conn.response.body = .{ .static = buffer };
+}
 
 test Server {
     const addr: net.Address = try .parseIp4("127.0.0.1", 0);
