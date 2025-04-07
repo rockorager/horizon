@@ -1202,7 +1202,7 @@ pub fn errorResponse(
 /// Serve a static buffer. The buffer will not be sent through middleware - if using gzip middleware
 /// or something else which modifies the Content-Encoding, this must be handled first. The buffer is
 /// what will exactly be sent to the client
-pub fn serveStaticBuffer(ctx: *Context, _: ResponseWriter, _: Request, buffer: []const u8) !void {
+pub fn serveStaticBuffer(ctx: *Context, buffer: []const u8) !void {
     const conn: *Connection = @alignCast(@fieldParentPtr("ctx", ctx));
     conn.response.body = .{ .static = buffer };
 }
