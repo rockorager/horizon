@@ -19,6 +19,7 @@ pub const Worker = struct {
     should_quit: bool,
     ring: io.Ring,
     handler: Handler,
+    conn_pool: std.heap.MemoryPool(Connection),
 
     /// Number of active completions we have on the queue that we want to wait for before gracefully
     /// shutting down
@@ -35,6 +36,8 @@ pub const Worker = struct {
     };
 
     fn serve(self: *Worker, gpa: Allocator, server: *Server) !void {
+        defer self.conn_pool.deinit();
+
         state: switch (State.init) {
             .init => {
                 self.ring = try server.ring.initChild();
@@ -112,7 +115,7 @@ pub const Worker = struct {
                     // This accept was sent from the Server, and we handled errors there
                     const result = cqe.unwrap() catch unreachable;
 
-                    const conn = try gpa.create(Connection);
+                    const conn = try self.conn_pool.create();
                     try conn.init(gpa, self, result);
                 },
 
@@ -124,13 +127,13 @@ pub const Worker = struct {
                 switch (c.op) {
                     .recv, .send => {
                         const conn: *Connection = @alignCast(@fieldParentPtr("op_c", c));
-                        try conn.onEvent(gpa, self, cqe, c);
+                        try conn.onEvent(self, cqe, c);
                     },
 
                     .close => {
                         const conn: *Connection = @alignCast(@fieldParentPtr("op_c", c));
                         conn.deinit();
-                        gpa.destroy(conn);
+                        self.conn_pool.destroy(conn);
                     },
 
                     .timeout => {},
@@ -159,6 +162,8 @@ pub const Server = struct {
     accept_c: Event = .{ .parent = .server, .op = .accept },
 
     timeout: Timeouts,
+
+    shutdown_timeout: u8,
 
     pub const Options = struct {
         /// Number of entries in the completion queues
@@ -190,6 +195,11 @@ pub const Server = struct {
 
         /// Timeout to complete the write of the response
         write_timeout: u8 = 20,
+
+        /// Number of seconds to perform a graceful shutdown before exiting. This is the amount of
+        /// time to let each worker finish all existing connections, no new connections will be
+        /// accepted
+        shutdown_timeout: u8 = 60,
     };
 
     const Timeouts = struct {
@@ -243,6 +253,7 @@ pub const Server = struct {
                 .idle = opts.idle_timeout,
                 .write = opts.write_timeout,
             },
+            .shutdown_timeout = opts.shutdown_timeout,
         };
 
         try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
@@ -266,14 +277,24 @@ pub const Server = struct {
         // If we have a shutdown_signal, we have to register it before spawning threads. Each thread
         // inherits the signal mask
         var sfd: ?posix.fd_t = null;
+        defer if (sfd) |fd| posix.close(fd);
+
+        // The completion pointer we'll send to to workers at shutdown
+        var stop_c: Event = .{ .parent = .server, .op = .stop };
 
         const State = enum {
             init,
             running,
             stopping,
-            canceling,
-            clean_up,
+            shutting_down,
         };
+
+        var spawned_threads: usize = 0;
+        errdefer {
+            for (0..spawned_threads) |i| {
+                self.threads[i].detach();
+            }
+        }
 
         state: switch (State.init) {
             .init => {
@@ -289,9 +310,11 @@ pub const Server = struct {
                         .handler = handler,
                         .keep_alive = 0,
                         .timeout = self.timeout,
+                        .conn_pool = .init(gpa),
                     };
                     worker.handler = handler;
                     self.threads[i] = try std.Thread.spawn(.{}, Worker.serve, .{ worker, gpa, self });
+                    spawned_threads += 1;
                 }
 
                 // Start listening for stop signals from the stop pipe
@@ -331,107 +354,88 @@ pub const Server = struct {
             .stopping => {
                 if (sfd) |fd| {
                     var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
-                    _ = try posix.read(fd, &buf);
+                    _ = posix.read(fd, &buf) catch {};
                 }
+
+                // We start a few events to close:
+                // 1. A timer that will close use no matter what when it expires
+                // 2. A cancelation of the accept submission
+                // 3. A message to each worker to finish up working. The workers will message the
+                //    main thread when they exit
+
+                // 60 second timeout to gracefully close
+                try self.ring.timer(self.shutdown_timeout, @intFromEnum(Op.timeout));
+
                 try self.ring.cancel(
                     @intFromEnum(Op.accept),
                     @intFromEnum(Op.cancel_accept),
                 );
-                continue :state .canceling;
+
+                for (self.workers) |worker| {
+                    try self.ring.msgRing(
+                        worker.ring,
+                        0,
+                        @intFromPtr(&stop_c),
+                        @intFromEnum(Op.msg_ring),
+                    );
+                }
+
+                continue :state .shutting_down;
             },
 
-            .canceling => {
-                try self.ring.submitAndWait();
+            .shutting_down => {
+                var exited_threads: usize = 0;
 
-                while (self.ring.nextCompletion()) |cqe| {
-                    const op: Op = @enumFromInt(cqe.userdata);
-                    switch (op) {
-                        .accept => {
-                            // it's possible we accepted a connection before the cancelation. Close the
-                            // fd if we did
-                            const fd = cqe.unwrap() catch continue :state .clean_up;
-                            posix.close(fd);
-                        },
+                while (exited_threads < self.workers.len) {
+                    try self.ring.submitAndWait();
 
-                        // If we receive another stop signal, we return immediately
-                        .stop => {
-                            if (sfd) |fd| {
-                                var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
-                                _ = try posix.read(fd, &buf);
+                    while (self.ring.nextCompletion()) |cqe| {
+                        const op: Op = @enumFromInt(cqe.userdata);
+                        switch (op) {
+                            // it's possible we accepted a connection before the cancelation. Close
+                            // the fd if we did. The CQE will have an error when accept was
+                            // canceled, so we continue on error
+                            .accept => {
+                                const fd = cqe.unwrap() catch continue;
                                 posix.close(fd);
-                            }
-                            return;
-                        },
+                            },
 
-                        .cancel_accept => continue :state .clean_up,
+                            // We'll get a msg_ring event if we failed to send the stop message to
+                            // the workers
+                            .msg_ring => {
+                                _ = cqe.unwrap() catch |err|
+                                    log.err("msg not sent to ring: {}", .{err});
+                            },
 
-                        else => unreachable,
+                            // If we receive another stop signal, we return immediately with an
+                            // error
+                            .stop => {
+                                if (sfd) |fd| {
+                                    var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
+                                    _ = posix.read(fd, &buf) catch {};
+                                }
+                                return error.ForceStop;
+                            },
+
+                            // We get this event if the accept failed to cancel. There's nothing we
+                            // can really do if it fails though, we are already closing connections
+                            // that come in
+                            .cancel_accept => {},
+
+                            // When a thread exits, it sends us this message
+                            .thread_exit => exited_threads += 1,
+
+                            // On timeout, we just return immediately with an error
+                            .timeout => return error.Timeout,
+                        }
                     }
                 }
 
-                continue :state .canceling;
-            },
-
-            .clean_up => try self.cleanUp(sfd),
-        }
-    }
-
-    fn cleanUp(self: *Server, sfd: ?posix.fd_t) !void {
-        // Shutdown
-        //
-        // 1. Set a timeout for total shutdown time
-        // 2. Notify all threads of shutdown
-        // 3. Wait for signals from threads that they have closed
-        // 4. If we get another stop signal, detach threads and exit
-        // 5. If we got all our thread exit signals, we close cleanly
-
-        var stop_c: Event = .{ .parent = .server, .op = .stop };
-
-        // 60 second timeout to gracefully close
-        try self.ring.timer(60, @intFromEnum(Op.timeout));
-
-        for (self.workers) |worker| {
-            try self.ring.msgRing(worker.ring, 0, @intFromPtr(&stop_c), @intFromEnum(Op.msg_ring));
-        }
-
-        var exited_threads: usize = 0;
-        while (exited_threads < self.workers.len) {
-            try self.ring.submitAndWait();
-
-            while (self.ring.nextCompletion()) |cqe| {
-                const op: Op = @enumFromInt(cqe.userdata);
-                switch (op) {
-                    .accept => {
-                        // it's possible we accepted a connection before the cancelation. Close the
-                        // fd if we did
-                        const fd = cqe.unwrap() catch continue;
-                        posix.close(fd);
-                    },
-
-                    .msg_ring => _ = cqe.unwrap() catch |err|
-                        log.err("msg not sent to ring: {}", .{err}),
-
-                    // If we receive another stop signal, we return immediately
-                    .stop => {
-                        if (sfd) |fd| {
-                            var buf: [@sizeOf(posix.siginfo_t)]u8 = undefined;
-                            _ = try posix.read(fd, &buf);
-                            posix.close(fd);
-                        }
-                        return;
-                    },
-
-                    .cancel_accept => {},
-
-                    .thread_exit => exited_threads += 1,
-
-                    .timeout => return,
+                // If we've exited the loop, it's because we closed all the threads cleanly
+                for (self.threads) |thread| {
+                    thread.join();
                 }
-            }
-        }
-
-        for (self.threads) |thread| {
-            thread.join();
+            },
         }
     }
 
@@ -580,7 +584,6 @@ const Connection = struct {
 
     fn onEvent(
         self: *Connection,
-        gpa: Allocator,
         worker: *Worker,
         cqe: io.Completion,
         event: *Event,
@@ -825,7 +828,7 @@ const Connection = struct {
                 assert(worker.should_quit);
 
                 self.deinit();
-                gpa.destroy(self);
+                worker.conn_pool.destroy(self);
             },
         }
     }
@@ -1161,7 +1164,7 @@ pub const Handler = struct {
 
 test Server {
     const addr: net.Address = try .parseIp4("127.0.0.1", 0);
-    const opts: Server.Options = .{ .addr = addr, .workers = 1 };
+    const opts: Server.Options = .{ .addr = addr, .workers = 1, .shutdown_timeout = 1 };
     var server: Server = undefined;
 
     const TestHandler = struct {
