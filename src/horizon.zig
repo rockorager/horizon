@@ -1069,9 +1069,7 @@ pub const Response = struct {
     fn setHeader(ptr: *anyopaque, k: []const u8, maybe_v: ?[]const u8) Allocator.Error!void {
         const self: *Response = @ptrCast(@alignCast(ptr));
         if (maybe_v) |v| {
-            const k_dupe = try self.arena.dupe(u8, k);
-            const v_dupe = try self.arena.dupe(u8, v);
-            return self.headers.put(self.arena, k_dupe, v_dupe);
+            return self.headers.put(self.arena, k, v);
         }
 
         _ = self.headers.remove(k);
