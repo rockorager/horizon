@@ -1,9 +1,10 @@
 const std = @import("std");
-const io = @import("io/io.zig");
+const io = @import("io");
 const sniff = @import("sniff.zig");
 
 const log = std.log.scoped(.horizon);
 
+const client = @import("client.zig");
 const http = std.http;
 const net = std.net;
 const posix = std.posix;
@@ -154,6 +155,21 @@ pub const Worker = struct {
                     .timeout => {},
 
                     else => unreachable,
+                }
+            },
+
+            .client_connection => {
+                log.debug("cqe", .{});
+                switch (c.op) {
+                    .socket, .connect, .recv => {
+                        const conn: *client.Connection = @alignCast(@fieldParentPtr("op_c", c));
+                        try conn.onEvent(self, cqe, c);
+                    },
+                    .send => {
+                        const conn: *client.Connection = @alignCast(@fieldParentPtr("send_c", c));
+                        try conn.onEvent(self, cqe, c);
+                    },
+                    else => @panic("todo"),
                 }
             },
         }
@@ -485,10 +501,11 @@ pub const Server = struct {
 };
 
 /// A Completion Entry
-const Event = struct {
+pub const Event = struct {
     parent: enum {
         server,
         connection,
+        client_connection,
     },
 
     op: enum {
@@ -501,6 +518,8 @@ const Event = struct {
         stop,
         signal,
         timeout,
+        socket,
+        connect,
     },
 };
 
@@ -650,30 +669,35 @@ const Connection = struct {
                 // Keep the worker alive since we are now handling this request
                 worker.keep_alive += 1;
 
-                // validate the request
-                if (try self.request.isValid(self.response.responseWriter())) {
-                    // Call the handler
-                    try worker.handler.serveHttp(
-                        &self.ctx,
-                        self.response.responseWriter(),
-                        self.request,
-                    );
+                const tls_client = try client.Client.init(self.arena.allocator());
+                const conn = try self.arena.allocator().create(client.Connection);
+                try conn.init(self.arena.allocator(), tls_client.cert, worker, "timculverhouse.com", 443);
 
-                    // TODO: we need to add some future handling for IO ops here. We want to give the
-                    // handler an option to do IO async in our event loop. IE they could call API
-                    // endpoints and return without wanting to write the response
-                }
-
-                // Prepare the header
-                try self.prepareHeader();
-
-                switch (worker.timeout.write) {
-                    0 => continue :state .send,
-                    else => {
-                        self.deadline = std.time.timestamp() + worker.timeout.write;
-                        continue :state .send_with_deadline;
-                    },
-                }
+                return;
+                // // validate the request
+                // if (try self.request.isValid(self.response.responseWriter())) {
+                //     // Call the handler
+                //     try worker.handler.serveHttp(
+                //         &self.ctx,
+                //         self.response.responseWriter(),
+                //         self.request,
+                //     );
+                //
+                //     // TODO: we need to add some future handling for IO ops here. We want to give the
+                //     // handler an option to do IO async in our event loop. IE they could call API
+                //     // endpoints and return without wanting to write the response
+                // }
+                //
+                // // Prepare the header
+                // try self.prepareHeader();
+                //
+                // switch (worker.timeout.write) {
+                //     0 => continue :state .send,
+                //     else => {
+                //         self.deadline = std.time.timestamp() + worker.timeout.write;
+                //         continue :state .send_with_deadline;
+                //     },
+                // }
             },
 
             .send => {

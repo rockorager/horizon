@@ -288,6 +288,24 @@ pub fn cancelAll(self: *Uring) !void {
     sqe.prep_cancel(0, linux.IORING_ASYNC_CANCEL_ANY);
 }
 
+pub fn socket(self: *Uring, domain: u32, socket_type: u32, protocol: u32, userdata: u64) !void {
+    const sqe = try self.getSqe();
+    sqe.prep_socket(domain, socket_type, protocol, 0);
+    sqe.user_data = userdata;
+}
+
+pub fn connect(
+    self: *Uring,
+    fd: linux.fd_t,
+    addr: *const linux.sockaddr,
+    addrlen: linux.socklen_t,
+    userdata: u64,
+) !void {
+    const sqe = try self.getSqe();
+    sqe.prep_connect(fd, addr, addrlen);
+    sqe.user_data = userdata;
+}
+
 /// Gets an sqe from the ring. If one isn't available, a submit occurs and we retry
 fn getSqe(self: *Uring) error{SubmissionQueueFull}!*linux.io_uring_sqe {
     return self.ring.get_sqe() catch {

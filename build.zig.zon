@@ -20,6 +20,10 @@
             .hash = "zzz-0.3.0-4HoaJrBQAgCXB_66nre0nvYZmAXMxj__gS8sFjpR68Hs",
             .lazy = true,
         },
+        .tls = .{
+            .url = "git+https://github.com/ianic/tls.zig#8250aa9184fbad99983b32411bbe1a5d2fd6f4b7",
+            .hash = "tls-0.1.0-ER2e0pU3BQB-UD2_s90uvppceH_h4KZxtHCrCct8L054",
+        },
     },
 
     .paths = .{
