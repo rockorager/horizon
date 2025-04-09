@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const horizon = @import("horizon");
+const io = @import("io");
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -14,15 +15,19 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var s: horizon.Server = undefined;
-    try s.init(gpa, .{ .shutdown_signal = std.posix.SIG.INT });
-    defer s.deinit(gpa);
+    var ring = try io.Ring.init(gpa, 64);
+    defer ring.deinit();
+
+    var server: horizon.Server = undefined;
+    try server.init(gpa, .{});
+    defer server.deinit(gpa);
 
     var my_handler: MyHandler = .{};
 
-    std.log.debug("listening at {}", .{s.addr});
+    try server.listenAndServe(&ring, my_handler.handler());
+    std.log.debug("listening at {}", .{server.addr});
 
-    try s.serve(gpa, my_handler.handler());
+    try ring.run(.until_done);
 }
 
 const MyHandler = struct {

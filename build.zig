@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const horizon_module = b.addModule("horizon", .{
-        .root_source_file = b.path("src/horizon.zig"),
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -109,6 +109,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         example_exe.root_module.addImport("horizon", horizon_module);
+        example_exe.root_module.addImport("io", io_module);
         b.installArtifact(example_exe);
 
         const run_cmd = b.addRunArtifact(example_exe);

@@ -1,6 +1,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const posix = std.posix;
+
+pub const Task = @import("Task.zig");
+pub const Callback = *const fn (*Ring, *Task, Result) anyerror!void;
+pub fn noopCallback(_: *Ring, _: *Task, _: Result) anyerror!void {}
+
+pub const RunCondition = enum {
+    once,
+    until_done,
+    forever,
+};
+
+/// Used for timeouts and deadlines. We make this struct extern because we will ptrCast it to the
+/// linux kernel timespec struct
+pub const Timespec = extern struct {
+    sec: i64 = 0,
+    nsec: i64 = 0,
+
+    pub fn isZero(self: Timespec) bool {
+        return self.sec == 0 and self.nsec == 0;
+    }
+};
+
 pub const Ring = switch (builtin.os.tag) {
     .dragonfly,
     .freebsd,
@@ -31,141 +54,92 @@ pub const SubmissionQueueEntry = extern struct {
     resv: u64,
 };
 
-pub const Completion = extern struct {
-    userdata: u64,
-    result: i32,
-    flags: Flags,
-
-    pub const Flags = packed struct(u32) {
-        /// If set, the upper 16 bits are the buffer ID
-        buffer: bool = false,
-
-        /// If set, the parent SQE will generate more CQEs
-        has_more: bool = false,
-
-        /// If set, more data is available in the socket recv
-        socket_nonempty: bool = false,
-
-        /// Set for notification CQEs. Can be used to distinct them from sends for zerocopy
-        notification: bool = false,
-
-        /// The buffer was partially consumed and will get more completions.
-        buffer_more: bool = false,
-
-        _padding: u11 = 0,
-
-        buffer_id: u16 = 0,
-    };
-
-    pub const Error = error{
-        Canceled,
-        ConnectionResetByPeer,
-        TimedOut,
-        Unexpected,
-    };
-
-    pub fn err(self: Completion) std.posix.E {
-        if (self.result > -4096 and self.result < 0) {
-            return @as(std.posix.E, @enumFromInt(-self.result));
-        }
-        return .SUCCESS;
-    }
-
-    pub fn unwrap(self: Completion) Completion.Error!u16 {
-        switch (self.err()) {
-            .SUCCESS => return @intCast(self.result),
-            .CONNRESET => return error.ConnectionResetByPeer,
-            .CANCELED => return error.Canceled,
-            .TIME => return error.TimedOut,
-            else => {
-                std.log.err("completion error: {}", .{self.err()});
-                return error.Unexpected;
-            },
-        }
-    }
+pub const Op = enum {
+    noop,
+    deadline,
+    timer,
+    cancel,
+    accept,
+    msg_ring,
+    recv,
+    write,
+    writev,
+    close,
+    poll,
+    usermsg,
 };
 
-pub const Op = enum(u8) {
-    NOP,
-    READV,
-    WRITEV,
-    FSYNC,
-    READ_FIXED,
-    WRITE_FIXED,
-    POLL_ADD,
-    POLL_REMOVE,
-    SYNC_FILE_RANGE,
-    SENDMSG,
-    RECVMSG,
-    TIMEOUT,
-    TIMEOUT_REMOVE,
-    ACCEPT,
-    ASYNC_CANCEL,
-    LINK_TIMEOUT,
-    CONNECT,
-    FALLOCATE,
-    OPENAT,
-    CLOSE,
-    FILES_UPDATE,
-    STATX,
-    READ,
-    WRITE,
-    FADVISE,
-    MADVISE,
-    SEND,
-    RECV,
-    OPENAT2,
-    EPOLL_CTL,
-    SPLICE,
-    PROVIDE_BUFFERS,
-    REMOVE_BUFFERS,
-    TEE,
-    SHUTDOWN,
-    RENAMEAT,
-    UNLINKAT,
-    MKDIRAT,
-    SYMLINKAT,
-    LINKAT,
-    MSG_RING,
-    FSETXATTR,
-    SETXATTR,
-    FGETXATTR,
-    GETXATTR,
-    SOCKET,
-    URING_CMD,
-    SEND_ZC,
-    SENDMSG_ZC,
-    READ_MULTISHOT,
-    WAITID,
-    FUTEX_WAIT,
-    FUTEX_WAKE,
-    FUTEX_WAITV,
-    FIXED_FD_INSTALL,
-    FTRUNCATE,
-
-    _,
+pub const Request = union(Op) {
+    noop,
+    deadline: Timespec,
+    timer: Timespec,
+    cancel: union(enum) {
+        all,
+        task: *Task,
+    },
+    accept: posix.fd_t,
+    msg_ring: struct {
+        target: *const Ring,
+        result: u16,
+        task: *Task,
+    },
+    recv: struct {
+        fd: posix.fd_t,
+        buffer: []u8,
+    },
+    write: struct {
+        fd: posix.fd_t,
+        buffer: []const u8,
+    },
+    writev: struct {
+        fd: posix.fd_t,
+        vecs: []const posix.iovec_const,
+    },
+    close: posix.fd_t,
+    poll: struct {
+        fd: posix.fd_t,
+        mask: u32,
+    },
+    usermsg,
 };
 
-test Ring {
-    // Ensure the exposed API exists for all backends
-    try std.testing.expect(std.meta.hasMethod(Ring, "init"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "deinit"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "submit"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "submitAndWait"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "nextCompletion"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "accept"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "msgRing"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "cancel"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "close"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "recv"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "recvWithDeadline"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "write"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "writeWithDeadline"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "writev"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "writevWithDeadline"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "poll"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "signalfd"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "timer"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "socket"));
-    try std.testing.expect(std.meta.hasMethod(Ring, "connect"));
+pub const Result = union(Op) {
+    noop,
+    deadline: ResultError!void,
+    timer: ResultError!void,
+    cancel: CancelError!void,
+    accept: ResultError!posix.fd_t,
+    msg_ring: ResultError!void,
+    recv: RecvError!usize,
+    write: ResultError!usize,
+    writev: ResultError!usize,
+    close: ResultError!void,
+    poll: ResultError!void,
+    usermsg: u16,
+};
+
+pub const ResultError = error{
+    /// The request was invalid
+    Invalid,
+    /// The request was canceled
+    Canceled,
+    /// An unexpected error occured
+    Unexpected,
+};
+
+pub const CancelError = ResultError || error{
+    /// The entry to cancel couldn't be found
+    EntryNotFound,
+    /// The entry couldn't be canceled
+    NotCanceled,
+};
+
+pub const RecvError = ResultError || error{
+    /// The entry to cancel couldn't be found
+    ConnectionResetByPeer,
+};
+
+test {
+    _ = @import("queue.zig");
+    _ = @import("Uring.zig");
 }

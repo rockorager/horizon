@@ -84,7 +84,7 @@ pub const Connection = struct {
         port: u16,
     ) !void {
         const list = try std.net.getAddressList(arena, buf, port);
-        if (list.addrs.len == 0) @panic("here");
+        if (list.addrs.len == 0) return error.AddressNotFound;
         const addr = list.addrs[0];
 
         const opts: tls.config.Client = .{

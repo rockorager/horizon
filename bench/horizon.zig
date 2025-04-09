@@ -13,20 +13,21 @@ pub fn main() !void {
     defer if (is_debug) {
         _ = debug_allocator.deinit();
     };
-    var s: horizon.Server = undefined;
-    try s.init(gpa, .{ .shutdown_signal = std.posix.SIG.INT });
-    defer s.deinit(gpa);
-
-    var my_handler: MyHandler = .{};
-
-    // Wrap a handler with middleware. This is the same pattern as go where we nest handlers. We
-    // *could* do this with anonymous functions in zig but that gets very messy to read. This is a
-    // simple gzip middleware which gzips our response if the client accepts gzip encoding
-    var gzip_handler: gzip.Handler = .init(my_handler.handler());
-
-    std.log.debug("listening at {}", .{s.addr});
-
-    try s.serve(gpa, gzip_handler.handler());
+    _ = gpa;
+    // var s: horizon.Server = undefined;
+    // try s.init(gpa, .{ .shutdown_signal = std.posix.SIG.INT });
+    // defer s.deinit(gpa);
+    //
+    // var my_handler: MyHandler = .{};
+    //
+    // // Wrap a handler with middleware. This is the same pattern as go where we nest handlers. We
+    // // *could* do this with anonymous functions in zig but that gets very messy to read. This is a
+    // // simple gzip middleware which gzips our response if the client accepts gzip encoding
+    // var gzip_handler: gzip.Handler = .init(my_handler.handler());
+    //
+    // std.log.debug("listening at {}", .{s.addr});
+    //
+    // try s.serve(gpa, gzip_handler.handler());
 }
 
 const MyHandler = struct {
