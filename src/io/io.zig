@@ -37,23 +37,6 @@ pub const Ring = switch (builtin.os.tag) {
     else => @compileError("unsupported"),
 };
 
-pub const SubmissionQueueEntry = extern struct {
-    opcode: Op,
-    flags: u8,
-    ioprio: u16,
-    fd: i32,
-    off: u64,
-    addr: u64,
-    len: u32,
-    rw_flags: u32,
-    user_data: u64,
-    buf_index: u16,
-    personality: u16,
-    splice_fd_in: i32,
-    addr3: u64,
-    resv: u64,
-};
-
 pub const Op = enum {
     noop,
     deadline,

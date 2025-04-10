@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 });
                 hz_exe.root_module.addImport("horizon", horizon_module);
+                hz_exe.root_module.addImport("io", io_module);
                 b.installArtifact(hz_exe);
 
                 break :blk b.addRunArtifact(hz_exe);
