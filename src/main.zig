@@ -28,14 +28,15 @@ pub const Context = struct {
     /// Deadline for the response, in seconds from unix epoch
     deadline: u64,
 
-    /// Userdata that will live as long as the request. Always use the arena allocator when adding
-    /// data to the hashmap. Keys must be stable for the lifetime of the request - they can be duped
-    /// with the arena if needed
-    userdata: std.StringHashMapUnmanaged(u64),
-
     pub fn expired(self: Context) bool {
         if (self.deadline == 0) return false;
         return std.time.timestamp() > self.deadline;
+    }
+
+    pub fn sendResponse(self: *Context) !void {
+        const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
+        try conn.prepareResponse();
+        try conn.sendResponse();
     }
 };
 

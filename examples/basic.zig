@@ -39,10 +39,11 @@ const MyHandler = struct {
 
     pub fn serveHttp(
         _: *anyopaque,
-        _: *horizon.Context,
+        ctx: *horizon.Context,
         w: horizon.ResponseWriter,
         _: horizon.Request,
     ) anyerror!void {
         try w.any().print("Hello, world", .{});
+        try ctx.sendResponse();
     }
 };

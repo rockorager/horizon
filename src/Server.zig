@@ -388,7 +388,7 @@ const Worker = struct {
     }
 };
 
-const Connection = struct {
+pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     worker: *Worker,
 
@@ -410,7 +410,6 @@ const Connection = struct {
         init,
         reading_headers,
         handling_request,
-        send,
         waiting_send_response,
         idle,
         close,
@@ -438,7 +437,6 @@ const Connection = struct {
         self.ctx = .{
             .arena = self.arena.allocator(),
             .deadline = 0,
-            .userdata = .empty,
         };
 
         const task = try worker.ring.recv(fd, &self.buf, self, Connection.onTaskCompletion);
@@ -504,77 +502,6 @@ const Connection = struct {
                     // handler an option to do IO async in our event loop. IE they could call API
                     // endpoints and return without wanting to write the response
                 }
-
-                // Prepare the header
-                try self.prepareHeader();
-
-                if (self.worker.timeout.write > 0) {
-                    self.deadline = std.time.timestamp() + self.worker.timeout.write;
-                }
-
-                continue :state .send;
-            },
-
-            .send => {
-                self.state = .waiting_send_response;
-
-                const headers = self.write_buf.items;
-                const body = switch (self.response.body) {
-                    .file => @panic("TODO"),
-                    .static => |s| s,
-                    .dynamic => |*d| d.items,
-                };
-
-                const wstate: WriteState =
-                    if (self.written < headers.len and body.len == 0)
-                        .headers_only
-                    else if (self.written < headers.len)
-                        .headers_and_body
-                    else
-                        .body_only;
-
-                const new_task = switch (wstate) {
-                    .headers_only => try ring.write(
-                        self.fd,
-                        headers[self.written..],
-                        self,
-                        Connection.onTaskCompletion,
-                    ),
-
-                    .headers_and_body => blk: {
-                        const unwritten = headers[self.written..];
-                        self.vecs[0] = .{
-                            .base = unwritten.ptr,
-                            .len = unwritten.len,
-                        };
-                        self.vecs[1] = .{
-                            .base = body.ptr,
-                            .len = body.len,
-                        };
-
-                        break :blk try ring.writev(
-                            self.fd,
-                            &self.vecs,
-                            self,
-                            Connection.onTaskCompletion,
-                        );
-                    },
-
-                    .body_only => blk: {
-                        const offset = self.written - headers.len;
-                        const unwritten_body = body[offset..];
-                        break :blk try ring.write(
-                            self.fd,
-                            unwritten_body,
-                            self,
-                            Connection.onTaskCompletion,
-                        );
-                    },
-                };
-
-                if (self.worker.timeout.write > 0) {
-                    try new_task.setDeadline(ring, .{ .sec = self.deadline });
-                }
             },
 
             .waiting_send_response => {
@@ -595,7 +522,7 @@ const Connection = struct {
 
                 self.written += n;
                 if (!self.responseComplete()) {
-                    continue :state .send;
+                    return self.sendResponse();
                 }
 
                 // Response sent. Decide if we should close the connection or keep it alive
@@ -647,7 +574,7 @@ const Connection = struct {
     }
 
     /// Writes the header into write_buf
-    fn prepareHeader(self: *Connection) !void {
+    pub fn prepareHeader(self: *Connection) !void {
         var headers = &self.write_buf;
         const resp = self.response;
         const status = resp.status orelse .ok;
@@ -694,6 +621,78 @@ const Connection = struct {
         writer.writeAll("\r\n") catch unreachable;
     }
 
+    pub fn prepareResponse(self: *Connection) !void {
+        // Prepare the header
+        try self.prepareHeader();
+
+        // Set the deadline
+        if (self.worker.timeout.write > 0) {
+            self.deadline = std.time.timestamp() + self.worker.timeout.write;
+        }
+    }
+
+    pub fn sendResponse(self: *Connection) !void {
+        self.state = .waiting_send_response;
+
+        const headers = self.write_buf.items;
+        const body = switch (self.response.body) {
+            .file => @panic("TODO"),
+            .static => |s| s,
+            .dynamic => |*d| d.items,
+        };
+
+        const wstate: WriteState =
+            if (self.written < headers.len and body.len == 0)
+                .headers_only
+            else if (self.written < headers.len)
+                .headers_and_body
+            else
+                .body_only;
+
+        const new_task = switch (wstate) {
+            .headers_only => try self.worker.ring.write(
+                self.fd,
+                headers[self.written..],
+                self,
+                Connection.onTaskCompletion,
+            ),
+
+            .headers_and_body => blk: {
+                const unwritten = headers[self.written..];
+                self.vecs[0] = .{
+                    .base = unwritten.ptr,
+                    .len = unwritten.len,
+                };
+                self.vecs[1] = .{
+                    .base = body.ptr,
+                    .len = body.len,
+                };
+
+                break :blk try self.worker.ring.writev(
+                    self.fd,
+                    &self.vecs,
+                    self,
+                    Connection.onTaskCompletion,
+                );
+            },
+
+            .body_only => blk: {
+                const offset = self.written - headers.len;
+                const unwritten_body = body[offset..];
+                break :blk try self.worker.ring.write(
+                    self.fd,
+                    unwritten_body,
+                    self,
+                    Connection.onTaskCompletion,
+                );
+            },
+        };
+
+        if (self.worker.timeout.write > 0) {
+            try new_task.setDeadline(&self.worker.ring, .{ .sec = self.deadline });
+        }
+    }
+
     fn reset(self: *Connection) void {
         _ = self.arena.reset(.retain_capacity);
         self.request = .{};
@@ -702,7 +701,6 @@ const Connection = struct {
         self.written = 0;
 
         self.ctx.deadline = 0;
-        self.ctx.userdata = .empty;
     }
 
     fn responseComplete(self: *Connection) bool {
@@ -735,13 +733,14 @@ test "server" {
 
         pub fn serveHttp(
             ptr: *anyopaque,
-            _: *hz.Context,
+            ctx: *hz.Context,
             w: hz.ResponseWriter,
             _: hz.Request,
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.got_request = true;
             w.any().print("hello world", .{}) catch unreachable;
+            try ctx.sendResponse();
             try self.server.stop();
         }
     };

@@ -37,8 +37,9 @@ const MyHandler = struct {
         return .init(MyHandler, self);
     }
 
-    pub fn serveHttp(_: *anyopaque, _: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
+    pub fn serveHttp(_: *anyopaque, ctx: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
         try w.any().print("hello, world", .{});
+        try ctx.sendResponse();
     }
 };
 
