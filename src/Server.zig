@@ -437,6 +437,7 @@ pub const Connection = struct {
         self.ctx = .{
             .arena = self.arena.allocator(),
             .deadline = 0,
+            .ring = &worker.ring,
         };
 
         const task = try worker.ring.recv(fd, &self.buf, self, Connection.onTaskCompletion);
@@ -497,10 +498,6 @@ pub const Connection = struct {
                         self.response.responseWriter(),
                         self.request,
                     );
-
-                    // TODO: we need to add some future handling for IO ops here. We want to give the
-                    // handler an option to do IO async in our event loop. IE they could call API
-                    // endpoints and return without wanting to write the response
                 }
             },
 

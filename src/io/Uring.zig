@@ -13,9 +13,9 @@ const posix = std.posix;
 const common_flags: u32 =
     linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
     linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
-    // linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks. Requires SINGLE_ISSUER
-    linux.IORING_SETUP_COOP_TASKRUN; // Don't interupt userspace when task is complete
-// linux.IORING_SETUP_SINGLE_ISSUER; // Only a single thread will issue tasks
+    linux.IORING_SETUP_DEFER_TASKRUN | // Defer work until we submit tasks. Requires SINGLE_ISSUER
+    linux.IORING_SETUP_COOP_TASKRUN | // Don't interupt userspace when task is complete
+    linux.IORING_SETUP_SINGLE_ISSUER; // Only a single thread will issue tasks
 
 const msg_ring_received_cqe = 1 << 8;
 
