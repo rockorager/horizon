@@ -15,13 +15,11 @@ const log = std.log.scoped(.horizon);
 
 gpa: Allocator,
 threads: []std.Thread,
+worker: Worker,
 workers: []Worker,
-next_ring: usize = 0,
 
-fd: posix.fd_t,
 addr: net.Address,
 
-accept_task: ?*io.Task = null,
 shutdown_signal: u6 = 0,
 stop_pipe: [2]posix.fd_t,
 
@@ -92,21 +90,17 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
     else
         net.Address.parseIp4("127.0.0.1", 8080) catch unreachable;
 
-    const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
-    const fd = try posix.socket(addr.any.family, flags, 0);
-    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-
-    const worker_count: usize = blk: {
+    // We always subtract one because the main thread counts as a worker too
+    const worker_count: usize = if (opts.workers) |w| w -| 1 else blk: {
         const cpu_count = std.Thread.getCpuCount() catch 1;
-        const base = opts.workers orelse @max(1, cpu_count -| 1);
-        break :blk @max(base, 1);
+        break :blk cpu_count -| 1;
     };
 
     self.* = .{
         .gpa = gpa,
+        .worker = undefined,
         .workers = try gpa.alloc(Worker, worker_count),
         .threads = try gpa.alloc(std.Thread, worker_count),
-        .fd = fd,
         .addr = addr,
         .stop_pipe = try posix.pipe2(.{}),
         .shutdown_signal = opts.shutdown_signal,
@@ -119,29 +113,41 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
         .shutdown_timeout = opts.shutdown_timeout,
         .ring = undefined,
     };
-
-    try posix.bind(fd, &self.addr.any, addr.getOsSockLen());
-
-    var sock_len = addr.getOsSockLen();
-    try posix.getsockname(fd, &self.addr.any, &sock_len);
 }
 
 pub fn listenAndServe(self: *Server, ioring: *io.Ring, handler: hz.Handler) !void {
     self.ring = ioring;
-    try posix.listen(self.fd, 64);
-    self.accept_task = try ioring.accept(self.fd, self, onTaskCompletion);
+
+    {
+        self.worker = try .init(self.gpa, self.timeout, handler, self.addr, self);
+        self.worker.ring = ioring;
+        self.worker.state = .running;
+        var sock_len = self.addr.getOsSockLen();
+        try posix.getsockname(self.worker.fd, &self.addr.any, &sock_len);
+
+        try posix.listen(self.worker.fd, 64);
+        self.worker.accept_task = try ioring.accept(
+            self.worker.fd,
+            &self.worker,
+            Worker.onTaskCompletion,
+        );
+    }
+
     self.state = .accepting;
     for (self.workers, 0..) |*worker, i| {
+        worker.* = try .init(self.gpa, self.timeout, handler, self.addr, self);
+
         self.threads[i] = try std.Thread.spawn(
             .{},
             Worker.run,
-            .{ worker, self.gpa, self, self.timeout, handler },
+            .{ worker, ioring },
         );
     }
     _ = try ioring.poll(self.stop_pipe[0], posix.POLL.IN, self, onTaskCompletion);
 }
 
 pub fn deinit(self: *Server, gpa: Allocator) void {
+    self.worker.conn_pool.deinit(gpa);
     for (self.workers) |*worker| {
         worker.deinit();
     }
@@ -160,41 +166,16 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
 
         .accepting => {
             switch (result) {
-                .accept => {
-                    if (task.state != .in_flight) {
-                        // Requeue accept if it returned
-                        self.accept_task = try ring.accept(self.fd, self, onTaskCompletion);
-                    }
-
-                    const fd = result.accept catch |err| {
-                        switch (err) {
-                            error.Canceled => {},
-                            else => log.err("accept error: {}", .{err}),
-                        }
-                        return;
-                    };
-
-                    // Send the accepted fd to a worker
-                    const target_task = try ring.getTask();
-                    const target = self.nextWorker();
-                    target_task.* = .{
-                        .userdata = target,
-                        .callback = Worker.onTaskCompletion,
-                        .req = task.req,
-                    };
-
-                    _ = try ring.msgRing(&target.ring, target_task, @intCast(fd), self, onMsgRing);
-                },
-
                 .poll => { // shutdown
                     var buf: [8]u8 = undefined;
                     _ = posix.read(self.stop_pipe[0], &buf) catch 0;
-                    const accept_task = self.accept_task orelse unreachable;
-                    try accept_task.cancel(ring, self, onTaskCompletion);
                     self.state = .closing;
 
                     // Set our shutdown timer
                     _ = try ring.timer(.{ .sec = self.shutdown_timeout }, self, onTaskCompletion);
+
+                    self.worker.state = .shutting_down;
+                    _ = try self.worker.accept_task.cancel(ring, &self.worker, Worker.onTaskCompletion);
 
                     // Message each ring to shut down
                     for (self.workers) |*worker| {
@@ -206,7 +187,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                         };
 
                         _ = try ring.msgRing(
-                            &worker.ring,
+                            worker.ring,
                             target_task,
                             @intFromEnum(UserMsg.quit),
                             self,
@@ -221,13 +202,6 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
 
         .closing => {
             switch (result) {
-                .accept => {
-                    // If for some reason we get a valid fd after issuing our cancelation, we just
-                    // close it
-                    const fd = result.accept catch return;
-                    posix.close(fd);
-                },
-
                 .timer => try ring.cancelAll(),
 
                 .cancel => {
@@ -273,24 +247,20 @@ fn onMsgRing(_: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
     };
 }
 
-fn nextWorker(self: *Server) *Worker {
-    const target = &self.workers[self.next_ring];
-    self.next_ring = (self.next_ring + 1) % (self.workers.len);
-    return target;
-}
-
 pub fn stop(self: *Server) !void {
     _ = try posix.write(self.stop_pipe[1], "q");
 }
 
 const Worker = struct {
     gpa: Allocator,
-    ring: io.Ring,
+    ring: *io.Ring,
     conn_pool: MemoryPool(Connection),
     state: Worker.State,
     timeout: Timeouts,
     handler: hz.Handler,
 
+    fd: posix.socket_t,
+    accept_task: *io.Task,
     server: *Server,
 
     /// Number of active completions we have on the queue that we want to wait for before gracefully
@@ -302,25 +272,44 @@ const Worker = struct {
         shutting_down,
     };
 
-    fn run(
-        self: *Worker,
+    fn init(
         gpa: Allocator,
-        server: *Server,
         timeout: Timeouts,
         handler: hz.Handler,
-    ) !void {
-        self.* = .{
+        addr: net.Address,
+        server: *Server,
+    ) !Worker {
+        const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
+        const fd = try posix.socket(addr.any.family, flags, 0);
+        try posix.setsockopt(
+            fd,
+            posix.SOL.SOCKET,
+            posix.SO.REUSEADDR | posix.SO.REUSEPORT,
+            &std.mem.toBytes(@as(c_int, 1)),
+        );
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+
+        return .{
             .gpa = gpa,
-            .ring = try server.ring.initChild(64),
-            .conn_pool = .empty,
+            .ring = undefined,
             .state = .running,
+            .conn_pool = .empty,
             .timeout = timeout,
-            .keep_alive = 0,
             .handler = handler,
+            .fd = fd,
+            .keep_alive = 0,
+            .accept_task = undefined,
             .server = server,
         };
+    }
 
-        try self.ring.run(.forever);
+    fn run(self: *Worker, main: *io.Ring) !void {
+        var ring = try main.initChild(64);
+        try posix.listen(self.fd, 64);
+        self.ring = &ring;
+        self.accept_task = try ring.accept(self.fd, self, Worker.onTaskCompletion);
+
+        try ring.run(.forever);
     }
 
     fn deinit(self: *Worker) void {
@@ -334,9 +323,10 @@ const Worker = struct {
             .running => {
                 switch (result) {
                     .accept => {
-                        // We only receive accept from msg_ring tasks, and we only allow successful
-                        // accepts to be sent
-                        const fd = result.accept catch unreachable;
+                        const fd = result.accept catch |err| {
+                            log.err("accept error: {}", .{err});
+                            return;
+                        };
                         const conn = try self.conn_pool.create(self.gpa);
 
                         try conn.init(self.gpa, self, fd);
@@ -348,6 +338,7 @@ const Worker = struct {
                             .quit => {
                                 ring.run_cond = .until_done;
                                 self.state = .shutting_down;
+                                _ = try self.accept_task.cancel(ring, self, Worker.onTaskCompletion);
                                 continue :state .shutting_down;
                             },
 
@@ -437,12 +428,12 @@ pub const Connection = struct {
         self.ctx = .{
             .arena = self.arena.allocator(),
             .deadline = 0,
-            .ring = &worker.ring,
+            .ring = worker.ring,
         };
 
         const task = try worker.ring.recv(fd, &self.buf, self, Connection.onTaskCompletion);
         if (worker.timeout.read_header > 0) {
-            try task.setDeadline(&worker.ring, .{ .sec = self.deadline });
+            try task.setDeadline(worker.ring, .{ .sec = self.deadline });
         }
         self.state = .reading_headers;
     }
@@ -686,7 +677,7 @@ pub const Connection = struct {
         };
 
         if (self.worker.timeout.write > 0) {
-            try new_task.setDeadline(&self.worker.ring, .{ .sec = self.deadline });
+            try new_task.setDeadline(self.worker.ring, .{ .sec = self.deadline });
         }
     }
 
@@ -717,7 +708,7 @@ test "server" {
 
     var server: Server = undefined;
 
-    try server.init(gpa, .{ .workers = 1 });
+    try server.init(gpa, .{ .workers = 0 });
     defer server.deinit(gpa);
 
     const TestHandler = struct {
