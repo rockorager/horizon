@@ -145,12 +145,13 @@ pub const Request = struct {
     }
 
     /// Validates a request
-    pub fn isValid(self: Request, w: ResponseWriter) !bool {
+    pub fn isValid(self: Request, ctx: *Context, w: ResponseWriter) !bool {
         const m = self.method();
         if (m.requestHasBody()) {
             // We require a content length
             if (self.contentLength() == null) {
                 try errorResponse(w, .bad_request, "Content-Length is required", .{});
+                try ctx.sendResponse();
                 return false;
             }
         }

@@ -477,7 +477,7 @@ pub const Connection = struct {
                 self.worker.keep_alive += 1;
 
                 // validate the request
-                if (try self.request.isValid(self.response.responseWriter())) {
+                if (try self.request.isValid(&self.ctx, self.response.responseWriter())) {
                     // Call the handler
                     try self.worker.handler.serveHttp(
                         &self.ctx,
