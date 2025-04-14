@@ -174,10 +174,11 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                     // Set our shutdown timer
                     _ = try ring.timer(.{ .sec = self.shutdown_timeout }, self, onTaskCompletion);
 
+                    // Shutdown the main thread worker
                     self.worker.state = .shutting_down;
                     _ = try self.worker.accept_task.cancel(ring, &self.worker, Worker.onTaskCompletion);
 
-                    // Message each ring to shut down
+                    // Message each worker ring to shut down
                     for (self.workers) |*worker| {
                         const target_task = try ring.getTask();
                         target_task.* = .{
@@ -233,17 +234,10 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
     }
 }
 
-fn onMsgRing(_: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
+fn onMsgRing(_: *io.Ring, _: *io.Task, result: io.Result) anyerror!void {
     assert(result == .msg_ring);
     _ = result.msg_ring catch |err| {
         log.err("msg_ring error: {}", .{err});
-
-        const target_task = task.req.msg_ring.task;
-        switch (target_task.req) {
-            // If we failed to send an accept, we close the fd
-            .accept => posix.close(task.req.msg_ring.result),
-            else => unreachable,
-        }
     };
 }
 
