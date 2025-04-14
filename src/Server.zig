@@ -102,7 +102,7 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
         .workers = try gpa.alloc(Worker, worker_count),
         .threads = try gpa.alloc(std.Thread, worker_count),
         .addr = addr,
-        .stop_pipe = try posix.pipe2(.{}),
+        .stop_pipe = try posix.pipe2(.{ .CLOEXEC = true }),
         .shutdown_signal = opts.shutdown_signal,
         .timeout = .{
             .read_header = opts.read_header_timeout,
