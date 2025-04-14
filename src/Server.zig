@@ -395,6 +395,7 @@ pub const Connection = struct {
         init,
         reading_headers,
         handling_request,
+        reading_body,
         waiting_send_response,
         idle,
         close,
@@ -484,6 +485,17 @@ pub const Connection = struct {
                         self.request,
                     );
                 }
+            },
+
+            .reading_body => {
+                assert(task.req == .recv);
+
+                const n = result.recv catch continue :state .close;
+                if (n == 0) continue :state .close;
+
+                try self.request.appendSlice(self.arena.allocator(), self.buf[0..n]);
+
+                try self.readBody();
             },
 
             .waiting_send_response => {
@@ -601,6 +613,25 @@ pub const Connection = struct {
         }
 
         writer.writeAll("\r\n") catch unreachable;
+    }
+
+    /// Prepares a recv request to read the body of the request. If the body is fully read, the
+    /// handler is called again
+    pub fn readBody(self: *Connection) !void {
+        const head_len = self.request.headLen() orelse @panic("TODO");
+        const cl = self.request.contentLength() orelse @panic("TODO");
+
+        if (head_len + cl == self.request.bytes.items.len) {
+            return self.worker.handler.serveHttp(
+                &self.ctx,
+                self.response.responseWriter(),
+                self.request,
+            );
+        }
+
+        self.state = .reading_body;
+
+        _ = try self.worker.ring.recv(self.fd, &self.buf, self, Connection.onTaskCompletion);
     }
 
     pub fn prepareResponse(self: *Connection) !void {

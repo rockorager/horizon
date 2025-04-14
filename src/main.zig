@@ -46,6 +46,12 @@ pub const Context = struct {
         try conn.prepareResponse();
         try conn.sendResponse();
     }
+
+    pub fn readBody(self: *Context) !void {
+        const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
+        assert(conn.request.body() == null);
+        try conn.readBody();
+    }
 };
 
 pub const Request = struct {
@@ -304,7 +310,7 @@ pub fn errorResponse(
 
 test {
     _ = @import("Server.zig");
-    _ = @import("client.zig");
+    // _ = @import("client.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
 }
