@@ -159,6 +159,20 @@ fn reapCompletions(self: *Uring) anyerror!void {
                 else => |e| unexpectedError(e),
             } },
 
+            .socket => .{ .socket = switch (cqeToE(cqe.res)) {
+                .SUCCESS => @intCast(cqe.res),
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .connect => .{ .connect = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
             .usermsg => .{ .usermsg = @intCast(cqe.res) },
         };
 
@@ -313,6 +327,20 @@ pub fn prepTask(self: *Uring, task: *io.Task) void {
         .poll => |req| {
             const sqe = self.getSqe();
             sqe.prep_poll_add(req.fd, req.mask);
+            sqe.user_data = @intFromPtr(task);
+            self.prepDeadline(task, sqe);
+        },
+
+        .socket => |req| {
+            const sqe = self.getSqe();
+            sqe.prep_socket(req.domain, req.type, req.protocol, 0);
+            sqe.user_data = @intFromPtr(task);
+            self.prepDeadline(task, sqe);
+        },
+
+        .connect => |req| {
+            const sqe = self.getSqe();
+            sqe.prep_connect(req.fd, req.addr, req.addr_len);
             sqe.user_data = @intFromPtr(task);
             self.prepDeadline(task, sqe);
         },
@@ -541,6 +569,44 @@ pub fn poll(
         .userdata = userdata,
         .callback = callback,
         .req = .{ .poll = .{ .fd = fd, .mask = mask } },
+    };
+
+    self.work_queue.push(task);
+    return task;
+}
+
+pub fn socket(
+    self: *Uring,
+    domain: u32,
+    socket_type: u32,
+    protocol: u32,
+    userdata: ?*anyopaque,
+    callback: io.Callback,
+) Allocator.Error!*io.Task {
+    const task = try self.getTask();
+    task.* = .{
+        .userdata = userdata,
+        .callback = callback,
+        .req = .{ .socket = .{ .domain = domain, .type = socket_type, .protocol = protocol } },
+    };
+
+    self.work_queue.push(task);
+    return task;
+}
+
+pub fn connect(
+    self: *Uring,
+    fd: posix.socket_t,
+    addr: *posix.sockaddr,
+    addr_len: posix.socklen_t,
+    userdata: ?*anyopaque,
+    callback: io.Callback,
+) Allocator.Error!*io.Task {
+    const task = try self.getTask();
+    task.* = .{
+        .userdata = userdata,
+        .callback = callback,
+        .req = .{ .connect = .{ .fd = fd, .addr = addr, .addr_len = addr_len } },
     };
 
     self.work_queue.push(task);

@@ -49,6 +49,9 @@ pub const Op = enum {
     writev,
     close,
     poll,
+    socket,
+    connect,
+
     usermsg,
 };
 
@@ -83,6 +86,17 @@ pub const Request = union(Op) {
         fd: posix.fd_t,
         mask: u32,
     },
+    socket: struct {
+        domain: u32,
+        type: u32,
+        protocol: u32,
+    },
+    connect: struct {
+        fd: posix.socket_t,
+        addr: *posix.sockaddr,
+        addr_len: posix.socklen_t,
+    },
+
     usermsg,
 };
 
@@ -98,6 +112,9 @@ pub const Result = union(Op) {
     writev: ResultError!usize,
     close: ResultError!void,
     poll: ResultError!void,
+    socket: ResultError!posix.fd_t,
+    connect: ResultError!void,
+
     usermsg: u16,
 };
 
