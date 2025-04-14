@@ -32,7 +32,7 @@ pub fn main() !void {
 
 const MyHandler = struct {
     fn handler(self: *MyHandler) horizon.Handler {
-        // Not much magic here. If your type has a servHttp method, this is a helper to make the
+        // Not much magic here. If your type has a serveHttp method, this is a helper to make the
         // interface from the type and pointer
         return .init(MyHandler, self);
     }
