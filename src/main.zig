@@ -41,12 +41,6 @@ pub const Context = struct {
         return std.time.timestamp() > self.deadline;
     }
 
-    pub fn sendResponse(self: *Context) !void {
-        const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
-        try conn.prepareResponse();
-        try conn.sendResponse();
-    }
-
     pub fn readBody(self: *Context) !void {
         const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
         assert(conn.request.body() == null);
@@ -145,13 +139,12 @@ pub const Request = struct {
     }
 
     /// Validates a request
-    pub fn isValid(self: Request, ctx: *Context, w: ResponseWriter) !bool {
+    pub fn isValid(self: Request, w: ResponseWriter) !bool {
         const m = self.method();
         if (m.requestHasBody()) {
             // We require a content length
             if (self.contentLength() == null) {
                 try errorResponse(w, .bad_request, "Content-Length is required", .{});
-                try ctx.sendResponse();
                 return false;
             }
         }
@@ -164,12 +157,14 @@ pub const ResponseWriter = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        flush: *const fn (*anyopaque) anyerror!void,
         setHeader: *const fn (*anyopaque, []const u8, ?[]const u8) Allocator.Error!void,
         setStatus: *const fn (*anyopaque, status: http.Status) void,
         write: *const fn (*const anyopaque, []const u8) anyerror!usize,
 
         pub fn init(comptime T: type) *const VTable {
             return &.{
+                .flush = T.flush,
                 .setHeader = T.setHeader,
                 .setStatus = T.setStatus,
                 .write = T.write,
@@ -182,6 +177,11 @@ pub const ResponseWriter = struct {
             .ptr = ptr,
             .vtable = .init(T),
         };
+    }
+
+    /// Flush the response to the connection
+    pub fn flush(self: ResponseWriter) anyerror!void {
+        return self.vtable.flush(self.ptr);
     }
 
     pub fn setHeader(self: ResponseWriter, name: []const u8, value: ?[]const u8) Allocator.Error!void {
@@ -211,6 +211,7 @@ pub const Response = struct {
     status: ?http.Status = null,
 
     pub const VTable: ResponseWriter.VTable = .{
+        .flush = Response.flush,
         .setHeader = Response.setHeader,
         .setStatus = Response.setStatus,
         .write = Response.typeErasedWrite,
@@ -265,6 +266,13 @@ pub const Response = struct {
         try self.body.dynamic.appendSlice(self.arena, bytes);
         return bytes.len;
     }
+
+    pub fn flush(ptr: *anyopaque) anyerror!void {
+        const self: *Response = @ptrCast(@alignCast(ptr));
+        const conn: *Server.Connection = @alignCast(@fieldParentPtr("response", self));
+        try conn.prepareResponse();
+        try conn.sendResponse();
+    }
 };
 
 pub const HeaderIterator = struct {
@@ -307,6 +315,8 @@ pub fn errorResponse(
     try w.setHeader("Content-Type", "text/plain");
     // Print the body
     try w.any().print(format, args);
+
+    return w.flush();
 }
 
 test {

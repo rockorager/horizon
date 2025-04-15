@@ -37,9 +37,9 @@ const MyHandler = struct {
         return .init(MyHandler, self);
     }
 
-    pub fn serveHttp(_: *anyopaque, ctx: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
+    pub fn serveHttp(_: *anyopaque, _: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
         try w.any().print("hello, world", .{});
-        try ctx.sendResponse();
+        return w.flush();
     }
 };
 
@@ -70,7 +70,10 @@ const gzip = struct {
                 return self.next.serveHttp(ctx, w, r);
 
             try w.setHeader("Content-Encoding", "gzip");
-            var gz: ResponseWriter = .{ .rw = w };
+
+            // We need to allocate the writer, it's lifetime could be beyond this function if the
+            const gz = try ctx.arena.create(ResponseWriter);
+            gz.* = .{ .rw = w };
             try self.next.serveHttp(ctx, gz.responseWriter(), r);
             try gz.flush();
         }
@@ -129,6 +132,8 @@ const gzip = struct {
             var fbs = std.io.fixedBufferStream(self.buffer[0..self.idx]);
             try std.compress.gzip.compress(fbs.reader(), self.rw.any(), .{});
             self.idx = 0;
+
+            return self.rw.flush();
         }
     };
 };

@@ -477,7 +477,7 @@ pub const Connection = struct {
                 self.worker.keep_alive += 1;
 
                 // validate the request
-                if (try self.request.isValid(&self.ctx, self.response.responseWriter())) {
+                if (try self.request.isValid(self.response.responseWriter())) {
                     // Call the handler
                     try self.worker.handler.serveHttp(
                         &self.ctx,
@@ -746,14 +746,14 @@ test "server" {
 
         pub fn serveHttp(
             ptr: *anyopaque,
-            ctx: *hz.Context,
+            _: *hz.Context,
             w: hz.ResponseWriter,
             _: hz.Request,
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.got_request = true;
             w.any().print("hello world", .{}) catch unreachable;
-            try ctx.sendResponse();
+            try w.flush();
             try self.server.stop();
         }
     };
