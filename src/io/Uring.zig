@@ -25,6 +25,7 @@ free_list: Queue(io.Task, .free) = .{},
 work_queue: Queue(io.Task, .in_flight) = .{},
 inflight: usize = 0,
 run_cond: io.RunCondition,
+eventfd: ?posix.fd_t = null,
 
 /// Initialize a Ring
 pub fn init(gpa: Allocator, entries: u16) !Uring {
@@ -40,8 +41,13 @@ pub fn deinit(self: *Uring) void {
     while (self.free_list.pop()) |task| self.gpa.destroy(task);
     while (self.work_queue.pop()) |task| self.gpa.destroy(task);
 
-    if (self.ring.fd < 0) return;
-    self.ring.deinit();
+    if (self.ring.fd >= 0) {
+        self.ring.deinit();
+    }
+    if (self.eventfd) |fd| {
+        posix.close(fd);
+        self.eventfd = null;
+    }
     self.* = undefined;
 }
 
@@ -66,7 +72,7 @@ pub fn initChild(self: Uring, entries: u16) !Uring {
 pub fn run(self: *Uring, limit: io.RunCondition) !void {
     self.run_cond = limit;
     while (true) {
-        try self.submit();
+        try self.submitAndWait();
         try self.reapCompletions();
         switch (self.run_cond) {
             .once => return,
@@ -76,9 +82,18 @@ pub fn run(self: *Uring, limit: io.RunCondition) !void {
     }
 }
 
-fn reapCompletions(self: *Uring) anyerror!void {
+/// Return a file descriptor which can be used to poll the ring for completions
+pub fn pollableFd(self: *Uring) !posix.fd_t {
+    if (self.eventfd) |fd| return fd;
+    const fd: posix.fd_t = @intCast(linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK));
+    try self.ring.register_eventfd(fd);
+    self.eventfd = fd;
+    return fd;
+}
+
+pub fn reapCompletions(self: *Uring) anyerror!void {
     var cqes: [64]linux.io_uring_cqe = undefined;
-    const n = self.ring.copy_cqes(&cqes, 1) catch |err| {
+    const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
         switch (err) {
             error.SignalInterrupt => return,
             else => return err,
@@ -238,7 +253,8 @@ pub fn submit(self: *Uring) !void {
         defer sqes_available -= sqes_required;
         self.prepTask(task);
     }
-    _ = try self.ring.submit();
+    const n = try self.ring.submit();
+    _ = try self.ring.enter(n, 0, linux.IORING_ENTER_GETEVENTS);
 }
 
 fn sqesRequired(task: *const io.Task) u32 {
@@ -263,7 +279,7 @@ pub fn prepTask(self: *Uring, task: *io.Task) void {
 
         .timer => |*t| {
             const sqe = self.getSqe();
-            sqe.prep_timeout(@ptrCast(t), 0, 0);
+            sqe.prep_timeout(@ptrCast(t), 0, linux.IORING_TIMEOUT_REALTIME);
             sqe.user_data = @intFromPtr(task);
             self.prepDeadline(task, sqe);
         },
