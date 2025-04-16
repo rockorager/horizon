@@ -72,6 +72,7 @@ pub const Client = struct {
 
     pub fn fetch(
         self: *Client,
+        arena: Allocator,
         ring: *io.Ring,
         options: FetchOptions,
         userdata: ?*anyopaque,
@@ -86,7 +87,7 @@ pub const Client = struct {
         const method: std.http.Method = options.method orelse
             if (options.payload != null) .POST else .GET;
 
-        const req = try open(self, method, uri, .{
+        const req = try open(self, arena, method, uri, .{
             .server_header_buffer = options.server_header_buffer orelse &server_header_buffer,
             .redirect_behavior = options.redirect_behavior orelse
                 if (options.payload == null) @enumFromInt(3) else .unhandled,
@@ -127,62 +128,6 @@ pub const Client = struct {
             self.cert,
             ring,
         );
-        // conn.* = .{ .data = undefined };
-
-        // const stream = net.tcpConnectToHost(client.allocator, host, port) catch |err| switch (err) {
-        //     error.ConnectionRefused => return error.ConnectionRefused,
-        //     error.NetworkUnreachable => return error.NetworkUnreachable,
-        //     error.ConnectionTimedOut => return error.ConnectionTimedOut,
-        //     error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
-        //     error.TemporaryNameServerFailure => return error.TemporaryNameServerFailure,
-        //     error.NameServerFailure => return error.NameServerFailure,
-        //     error.UnknownHostName => return error.UnknownHostName,
-        //     error.HostLacksNetworkAddresses => return error.HostLacksNetworkAddresses,
-        //     else => return error.UnexpectedConnectFailure,
-        // };
-        // errdefer stream.close();
-        //
-        // conn.data = .{
-        //     .stream = stream,
-        //     .tls_client = undefined,
-        //
-        //     .protocol = protocol,
-        //     .host = try client.allocator.dupe(u8, host),
-        //     .port = port,
-        // };
-        // errdefer client.allocator.free(conn.data.host);
-        //
-        // if (protocol == .tls) {
-        //     if (disable_tls) unreachable;
-        //
-        //     conn.data.tls_client = try client.allocator.create(std.crypto.tls.Client);
-        //     errdefer client.allocator.destroy(conn.data.tls_client);
-        //
-        //     const ssl_key_log_file: ?std.fs.File = if (std.options.http_enable_ssl_key_log_file) ssl_key_log_file: {
-        //         const ssl_key_log_path = std.process.getEnvVarOwned(client.allocator, "SSLKEYLOGFILE") catch |err| switch (err) {
-        //             error.EnvironmentVariableNotFound, error.InvalidWtf8 => break :ssl_key_log_file null,
-        //             error.OutOfMemory => return error.OutOfMemory,
-        //         };
-        //         defer client.allocator.free(ssl_key_log_path);
-        //         break :ssl_key_log_file std.fs.cwd().createFile(ssl_key_log_path, .{
-        //             .truncate = false,
-        //             .mode = switch (builtin.os.tag) {
-        //                 .windows, .wasi => 0,
-        //                 else => 0o600,
-        //             },
-        //         }) catch null;
-        //     } else null;
-        //     errdefer if (ssl_key_log_file) |key_log_file| key_log_file.close();
-        //
-        //     conn.data.tls_client.* = std.crypto.tls.Client.init(stream, .{
-        //         .host = .{ .explicit = host },
-        //         .ca = .{ .bundle = client.ca_bundle },
-        //         .ssl_key_log_file = ssl_key_log_file,
-        //     }) catch return error.TlsInitializationFailed;
-        //     // This is appropriate for HTTPS because the HTTP headers contain
-        //     // the content length which is used to detect truncation attacks.
-        //     conn.data.tls_client.allow_truncation_attacks = true;
-        // }
 
         self.connection_pool.addUsed(conn);
 
@@ -339,7 +284,6 @@ pub const Connection = struct {
 
                         self.written += n;
                         if (self.written < self.send_buf.items.len) {
-                            log.err("handshake short write", .{});
                             _ = try ring.write(
                                 self.fd,
                                 self.send_buf.items[self.written..],
@@ -347,7 +291,6 @@ pub const Connection = struct {
                                 Connection.onTaskCompletion,
                             );
                         } else {
-                            log.err("handshake full write", .{});
                             self.written = 0;
                             self.send_buf.clearRetainingCapacity();
                         }
@@ -471,13 +414,13 @@ pub const Connection = struct {
                         log.err("response={s}", .{self.resp_buf.items});
 
                         // Rearm our recv task
-                        _ = try ring.recv(
-                            self.fd,
-                            &self.recv_buf,
-                            self,
-                            Connection.onTaskCompletion,
-                        );
-                        @panic("here");
+                        // _ = try ring.recv(
+                        //     self.fd,
+                        //     &self.recv_buf,
+                        //     self,
+                        //     Connection.onTaskCompletion,
+                        // );
+                        // @panic("here");
                     },
 
                     else => unreachable,
@@ -486,24 +429,21 @@ pub const Connection = struct {
         }
     }
 
-    // fn prepRequest(self: *Connection) !void {
-    // self.send_buf.clearRetainingCapacity();
-    // var writer = self.send_buf.writer(self.arena);
-    // {
-    //     self.request.method = .GET;
-    //     try self.request.method.write(writer);
-    //     const path = self.uri.path.percent_encoded;
-    //     try writer.print(" {s} HTTP/1.1\r\n", .{if (path.len == 0) "/" else path});
-    // }
-    //
-    // const host = self.request.uri.host.?;
-    // try writer.print("Host: {s}\r\n", .{host.percent_encoded});
-    // log.err("{s}", .{self.send_buf.items});
-    // }
+    pub fn close(self: *Connection) void {
+        switch (self.tls_client) {
+            .conn => |*conn| blk: {
+                var buf: [8]u8 = undefined;
+                const msg = conn.close(&buf) catch break :blk;
+                _ = posix.write(self.fd, msg) catch break :blk;
+            },
+            else => {},
+        }
+        posix.close(self.fd);
+    }
 };
 
 pub const Request = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: Allocator,
 
     ptr: ?*anyopaque,
     callback: *const fn (*Request) anyerror!void,
@@ -1235,6 +1175,7 @@ pub const ConnectionPool = struct {
 /// Asserts that "\r\n" does not occur in any header name or value.
 pub fn open(
     client: *Client,
+    arena: Allocator,
     method: http.Method,
     uri: Uri,
     options: RequestOptions,
@@ -1254,11 +1195,10 @@ pub fn open(
         assert(std.mem.indexOfPosLinear(u8, header.value, 0, "\r\n") == null);
     }
 
-    const req = try client.gpa.create(Request);
-    req.arena = .init(client.gpa);
+    const req = try arena.create(Request);
 
     var server_header: std.heap.FixedBufferAllocator = .init(options.server_header_buffer);
-    const protocol, const valid_uri = try validateUri(uri, req.arena.allocator());
+    const protocol, const valid_uri = try validateUri(uri, arena);
 
     const connection = options.connection orelse
         try client.connect(valid_uri.host.?.raw, uriPort(valid_uri, protocol), protocol, ring);
@@ -1344,10 +1284,13 @@ test "client: handshake" {
     var client: Client = try .init(std.testing.allocator);
     defer client.deinit();
 
-    const req = try client.fetch(&ring, .{
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+
+    const req = try client.fetch(arena.allocator(), &ring, .{
         .location = .{ .url = "https://timculverhouse.com" },
     }, null, testFetchCallback);
-    defer std.testing.allocator.destroy(req);
+    _ = req;
 
     // var conn: Connection = undefined;
     // var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
