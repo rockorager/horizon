@@ -202,7 +202,7 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
             task.state = .free;
         }
 
-        try task.callback(self, task, result);
+        try task.callback(task.userdata, self, task.msg, result);
 
         // The callback could reschedule the task. So we handle it's state after the callback
         switch (task.state) {
@@ -410,11 +410,13 @@ pub fn getTask(self: *Uring) Allocator.Error!*io.Task {
 pub fn noop(
     self: *Uring,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .noop,
     };
@@ -427,11 +429,13 @@ pub fn timer(
     self: *Uring,
     duration: io.Timespec,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .timer = duration },
     };
@@ -444,6 +448,7 @@ pub fn cancelAll(self: *Uring) Allocator.Error!void {
     const task = try self.getTask();
     task.* = .{
         .userdata = null,
+        .msg = 0,
         .callback = io.noopCallback,
         .req = .{ .cancel = .all },
     };
@@ -455,11 +460,13 @@ pub fn accept(
     self: *Uring,
     fd: posix.fd_t,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .accept = fd },
     };
@@ -475,12 +482,14 @@ pub fn msgRing(
     // this tsak are what will be called when the target receives the message
     result: u16, // We only allow sending a successful result
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     // This is the task to send the message
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .msg_ring = .{
             .target = target,
@@ -498,11 +507,13 @@ pub fn recv(
     fd: posix.fd_t,
     buffer: []u8,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .recv = .{
             .fd = fd,
@@ -519,11 +530,13 @@ pub fn write(
     fd: posix.fd_t,
     buffer: []const u8,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .write = .{
             .fd = fd,
@@ -540,11 +553,13 @@ pub fn writev(
     fd: posix.fd_t,
     vecs: []const posix.iovec_const,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .writev = .{
             .fd = fd,
@@ -560,11 +575,13 @@ pub fn close(
     self: *Uring,
     fd: posix.fd_t,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .close = fd },
     };
@@ -578,11 +595,13 @@ pub fn poll(
     fd: posix.fd_t,
     mask: u32,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .poll = .{ .fd = fd, .mask = mask } },
     };
@@ -597,11 +616,13 @@ pub fn socket(
     socket_type: u32,
     protocol: u32,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .socket = .{ .domain = domain, .type = socket_type, .protocol = protocol } },
     };
@@ -616,11 +637,13 @@ pub fn connect(
     addr: *posix.sockaddr,
     addr_len: posix.socklen_t,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!*io.Task {
     const task = try self.getTask();
     task.* = .{
         .userdata = userdata,
+        .msg = msg,
         .callback = callback,
         .req = .{ .connect = .{ .fd = fd, .addr = addr, .addr_len = addr_len } },
     };
@@ -629,20 +652,20 @@ pub fn connect(
     return task;
 }
 
-/// Foo is only for testing
-const Foo = struct {
-    bar: usize = 0,
-
-    fn callback(_: *io.Ring, task: *io.Task, _: io.Result) anyerror!void {
-        const self = task.ptrCast(@This());
-        self.bar += 1;
-    }
-};
-
 fn unexpectedError(err: posix.E) posix.UnexpectedError {
     std.log.err("unexpected posix error: {}", .{err});
     return error.Unexpected;
 }
+
+/// Foo is only for testing
+const Foo = struct {
+    bar: usize = 0,
+
+    fn callback(ptr: ?*anyopaque, _: *io.Ring, _: u16, _: io.Result) anyerror!void {
+        const self = io.ptrCast(@This(), ptr);
+        self.bar += 1;
+    }
+};
 
 test "uring: inflight" {
     const gpa = std.testing.allocator;
@@ -650,7 +673,7 @@ test "uring: inflight" {
     defer ring.deinit();
 
     var foo: Foo = .{};
-    const task = try ring.noop(&foo, Foo.callback);
+    const task = try ring.noop(&foo, 0, Foo.callback);
     try task.setDeadline(&ring, .{ .sec = 1 });
 
     try ring.submitAndWait();
@@ -667,7 +690,7 @@ test "uring: deadline doesn't call user callback" {
     defer ring.deinit();
 
     var foo: Foo = .{};
-    const task = try ring.noop(&foo, Foo.callback);
+    const task = try ring.noop(&foo, 0, Foo.callback);
     try task.setDeadline(&ring, .{ .sec = 1 });
 
     try ring.run(.until_done);
@@ -687,6 +710,7 @@ test "uring: timeout" {
     _ = try ring.timer(
         .{ .nsec = delay },
         &foo,
+        0,
         Foo.callback,
     );
 
@@ -707,10 +731,11 @@ test "uring: cancel" {
     const task = try ring.timer(
         .{ .nsec = delay },
         &foo,
+        0,
         Foo.callback,
     );
 
-    try task.cancel(&ring, null, io.noopCallback);
+    try task.cancel(&ring, null, 0, io.noopCallback);
 
     const start = std.time.nanoTimestamp();
     try ring.run(.until_done);

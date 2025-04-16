@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const Ring = io.Ring;
 
 userdata: ?*anyopaque,
+msg: u16,
 callback: io.Callback,
 req: io.Request,
 
@@ -25,10 +26,6 @@ deadline: ?*Task = null,
 
 next: ?*Task = null,
 
-pub fn ptrCast(self: Task, comptime T: type) *T {
-    return @ptrCast(@alignCast(self.userdata));
-}
-
 pub fn setDeadline(
     self: *Task,
     ring: *Ring,
@@ -40,6 +37,7 @@ pub fn setDeadline(
     task.* = .{
         .callback = io.noopCallback,
         .userdata = null,
+        .msg = 0,
         .req = .{ .deadline = deadline },
     };
 
@@ -50,11 +48,13 @@ pub fn cancel(
     self: *Task,
     ring: *Ring,
     userdata: ?*anyopaque,
+    msg: u16,
     callback: io.Callback,
 ) Allocator.Error!void {
     const task = try ring.getTask();
     task.* = .{
         .callback = callback,
+        .msg = msg,
         .userdata = userdata,
         .req = .{ .cancel = .{ .task = self } },
     };

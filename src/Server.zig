@@ -113,7 +113,8 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
     };
 }
 
-fn mainLoopTick(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
+fn mainLoopTick(ptr: ?*anyopaque, ring: *io.Ring, msg: u16, result: io.Result) anyerror!void {
+    _ = msg;
     _ = result.poll catch |err| {
         switch (err) {
             error.Canceled => return,
@@ -123,7 +124,7 @@ fn mainLoopTick(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void
         return;
     };
 
-    const self = task.ptrCast(Server);
+    const self = io.ptrCast(Server, ptr);
     switch (builtin.os.tag) {
         .linux => {
             const fd = self.worker.ring.pollableFd() catch unreachable;
@@ -142,6 +143,7 @@ fn mainLoopTick(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void
         self.worker.ring.pollableFd() catch unreachable,
         posix.POLL.IN,
         self,
+        0,
         mainLoopTick,
     );
 
@@ -159,6 +161,7 @@ pub fn listenAndServe(self: *Server, ioring: *io.Ring, handler: hz.Handler) !voi
         self.worker.accept_task = try self.worker.ring.accept(
             self.worker.fd,
             &self.worker,
+            0,
             Worker.onTaskCompletion,
         );
 
@@ -183,9 +186,10 @@ pub fn listenAndServe(self: *Server, ioring: *io.Ring, handler: hz.Handler) !voi
         try self.worker.ring.pollableFd(),
         posix.POLL.IN,
         self,
+        0,
         mainLoopTick,
     );
-    _ = try ioring.poll(self.stop_pipe[0], posix.POLL.IN, self, onTaskCompletion);
+    _ = try ioring.poll(self.stop_pipe[0], posix.POLL.IN, self, 0, onTaskCompletion);
 }
 
 pub fn deinit(self: *Server, gpa: Allocator) void {
@@ -195,7 +199,7 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
     }
 
     if (self.poll_task) |pt| {
-        _ = pt.cancel(self.ring, null, io.noopCallback) catch {};
+        _ = pt.cancel(self.ring, null, 0, io.noopCallback) catch {};
         self.poll_task = null;
     }
 
@@ -206,8 +210,8 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
     gpa.free(self.threads);
 }
 
-fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
-    const self = task.ptrCast(Server);
+fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+    const self = io.ptrCast(Server, ptr);
     switch (self.state) {
         .init => unreachable,
 
@@ -222,6 +226,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                     self.shutdown_timer = try ring.timer(
                         .{ .sec = self.shutdown_timeout },
                         self,
+                        0,
                         onTaskCompletion,
                     );
 
@@ -229,6 +234,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                         const target_task = try ring.getTask();
                         target_task.* = .{
                             .userdata = &self.worker,
+                            .msg = 0,
                             .callback = Worker.onTaskCompletion,
                             .req = .usermsg,
                         };
@@ -238,6 +244,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                             target_task,
                             @intFromEnum(UserMsg.quit),
                             self,
+                            0,
                             onMsgRing,
                         );
                     }
@@ -247,6 +254,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                         const target_task = try ring.getTask();
                         target_task.* = .{
                             .userdata = worker,
+                            .msg = 0,
                             .callback = Worker.onTaskCompletion,
                             .req = .usermsg,
                         };
@@ -256,6 +264,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                             target_task,
                             @intFromEnum(UserMsg.quit),
                             self,
+                            0,
                             onMsgRing,
                         );
                     }
@@ -270,7 +279,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                 .timer => {
                     self.shutdown_timer = null;
                     if (self.poll_task) |pt| {
-                        _ = try pt.cancel(ring, null, io.noopCallback);
+                        _ = try pt.cancel(ring, null, 0, io.noopCallback);
                         self.poll_task = null;
                     }
                 },
@@ -291,11 +300,11 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
                                     thread.join();
                                 }
                                 if (self.poll_task) |pt| {
-                                    _ = try pt.cancel(ring, null, io.noopCallback);
+                                    _ = try pt.cancel(ring, null, 0, io.noopCallback);
                                     self.poll_task = null;
                                 }
                                 if (self.shutdown_timer) |timer| {
-                                    _ = try timer.cancel(ring, null, io.noopCallback);
+                                    _ = try timer.cancel(ring, null, 0, io.noopCallback);
                                     self.shutdown_timer = null;
                                 }
                             }
@@ -318,7 +327,7 @@ fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!
     try self.worker.ring.submit();
 }
 
-fn onMsgRing(_: *io.Ring, _: *io.Task, result: io.Result) anyerror!void {
+fn onMsgRing(_: ?*anyopaque, _: *io.Ring, _: u16, result: io.Result) anyerror!void {
     assert(result == .msg_ring);
     _ = result.msg_ring catch |err| {
         log.err("msg_ring error: {}", .{err});
@@ -385,7 +394,7 @@ const Worker = struct {
     fn run(self: *Worker, main: *io.Ring) !void {
         self.ring = try main.initChild(64);
         try posix.listen(self.fd, 64);
-        self.accept_task = try self.ring.accept(self.fd, self, Worker.onTaskCompletion);
+        self.accept_task = try self.ring.accept(self.fd, self, 0, Worker.onTaskCompletion);
 
         try self.ring.run(.until_done);
     }
@@ -395,8 +404,8 @@ const Worker = struct {
         self.ring.deinit();
     }
 
-    fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
-        const self = task.ptrCast(Worker);
+    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+        const self = io.ptrCast(Worker, ptr);
         state: switch (self.state) {
             .running => {
                 switch (result) {
@@ -416,7 +425,7 @@ const Worker = struct {
                             .quit => {
                                 ring.run_cond = .until_done;
                                 self.state = .shutting_down;
-                                _ = try self.accept_task.cancel(ring, self, Worker.onTaskCompletion);
+                                _ = try self.accept_task.cancel(ring, self, 0, Worker.onTaskCompletion);
                                 continue :state .shutting_down;
                             },
 
@@ -448,6 +457,7 @@ const Worker = struct {
         const target_task = try self.ring.getTask();
         target_task.* = .{
             .userdata = self.server,
+            .msg = 0,
             .callback = Server.onTaskCompletion,
             .req = .usermsg,
         };
@@ -457,6 +467,7 @@ const Worker = struct {
             target_task,
             @intFromEnum(UserMsg.worker_shutdown),
             null,
+            0,
             io.noopCallback,
         );
     }
@@ -515,7 +526,7 @@ pub const Connection = struct {
             .ring = &worker.ring,
         };
 
-        const task = try worker.ring.recv(fd, &self.buf, self, Connection.onTaskCompletion);
+        const task = try worker.ring.recv(fd, &self.buf, self, 0, Connection.onTaskCompletion);
         if (worker.timeout.read_header > 0) {
             try task.setDeadline(&worker.ring, .{ .sec = self.deadline });
         }
@@ -527,13 +538,13 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
-    fn onTaskCompletion(ring: *io.Ring, task: *io.Task, result: io.Result) anyerror!void {
-        const self = task.ptrCast(Connection);
+    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+        const self = io.ptrCast(Connection, ptr);
         state: switch (self.state) {
             .init => unreachable,
 
             .reading_headers => {
-                assert(task.req == .recv);
+                assert(result == .recv);
 
                 const n = result.recv catch continue :state .close;
                 if (n == 0) continue :state .close;
@@ -550,6 +561,7 @@ pub const Connection = struct {
                             self.fd,
                             &self.buf,
                             self,
+                            0,
                             Connection.onTaskCompletion,
                         );
                         if (self.worker.timeout.read_header > 0) {
@@ -577,7 +589,7 @@ pub const Connection = struct {
             },
 
             .reading_body => {
-                assert(task.req == .recv);
+                assert(result == .recv);
 
                 const n = result.recv catch continue :state .close;
                 if (n == 0) continue :state .close;
@@ -588,8 +600,8 @@ pub const Connection = struct {
             },
 
             .waiting_send_response => {
-                assert(task.req == .write or task.req == .writev);
-                const n = switch (task.req) {
+                assert(result == .write or result == .writev);
+                const n = switch (result) {
                     .write => result.write catch {
                         // On error we are done and can let the worker softclose if it wants
                         self.worker.keep_alive -= 1;
@@ -626,7 +638,7 @@ pub const Connection = struct {
 
                 self.reset();
 
-                const new_task = try ring.recv(self.fd, &self.buf, self, Connection.onTaskCompletion);
+                const new_task = try ring.recv(self.fd, &self.buf, self, 0, Connection.onTaskCompletion);
                 // prep another recv
                 if (self.worker.timeout.idle > 0) {
                     self.deadline = std.time.timestamp() + self.worker.timeout.idle;
@@ -636,7 +648,7 @@ pub const Connection = struct {
 
             .close => {
                 self.state = .waiting_for_destruction;
-                _ = try ring.close(self.fd, self, Connection.onTaskCompletion);
+                _ = try ring.close(self.fd, self, 0, Connection.onTaskCompletion);
             },
 
             .waiting_for_destruction => {
@@ -720,7 +732,7 @@ pub const Connection = struct {
 
         self.state = .reading_body;
 
-        _ = try self.worker.ring.recv(self.fd, &self.buf, self, Connection.onTaskCompletion);
+        _ = try self.worker.ring.recv(self.fd, &self.buf, self, 0, Connection.onTaskCompletion);
     }
 
     pub fn prepareResponse(self: *Connection) !void {
@@ -756,6 +768,7 @@ pub const Connection = struct {
                 self.fd,
                 headers[self.written..],
                 self,
+                0,
                 Connection.onTaskCompletion,
             ),
 
@@ -774,6 +787,7 @@ pub const Connection = struct {
                     self.fd,
                     &self.vecs,
                     self,
+                    0,
                     Connection.onTaskCompletion,
                 );
             },
@@ -785,6 +799,7 @@ pub const Connection = struct {
                     self.fd,
                     unwritten_body,
                     self,
+                    0,
                     Connection.onTaskCompletion,
                 );
             },

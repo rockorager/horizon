@@ -209,6 +209,7 @@ pub const Connection = struct {
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
             self,
+            0,
             Connection.onTaskCompletion,
         );
         self.state = .socket_response;
@@ -219,11 +220,12 @@ pub const Connection = struct {
     }
 
     fn onTaskCompletion(
+        ptr: ?*anyopaque,
         ring: *io.Ring,
-        task: *io.Task,
+        _: u16,
         result: io.Result,
     ) anyerror!void {
-        const self = task.ptrCast(Connection);
+        const self = io.ptrCast(Connection, ptr);
         state: switch (self.state) {
             .init => unreachable,
 
@@ -240,6 +242,7 @@ pub const Connection = struct {
                     &self.addr.any,
                     self.addr.getOsSockLen(),
                     self,
+                    0,
                     Connection.onTaskCompletion,
                 );
 
@@ -251,7 +254,7 @@ pub const Connection = struct {
 
                 _ = result.connect catch |err| {
                     log.err("socket error: {}", .{err});
-                    _ = try ring.close(self.fd, null, io.noopCallback);
+                    _ = try ring.close(self.fd, null, 0, io.noopCallback);
                     return err;
                 };
 
@@ -263,10 +266,10 @@ pub const Connection = struct {
                 try self.send_buf.appendSlice(self.gpa, hs_result.send);
 
                 // Issue the write
-                _ = try ring.write(self.fd, self.send_buf.items, self, Connection.onTaskCompletion);
+                _ = try ring.write(self.fd, self.send_buf.items, self, 0, Connection.onTaskCompletion);
 
                 // Start receiving
-                _ = try ring.recv(self.fd, &self.recv_buf, self, Connection.onTaskCompletion);
+                _ = try ring.recv(self.fd, &self.recv_buf, self, 0, Connection.onTaskCompletion);
 
                 self.state = .handshake;
             },
@@ -278,7 +281,7 @@ pub const Connection = struct {
                     .write => {
                         const n = result.write catch |err| {
                             log.err("send during handshake error: {}", .{err});
-                            _ = try ring.close(self.fd, null, io.noopCallback);
+                            _ = try ring.close(self.fd, null, 0, io.noopCallback);
                             return;
                         };
 
@@ -288,6 +291,7 @@ pub const Connection = struct {
                                 self.fd,
                                 self.send_buf.items[self.written..],
                                 self,
+                                0,
                                 Connection.onTaskCompletion,
                             );
                         } else {
@@ -305,7 +309,7 @@ pub const Connection = struct {
                     .recv => {
                         const n = result.recv catch |err| {
                             log.err("recv during handshake error: {}", .{err});
-                            _ = try ring.close(self.fd, null, io.noopCallback);
+                            _ = try ring.close(self.fd, null, 0, io.noopCallback);
                             return;
                         };
 
@@ -327,6 +331,7 @@ pub const Connection = struct {
                             self.fd,
                             &self.recv_buf,
                             self,
+                            0,
                             Connection.onTaskCompletion,
                         );
 
@@ -345,6 +350,7 @@ pub const Connection = struct {
                                 self.fd,
                                 self.send_buf.items[self.written..],
                                 self,
+                                0,
                                 Connection.onTaskCompletion,
                             );
                         }
@@ -365,6 +371,7 @@ pub const Connection = struct {
                         self.fd,
                         r.ciphertext,
                         self,
+                        0,
                         Connection.onTaskCompletion,
                     );
                     self.state = .waiting_response;
@@ -376,7 +383,7 @@ pub const Connection = struct {
                     .write => {
                         const n = result.write catch |err| {
                             log.err("send error: {}", .{err});
-                            _ = try ring.close(self.fd, null, io.noopCallback);
+                            _ = try ring.close(self.fd, null, 0, io.noopCallback);
                             return;
                         };
 
@@ -386,6 +393,7 @@ pub const Connection = struct {
                                 self.fd,
                                 self.send_buf.items[self.written..],
                                 self,
+                                0,
                                 Connection.onTaskCompletion,
                             );
                         } else {
@@ -397,7 +405,7 @@ pub const Connection = struct {
                     .recv => {
                         const n = result.recv catch |err| {
                             log.err("recv during handshake error: {}", .{err});
-                            _ = try ring.close(self.fd, null, io.noopCallback);
+                            _ = try ring.close(self.fd, null, 0, io.noopCallback);
                             return;
                         };
 

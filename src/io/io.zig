@@ -4,8 +4,12 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 pub const Task = @import("Task.zig");
-pub const Callback = *const fn (*Ring, *Task, Result) anyerror!void;
-pub fn noopCallback(_: *Ring, _: *Task, _: Result) anyerror!void {}
+pub const Callback = *const fn (?*anyopaque, *Ring, u16, Result) anyerror!void;
+pub fn noopCallback(_: ?*anyopaque, _: *Ring, _: u16, _: Result) anyerror!void {}
+
+pub fn ptrCast(comptime T: type, ptr: ?*anyopaque) *T {
+    return @ptrCast(@alignCast(ptr));
+}
 
 pub const RunCondition = enum {
     once,
