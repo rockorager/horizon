@@ -27,8 +27,6 @@ timeout: Timeouts,
 
 shutdown_timeout: u8,
 
-state: State = .init,
-
 ring: *io.Runtime,
 
 exited_workers: u16 = 0,
@@ -72,12 +70,6 @@ const Timeouts = struct {
     write: u8,
 };
 
-const State = enum {
-    init,
-    accepting,
-    closing,
-};
-
 pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
     // Set the number of open files to system max
     const limit = try posix.getrlimit(posix.rlimit_resource.NOFILE);
@@ -113,40 +105,146 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
     };
 }
 
-fn mainLoopTick(ptr: ?*anyopaque, ring: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
-    _ = msg;
-    _ = result.poll catch |err| {
-        switch (err) {
-            error.Canceled => return,
-            else => {},
-        }
-        log.err("poll error: {}", .{err});
-        return;
-    };
+const Msg = enum {
+    main_worker_ready,
+    shutdown,
+    shutdown_timeout,
+    msg_ring_fail,
+    worker_shutdown,
 
+    fn fromInt(v: u16) Msg {
+        return @enumFromInt(v);
+    }
+};
+
+fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
     const self = io.ptrCast(Server, ptr);
-    switch (builtin.os.tag) {
-        .linux => {
-            const fd = self.worker.ring.pollableFd() catch unreachable;
-            var buf: [8]u8 = undefined;
-            _ = posix.read(fd, &buf) catch |err| {
+
+    switch (Msg.fromInt(msg)) {
+        .main_worker_ready => {
+            assert(result == .poll);
+
+            _ = result.poll catch |err| {
                 switch (err) {
-                    error.WouldBlock => return,
+                    error.Canceled => return,
                     else => {},
                 }
+                log.err("poll error: {}", .{err});
+                return;
+            };
+
+            switch (builtin.os.tag) {
+                .linux => {
+                    const fd = self.worker.ring.pollableFd() catch unreachable;
+                    var buf: [8]u8 = undefined;
+                    _ = posix.read(fd, &buf) catch |err| {
+                        switch (err) {
+                            error.WouldBlock => return,
+                            else => {},
+                        }
+                    };
+                },
+                else => unreachable,
+            }
+
+            // Rearm the poll task
+            self.poll_task = try rt.poll(
+                try self.worker.ring.pollableFd(),
+                posix.POLL.IN,
+                self,
+                @intFromEnum(Msg.main_worker_ready),
+                handleMsg,
+            );
+        },
+
+        .shutdown => {
+            var buf: [8]u8 = undefined;
+            _ = posix.read(self.stop_pipe[0], &buf) catch 0;
+            self.state = .closing;
+
+            // Set our shutdown timer
+            self.shutdown_timer = try rt.timer(
+                .{ .sec = self.shutdown_timeout },
+                self,
+                @intFromEnum(Msg.shutdown_timeout),
+                handleMsg,
+            );
+
+            {
+                const target_task = try rt.getTask();
+                target_task.* = .{
+                    .userdata = &self.worker,
+                    .msg = @intFromEnum(Worker.Msg.shutdown),
+                    .callback = Worker.onTaskCompletion,
+                    .req = .usermsg,
+                };
+
+                _ = try rt.msgRing(
+                    &self.worker.ring,
+                    target_task,
+                    @intFromEnum(UserMsg.quit),
+                    self,
+                    @intFromEnum(Msg.msg_ring_fail),
+                    handleMsg,
+                );
+            }
+
+            // Message each worker ring to shut down
+            for (self.workers) |*worker| {
+                const target_task = try rt.getTask();
+                target_task.* = .{
+                    .userdata = worker,
+                    .msg = @intFromEnum(Worker.Msg.shutdown),
+                    .callback = Worker.onTaskCompletion,
+                    .req = .usermsg,
+                };
+
+                _ = try rt.msgRing(
+                    &worker.ring,
+                    target_task,
+                    @intFromEnum(UserMsg.quit),
+                    self,
+                    @intFromEnum(Msg.msg_ring_fail),
+                    handleMsg,
+                );
+            }
+        },
+
+        .shutdown_timeout => {
+            self.shutdown_timer = null;
+            if (self.poll_task) |pt| {
+                _ = try pt.cancel(rt, null, 0, io.noopCallback);
+                self.poll_task = null;
+            }
+        },
+
+        .msg_ring_fail => {
+            _ = result.msg_ring catch |err| {
+                log.err("msg_ring error: {}", .{err});
             };
         },
-        else => unreachable,
+
+        .worker_shutdown => {
+            self.exited_workers += 1;
+            if (self.exited_workers == self.workers.len + 1) {
+                for (self.threads) |thread| {
+                    thread.join();
+                }
+                if (self.poll_task) |pt| {
+                    _ = try pt.cancel(rt, null, 0, io.noopCallback);
+                    self.poll_task = null;
+                }
+                if (self.shutdown_timer) |timer| {
+                    _ = try timer.cancel(rt, null, 0, io.noopCallback);
+                    self.shutdown_timer = null;
+                }
+            }
+        },
     }
 
-    self.poll_task = try ring.poll(
-        self.worker.ring.pollableFd() catch unreachable,
-        posix.POLL.IN,
-        self,
-        0,
-        mainLoopTick,
-    );
-
+    // We reap and submit our main worker ring here. It's possible that in this function our eventfd
+    // won't wake up when we send a msg_ring message. Both of these calls are nonblocking, and we
+    // only are in this function if we are shutting down, so we don't care too much about perf
     try self.worker.ring.reapCompletions();
     try self.worker.ring.submit();
 }
@@ -186,10 +284,16 @@ pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !
         try self.worker.ring.pollableFd(),
         posix.POLL.IN,
         self,
-        0,
-        mainLoopTick,
+        @intFromEnum(Msg.main_worker_ready),
+        handleMsg,
     );
-    _ = try ioring.poll(self.stop_pipe[0], posix.POLL.IN, self, 0, onTaskCompletion);
+    _ = try ioring.poll(
+        self.stop_pipe[0],
+        posix.POLL.IN,
+        self,
+        @intFromEnum(Msg.shutdown),
+        handleMsg,
+    );
 }
 
 pub fn deinit(self: *Server, gpa: Allocator) void {
@@ -208,130 +312,6 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
 
     gpa.free(self.workers);
     gpa.free(self.threads);
-}
-
-fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
-    const self = io.ptrCast(Server, ptr);
-    switch (self.state) {
-        .init => unreachable,
-
-        .accepting => {
-            switch (result) {
-                .poll => { // shutdown
-                    var buf: [8]u8 = undefined;
-                    _ = posix.read(self.stop_pipe[0], &buf) catch 0;
-                    self.state = .closing;
-
-                    // Set our shutdown timer
-                    self.shutdown_timer = try ring.timer(
-                        .{ .sec = self.shutdown_timeout },
-                        self,
-                        0,
-                        onTaskCompletion,
-                    );
-
-                    {
-                        const target_task = try ring.getTask();
-                        target_task.* = .{
-                            .userdata = &self.worker,
-                            .msg = 0,
-                            .callback = Worker.onTaskCompletion,
-                            .req = .usermsg,
-                        };
-
-                        _ = try ring.msgRing(
-                            &self.worker.ring,
-                            target_task,
-                            @intFromEnum(UserMsg.quit),
-                            self,
-                            0,
-                            onMsgRing,
-                        );
-                    }
-
-                    // Message each worker ring to shut down
-                    for (self.workers) |*worker| {
-                        const target_task = try ring.getTask();
-                        target_task.* = .{
-                            .userdata = worker,
-                            .msg = 0,
-                            .callback = Worker.onTaskCompletion,
-                            .req = .usermsg,
-                        };
-
-                        _ = try ring.msgRing(
-                            &worker.ring,
-                            target_task,
-                            @intFromEnum(UserMsg.quit),
-                            self,
-                            0,
-                            onMsgRing,
-                        );
-                    }
-                },
-
-                else => unreachable,
-            }
-        },
-
-        .closing => {
-            switch (result) {
-                .timer => {
-                    self.shutdown_timer = null;
-                    if (self.poll_task) |pt| {
-                        _ = try pt.cancel(ring, null, 0, io.noopCallback);
-                        self.poll_task = null;
-                    }
-                },
-
-                .cancel => {
-                    _ = result.cancel catch |err| {
-                        log.err("cancel error: {}", .{err});
-                    };
-                },
-
-                .usermsg => |v| {
-                    const msg: UserMsg = @enumFromInt(v);
-                    switch (msg) {
-                        .worker_shutdown => {
-                            self.exited_workers += 1;
-                            if (self.exited_workers == self.workers.len + 1) {
-                                for (self.threads) |thread| {
-                                    thread.join();
-                                }
-                                if (self.poll_task) |pt| {
-                                    _ = try pt.cancel(ring, null, 0, io.noopCallback);
-                                    self.poll_task = null;
-                                }
-                                if (self.shutdown_timer) |timer| {
-                                    _ = try timer.cancel(ring, null, 0, io.noopCallback);
-                                    self.shutdown_timer = null;
-                                }
-                            }
-                        },
-
-                        else => unreachable,
-                    }
-                },
-
-                else => unreachable,
-            }
-        },
-    }
-
-    // We also reap and submit our main worker ring here. It's possible that in this function our
-    // eventfd won't wake up when we send a msg_ring message. Both of these calls are nonblocking,
-    // and we only are in this function if we are shutting down, so we don't care too much about
-    // perf
-    try self.worker.ring.reapCompletions();
-    try self.worker.ring.submit();
-}
-
-fn onMsgRing(_: ?*anyopaque, _: *io.Runtime, _: u16, result: io.Result) anyerror!void {
-    assert(result == .msg_ring);
-    _ = result.msg_ring catch |err| {
-        log.err("msg_ring error: {}", .{err});
-    };
 }
 
 pub fn stop(self: *Server) !void {
@@ -358,6 +338,10 @@ const Worker = struct {
         running,
         shutting_down,
         done,
+    };
+
+    const Msg = enum {
+        shutdown,
     };
 
     fn init(
@@ -457,8 +441,8 @@ const Worker = struct {
         const target_task = try self.ring.getTask();
         target_task.* = .{
             .userdata = self.server,
-            .msg = 0,
-            .callback = Server.onTaskCompletion,
+            .msg = @intFromEnum(Server.Msg.worker_shutdown),
+            .callback = Server.handleMsg,
             .req = .usermsg,
         };
 
