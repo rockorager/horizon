@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const http = std.http;
 const posix = std.posix;
+pub const client = @import("client.zig");
 
 pub const Server = @import("Server.zig");
 
@@ -35,6 +36,8 @@ pub const Context = struct {
     /// tasks before calling ctx.sendResponse. Eg, fetching external data from an API, performing a
     /// DB query asynchronously, etc
     ring: *io.Ring,
+
+    client: *client.Client,
 
     pub fn expired(self: Context) bool {
         if (self.deadline == 0) return false;

@@ -122,7 +122,7 @@ pub const Client = struct {
         conn.* = .{ .data = undefined };
         try conn.data.init(
             self.gpa,
-            host,
+            try self.gpa.dupe(u8, host),
             port,
             protocol,
             self.cert,
@@ -138,7 +138,7 @@ pub const Client = struct {
 pub const Connection = struct {
     gpa: std.mem.Allocator,
 
-    recv_buf: [1024]u8 = undefined,
+    recv_buf: [4096 * 4]u8 = undefined,
 
     resp_buf: std.ArrayListUnmanaged(u8) = .empty,
     send_buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -163,6 +163,7 @@ pub const Connection = struct {
     request: ?*Request,
 
     proxied: bool = false,
+    closing: bool = false,
 
     pub const Protocol = enum { plain, tls };
 
@@ -173,6 +174,7 @@ pub const Connection = struct {
         handshake,
         send_request,
         waiting_response,
+        idle,
     };
 
     pub fn init(
@@ -364,7 +366,7 @@ pub const Connection = struct {
                 if (self.request) |req| {
                     try req.send();
                     const n = self.tls_client.conn.encryptedLength(self.send_buf.items.len);
-                    const buf = try self.gpa.alloc(u8, n);
+                    const buf = try req.arena.alloc(u8, n);
                     const r = try self.tls_client.conn.encrypt(self.send_buf.items, buf);
                     if (r.unused_cleartext.len > 0) @panic("TODO");
                     _ = try ring.write(
@@ -409,31 +411,42 @@ pub const Connection = struct {
                             return;
                         };
 
-                        switch (self.tls_client) {
-                            .none => try self.resp_buf.appendSlice(self.gpa, self.recv_buf[0..n]),
+                        const slice = switch (self.tls_client) {
+                            .none => self.recv_buf[0..n],
                             .handshake => unreachable,
-                            .conn => |*conn| {
+                            .conn => |*conn| blk: {
                                 const r = try conn.decrypt(self.recv_buf[0..n], self.recv_buf[0..n]);
-                                try self.resp_buf.appendSlice(self.gpa, r.cleartext);
+                                break :blk r.cleartext;
                             },
+                        };
+
+                        const req = self.request.?;
+                        try req.response.appendSlice(req.arena, slice);
+
+                        if (req.response.headLen() == null) {
+                            // Rearm our recv task
+                            _ = try ring.recv(
+                                self.fd,
+                                &self.recv_buf,
+                                self,
+                                0,
+                                Connection.onTaskCompletion,
+                            );
+                            return;
                         }
-                        // Buffer the response
 
-                        log.err("response={s}", .{self.resp_buf.items});
+                        // TODO:check if we have the full request, then keep reading
+                        try req.callback(req);
 
-                        // Rearm our recv task
-                        // _ = try ring.recv(
-                        //     self.fd,
-                        //     &self.recv_buf,
-                        //     self,
-                        //     Connection.onTaskCompletion,
-                        // );
-                        // @panic("here");
+                        self.state = .idle;
+                        req.client.connection_pool.release(req.client.gpa, self);
                     },
 
                     else => unreachable,
                 }
             },
+
+            .idle => {},
         }
     }
 
@@ -447,6 +460,8 @@ pub const Connection = struct {
             else => {},
         }
         posix.close(self.fd);
+        self.send_buf.deinit(self.gpa);
+        self.resp_buf.deinit(self.gpa);
     }
 };
 
@@ -473,9 +488,7 @@ pub const Request = struct {
     handle_continue: bool,
 
     /// The response associated with this request.
-    ///
-    /// This field is undefined until `wait` is called.
-    response: std.http.Client.Response,
+    response: Response,
 
     /// Standard headers that have default, but overridable, behavior.
     headers: Headers,
@@ -532,11 +545,7 @@ pub const Request = struct {
     /// Frees all resources associated with the request.
     pub fn deinit(req: *Request) void {
         if (req.connection) |connection| {
-            if (!req.response.parser.done) {
-                // If the response wasn't fully read, then we need to close the connection.
-                connection.closing = true;
-            }
-            req.client.connection_pool.release(req.client.allocator, connection);
+            req.client.connection_pool.release(req.client.gpa, connection);
         }
         req.* = undefined;
     }
@@ -652,7 +661,7 @@ pub const Request = struct {
         if (try emitOverridableHeader("accept-encoding: ", req.headers.accept_encoding, w)) {
             // https://github.com/ziglang/zig/issues/18937
             //try w.writeAll("accept-encoding: gzip, deflate, zstd\r\n");
-            try w.writeAll("accept-encoding: gzip, deflate\r\n");
+            try w.writeAll("accept-encoding: gzip\r\n");
         }
 
         switch (req.transfer_encoding) {
@@ -1026,7 +1035,6 @@ fn uriPort(uri: Uri, protocol: Connection.Protocol) u16 {
 
 /// A set of linked lists of connections that can be reused.
 pub const ConnectionPool = struct {
-    mutex: std.Thread.Mutex = .{},
     /// Open connections that are currently in use.
     used: Queue = .{},
     /// Open connections that are not currently in use.
@@ -1047,9 +1055,6 @@ pub const ConnectionPool = struct {
     /// Finds and acquires a connection from the connection pool matching the criteria. This function is threadsafe.
     /// If no connection is found, null is returned.
     pub fn findConnection(pool: *ConnectionPool, criteria: Criteria) ?*Connection {
-        pool.mutex.lock();
-        defer pool.mutex.unlock();
-
         var next = pool.free.last;
         while (next) |node| : (next = node.prev) {
             if (node.data.protocol != criteria.protocol) continue;
@@ -1075,9 +1080,6 @@ pub const ConnectionPool = struct {
 
     /// Acquires an existing connection from the connection pool. This function is threadsafe.
     pub fn acquire(pool: *ConnectionPool, node: *Node) void {
-        pool.mutex.lock();
-        defer pool.mutex.unlock();
-
         return pool.acquireUnsafe(node);
     }
 
@@ -1087,15 +1089,12 @@ pub const ConnectionPool = struct {
     /// The allocator must be the owner of all nodes in this pool.
     /// The allocator must be the owner of all resources associated with the connection.
     pub fn release(pool: *ConnectionPool, allocator: Allocator, connection: *Connection) void {
-        pool.mutex.lock();
-        defer pool.mutex.unlock();
-
         const node: *Node = @fieldParentPtr("data", connection);
 
         pool.used.remove(node);
 
         if (node.data.closing or pool.free_size == 0) {
-            node.data.close(allocator);
+            node.data.close();
             return allocator.destroy(node);
         }
 
@@ -1103,7 +1102,7 @@ pub const ConnectionPool = struct {
             const popped = pool.free.popFirst() orelse unreachable;
             pool.free_len -= 1;
 
-            popped.data.close(allocator);
+            popped.data.close();
             allocator.destroy(popped);
         }
 
@@ -1118,9 +1117,6 @@ pub const ConnectionPool = struct {
 
     /// Adds a newly created node to the pool of used connections. This function is threadsafe.
     pub fn addUsed(pool: *ConnectionPool, node: *Node) void {
-        pool.mutex.lock();
-        defer pool.mutex.unlock();
-
         pool.used.append(node);
     }
 
@@ -1128,9 +1124,6 @@ pub const ConnectionPool = struct {
     ///
     /// If the new size is smaller than the current size, then idle connections will be closed until the pool is the new size.
     pub fn resize(pool: *ConnectionPool, allocator: Allocator, new_size: usize) void {
-        pool.mutex.lock();
-        defer pool.mutex.unlock();
-
         const next = pool.free.first;
         _ = next;
         while (pool.free_len > new_size) {
@@ -1148,15 +1141,12 @@ pub const ConnectionPool = struct {
     ///
     /// All future operations on the connection pool will deadlock.
     pub fn deinit(pool: *ConnectionPool, allocator: Allocator) void {
-        pool.mutex.lock();
-
         var next = pool.free.first;
         while (next) |node| {
             defer allocator.destroy(node);
             next = node.next;
 
-            // TODO: close connection
-            // node.data.close(allocator);
+            node.data.close();
         }
 
         next = pool.used.first;
@@ -1164,8 +1154,7 @@ pub const ConnectionPool = struct {
             defer allocator.destroy(node);
             next = node.next;
 
-            // TODO: close connection
-            // node.data.close(allocator);
+            node.data.close();
         }
 
         pool.* = undefined;
@@ -1205,7 +1194,6 @@ pub fn open(
 
     const req = try arena.create(Request);
 
-    var server_header: std.heap.FixedBufferAllocator = .init(options.server_header_buffer);
     const protocol, const valid_uri = try validateUri(uri, arena);
 
     const connection = options.connection orelse
@@ -1214,7 +1202,7 @@ pub fn open(
     connection.request = req;
 
     req.* = .{
-        .arena = req.arena,
+        .arena = arena,
         .ptr = ptr,
         .callback = callback,
         .uri = valid_uri,
@@ -1226,18 +1214,25 @@ pub fn open(
         .transfer_encoding = .none,
         .redirect_behavior = options.redirect_behavior,
         .handle_continue = options.handle_continue,
-        .response = .{
-            .version = undefined,
-            .status = undefined,
-            .reason = undefined,
-            .keep_alive = undefined,
-            .parser = .init(server_header.buffer[server_header.end_index..]),
-        },
+        .response = .{ .bytes = .empty },
         .headers = options.headers,
         .extra_headers = options.extra_headers,
         .privileged_headers = options.privileged_headers,
     };
     errdefer req.deinit();
+
+    if (connection.state == .idle) {
+        connection.state = .send_request;
+        try Connection.onTaskCompletion(connection, ring, 0, .noop);
+        // Rearm our recv task
+        _ = try ring.recv(
+            connection.fd,
+            &connection.recv_buf,
+            connection,
+            0,
+            Connection.onTaskCompletion,
+        );
+    }
 
     return req;
 }
@@ -1285,6 +1280,92 @@ pub const RequestOptions = struct {
     privileged_headers: []const http.Header = &.{},
 };
 
+pub const Response = struct {
+    /// The raw bytes of the response
+    bytes: std.ArrayListUnmanaged(u8) = .empty,
+
+    // add the slice to the internal buffer
+    pub fn appendSlice(self: *Response, gpa: Allocator, bytes: []const u8) !void {
+        try self.bytes.appendSlice(gpa, bytes);
+    }
+
+    /// iterates over headers and trailers
+    pub fn headerIterator(self: Response) HeaderIterator {
+        assert(self.receivedHeader());
+        return .init(self.bytes.items);
+    }
+
+    pub fn headLen(self: Response) ?usize {
+        const idx = std.mem.indexOf(
+            u8,
+            self.bytes.items,
+            "\r\n" ++ "\r\n",
+        ) orelse return null;
+
+        return idx + 4;
+    }
+
+    /// Returns true if we have received the full header
+    pub fn receivedHeader(self: Response) bool {
+        return self.headLen() != null;
+    }
+
+    /// Returns the body of the request. Null indicates there is a body and we haven't read the
+    /// entirety of it. An empty string indicates the request has no body and is not expecting one
+    pub fn body(self: Response) ?[]const u8 {
+        const head_len = self.headLen() orelse return null;
+
+        const cl = self.contentLength() orelse {
+            // TODO: we need to also check for chunked transfer encoding
+            return "";
+        };
+
+        if (cl + head_len == self.bytes.items.len) return self.bytes.items[head_len..];
+
+        return null;
+    }
+
+    pub fn getHeader(self: Response, key: []const u8) ?[]const u8 {
+        var iter = self.headerIterator();
+        while (iter.next()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, key)) return header.value;
+        }
+        return null;
+    }
+
+    pub fn contentLength(self: Response) ?u64 {
+        const value = self.getHeader("Content-Length") orelse return null;
+        return std.fmt.parseUnsigned(u64, value, 10) catch @panic("TODO: bad content length");
+    }
+};
+
+pub const HeaderIterator = struct {
+    iter: std.mem.SplitIterator(u8, .sequence),
+
+    pub fn init(bytes: []const u8) HeaderIterator {
+        var iter = std.mem.splitSequence(u8, bytes, "\r\n");
+        // Throw away the first line
+        _ = iter.first();
+        return .{ .iter = iter };
+    }
+
+    pub fn next(self: *HeaderIterator) ?std.http.Header {
+        const line = self.iter.next() orelse return null;
+        if (line.len == 0) {
+            // When we get to the first empty line we are done
+            self.iter.index = self.iter.buffer.len;
+            return null;
+        }
+        var kv_iter = std.mem.splitScalar(u8, line, ':');
+        const name = kv_iter.first();
+        const value = kv_iter.rest();
+        return .{
+            .name = name,
+            .value = std.mem.trim(u8, value, " \t"),
+        };
+    }
+};
+
 test "client: handshake" {
     var ring = try io.Ring.init(std.testing.allocator, 8);
     defer ring.deinit();
@@ -1311,5 +1392,6 @@ test "client: handshake" {
 }
 
 fn testFetchCallback(request: *Request) anyerror!void {
-    _ = request;
+    log.err("headers={?s}", .{request.response.bytes.items[0..request.response.headLen().?]});
+    log.err("body={?s}", .{request.response.body()});
 }
