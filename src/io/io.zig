@@ -58,6 +58,7 @@ pub const Op = enum {
 
     userfd,
     usermsg,
+    userptr,
 };
 
 pub const Request = union(Op) {
@@ -104,6 +105,7 @@ pub const Request = union(Op) {
 
     userfd,
     usermsg,
+    userptr,
 };
 
 pub const Result = union(Op) {
@@ -123,6 +125,7 @@ pub const Result = union(Op) {
 
     userfd: anyerror!posix.fd_t,
     usermsg: u16,
+    userptr: anyerror!?*anyopaque,
 };
 
 pub const ResultError = error{

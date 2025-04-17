@@ -191,7 +191,7 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
             .usermsg => .{ .usermsg = @intCast(cqe.res) },
 
             // userfd should never reach the runtime
-            .userfd => unreachable,
+            .userfd, .userptr => unreachable,
         };
 
         if (cqe.flags & msg_ring_received_cqe != 0) {
@@ -365,7 +365,7 @@ pub fn prepTask(self: *Uring, task: *io.Task) void {
         },
 
         // user* is only sent internally between rings and higher level wrappers
-        .userfd, .usermsg => unreachable,
+        .userfd, .usermsg, .userptr => unreachable,
     }
 }
 
