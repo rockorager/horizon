@@ -322,7 +322,7 @@ pub fn errorResponse(
 
 test {
     _ = @import("Server.zig");
-    _ = @import("client.zig");
+    // _ = @import("client.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
 }

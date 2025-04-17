@@ -160,7 +160,6 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
         .shutdown => {
             var buf: [8]u8 = undefined;
             _ = posix.read(self.stop_pipe[0], &buf) catch 0;
-            self.state = .closing;
 
             // Set our shutdown timer
             self.shutdown_timer = try rt.timer(
@@ -175,7 +174,7 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
                 target_task.* = .{
                     .userdata = &self.worker,
                     .msg = @intFromEnum(Worker.Msg.shutdown),
-                    .callback = Worker.onTaskCompletion,
+                    .callback = Worker.handleMsg,
                     .req = .usermsg,
                 };
 
@@ -195,7 +194,7 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
                 target_task.* = .{
                     .userdata = worker,
                     .msg = @intFromEnum(Worker.Msg.shutdown),
-                    .callback = Worker.onTaskCompletion,
+                    .callback = Worker.handleMsg,
                     .req = .usermsg,
                 };
 
@@ -259,8 +258,8 @@ pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !
         self.worker.accept_task = try self.worker.ring.accept(
             self.worker.fd,
             &self.worker,
-            0,
-            Worker.onTaskCompletion,
+            @intFromEnum(Worker.Msg.new_connection),
+            Worker.handleMsg,
         );
 
         var sock_len = self.addr.getOsSockLen();
@@ -269,7 +268,6 @@ pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !
         try self.worker.ring.submit();
     }
 
-    self.state = .accepting;
     for (self.workers, 0..) |*worker, i| {
         worker.* = try .init(self.gpa, self.timeout, handler, self.addr, self);
 
@@ -341,7 +339,12 @@ const Worker = struct {
     };
 
     const Msg = enum {
+        new_connection,
         shutdown,
+
+        fn fromInt(v: u16) Worker.Msg {
+            return @enumFromInt(v);
+        }
     };
 
     fn init(
@@ -378,7 +381,12 @@ const Worker = struct {
     fn run(self: *Worker, main: *io.Runtime) !void {
         self.ring = try main.initChild(64);
         try posix.listen(self.fd, 64);
-        self.accept_task = try self.ring.accept(self.fd, self, 0, Worker.onTaskCompletion);
+        self.accept_task = try self.ring.accept(
+            self.fd,
+            self,
+            @intFromEnum(Worker.Msg.new_connection),
+            Worker.handleMsg,
+        );
 
         try self.ring.run(.until_done);
     }
@@ -388,46 +396,27 @@ const Worker = struct {
         self.ring.deinit();
     }
 
-    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
+    fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
         const self = io.ptrCast(Worker, ptr);
-        state: switch (self.state) {
-            .running => {
-                switch (result) {
-                    .accept => {
-                        const fd = result.accept catch |err| {
-                            log.err("accept error: {}", .{err});
-                            return;
-                        };
-                        const conn = try self.conn_pool.create(self.gpa);
+        switch (Worker.Msg.fromInt(msg)) {
+            .new_connection => {
+                const fd = result.accept catch |err| {
+                    switch (err) {
+                        error.Canceled => {},
+                        else => log.err("accept error: {}", .{err}),
+                    }
+                    return;
+                };
+                const conn = try self.conn_pool.create(self.gpa);
 
-                        try conn.init(self.gpa, self, fd);
-                    },
-
-                    .usermsg => |v| {
-                        const msg: UserMsg = @enumFromInt(v);
-                        switch (msg) {
-                            .quit => {
-                                ring.run_cond = .until_done;
-                                self.state = .shutting_down;
-                                _ = try self.accept_task.cancel(ring, self, 0, Worker.onTaskCompletion);
-                                continue :state .shutting_down;
-                            },
-
-                            else => unreachable,
-                        }
-                    },
-
-                    .cancel => {},
-
-                    else => unreachable,
-                }
+                try conn.init(self.gpa, self, fd);
             },
 
-            .shutting_down => {
+            .shutdown => {
+                self.state = .shutting_down;
+                _ = try self.accept_task.cancel(rt, null, 0, io.noopCallback);
                 try self.maybeClose();
             },
-
-            .done => {},
         }
     }
 
@@ -821,7 +810,7 @@ test "server" {
 
     var server: Server = undefined;
 
-    try server.init(gpa, .{ .workers = 0, .shutdown_timeout = 2 });
+    try server.init(gpa, .{ .workers = 1, .shutdown_timeout = 2 });
     defer server.deinit(gpa);
 
     const TestHandler = struct {

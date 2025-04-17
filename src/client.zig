@@ -73,7 +73,7 @@ pub const Client = struct {
     pub fn fetch(
         self: *Client,
         arena: Allocator,
-        ring: *io.Ring,
+        ring: *io.Runtime,
         options: FetchOptions,
         userdata: ?*anyopaque,
         callback: *const fn (*Request) anyerror!void,
@@ -109,7 +109,7 @@ pub const Client = struct {
         host: []const u8,
         port: u16,
         protocol: Connection.Protocol,
-        ring: *io.Ring,
+        ring: *io.Runtime,
     ) !*Connection {
         if (self.connection_pool.findConnection(.{
             .host = host,
@@ -184,7 +184,7 @@ pub const Connection = struct {
         port: u16,
         protocol: Connection.Protocol,
         bundle: CertBundle,
-        ioring: *io.Ring,
+        ioring: *io.Runtime,
     ) !void {
         const list = try std.net.getAddressList(gpa, host, port);
         defer list.deinit();
@@ -223,7 +223,7 @@ pub const Connection = struct {
 
     fn onTaskCompletion(
         ptr: ?*anyopaque,
-        ring: *io.Ring,
+        ring: *io.Runtime,
         _: u16,
         result: io.Result,
     ) anyerror!void {
@@ -1178,7 +1178,7 @@ pub fn open(
     options: RequestOptions,
     ptr: ?*anyopaque,
     callback: *const fn (*Request) anyerror!void,
-    ring: *io.Ring,
+    ring: *io.Runtime,
 ) !*Request {
     for (options.extra_headers) |header| {
         assert(header.name.len != 0);
@@ -1367,7 +1367,7 @@ pub const HeaderIterator = struct {
 };
 
 test "client: handshake" {
-    var ring = try io.Ring.init(std.testing.allocator, 8);
+    var ring = try io.Runtime.init(std.testing.allocator, 8);
     defer ring.deinit();
 
     var client: Client = try .init(std.testing.allocator);
