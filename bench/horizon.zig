@@ -15,7 +15,7 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var ring = try io.Ring.init(gpa, 64);
+    var ring = try io.Runtime.init(gpa, 64);
     defer ring.deinit();
 
     var server: horizon.Server = undefined;
@@ -30,6 +30,11 @@ pub fn main() !void {
     try ring.run(.until_done);
 }
 
+const Foo = struct {
+    w: horizon.ResponseWriter,
+    count: u8 = 0,
+};
+
 const MyHandler = struct {
     fn handler(self: *MyHandler) horizon.Handler {
         // Not much magic here. If your type has a servHttp method, this is a helper to make the
@@ -39,7 +44,7 @@ const MyHandler = struct {
 
     pub fn serveHttp(_: *anyopaque, _: *horizon.Context, w: horizon.ResponseWriter, _: horizon.Request) anyerror!void {
         try w.any().print("hello, world", .{});
-        return w.flush();
+        try w.flush();
     }
 };
 

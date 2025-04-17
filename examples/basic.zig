@@ -15,7 +15,7 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var ring = try io.Ring.init(gpa, 64);
+    var ring = try io.Runtime.init(gpa, 64);
     defer ring.deinit();
 
     var server: horizon.Server = undefined;

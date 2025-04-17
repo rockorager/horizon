@@ -29,7 +29,7 @@ shutdown_timeout: u8,
 
 state: State = .init,
 
-ring: *io.Ring,
+ring: *io.Runtime,
 
 exited_workers: u16 = 0,
 
@@ -113,7 +113,7 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
     };
 }
 
-fn mainLoopTick(ptr: ?*anyopaque, ring: *io.Ring, msg: u16, result: io.Result) anyerror!void {
+fn mainLoopTick(ptr: ?*anyopaque, ring: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
     _ = msg;
     _ = result.poll catch |err| {
         switch (err) {
@@ -151,7 +151,7 @@ fn mainLoopTick(ptr: ?*anyopaque, ring: *io.Ring, msg: u16, result: io.Result) a
     try self.worker.ring.submit();
 }
 
-pub fn listenAndServe(self: *Server, ioring: *io.Ring, handler: hz.Handler) !void {
+pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !void {
     self.ring = ioring;
 
     {
@@ -210,7 +210,7 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
     gpa.free(self.threads);
 }
 
-fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
     const self = io.ptrCast(Server, ptr);
     switch (self.state) {
         .init => unreachable,
@@ -327,7 +327,7 @@ fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result)
     try self.worker.ring.submit();
 }
 
-fn onMsgRing(_: ?*anyopaque, _: *io.Ring, _: u16, result: io.Result) anyerror!void {
+fn onMsgRing(_: ?*anyopaque, _: *io.Runtime, _: u16, result: io.Result) anyerror!void {
     assert(result == .msg_ring);
     _ = result.msg_ring catch |err| {
         log.err("msg_ring error: {}", .{err});
@@ -340,7 +340,7 @@ pub fn stop(self: *Server) !void {
 
 const Worker = struct {
     gpa: Allocator,
-    ring: io.Ring,
+    ring: io.Runtime,
     conn_pool: MemoryPool(Connection),
     state: Worker.State,
     timeout: Timeouts,
@@ -391,7 +391,7 @@ const Worker = struct {
         };
     }
 
-    fn run(self: *Worker, main: *io.Ring) !void {
+    fn run(self: *Worker, main: *io.Runtime) !void {
         self.ring = try main.initChild(64);
         try posix.listen(self.fd, 64);
         self.accept_task = try self.ring.accept(self.fd, self, 0, Worker.onTaskCompletion);
@@ -404,7 +404,7 @@ const Worker = struct {
         self.ring.deinit();
     }
 
-    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
         const self = io.ptrCast(Worker, ptr);
         state: switch (self.state) {
             .running => {
@@ -538,7 +538,7 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
-    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Ring, _: u16, result: io.Result) anyerror!void {
+    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
         const self = io.ptrCast(Connection, ptr);
         state: switch (self.state) {
             .init => unreachable,
@@ -832,7 +832,7 @@ const UserMsg = enum(u16) {
 
 test "server" {
     const gpa = std.testing.allocator;
-    var ring = try io.Ring.init(gpa, 8);
+    var ring = try io.Runtime.init(gpa, 8);
     defer ring.deinit();
 
     var server: Server = undefined;

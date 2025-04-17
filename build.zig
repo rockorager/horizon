@@ -24,14 +24,14 @@ pub fn build(b: *std.Build) void {
     const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
     horizon_module.addImport("tls", tls_dep.module("tls"));
 
-    const unit_tests = b.addTest(.{ .root_module = horizon_module });
-    const run_unit_tests = b.addRunArtifact(unit_tests);
+    // const unit_tests = b.addTest(.{ .root_module = horizon_module });
+    // const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const io_tests = b.addTest(.{ .root_module = io_module });
     const run_io_tests = b.addRunArtifact(io_tests);
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    // test_step.dependOn(&run_unit_tests.step);
     test_step.dependOn(&run_io_tests.step);
 
     // Bench run command

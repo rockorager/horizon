@@ -4,7 +4,7 @@ const std = @import("std");
 const io = @import("io.zig");
 
 const Allocator = std.mem.Allocator;
-const Ring = io.Ring;
+const Runtime = io.Runtime;
 
 userdata: ?*anyopaque,
 msg: u16,
@@ -28,11 +28,11 @@ next: ?*Task = null,
 
 pub fn setDeadline(
     self: *Task,
-    ring: *Ring,
+    rt: *Runtime,
     deadline: io.Timespec,
 ) Allocator.Error!void {
     std.debug.assert(!deadline.isZero());
-    const task = try ring.getTask();
+    const task = try rt.getTask();
 
     task.* = .{
         .callback = io.noopCallback,
@@ -46,17 +46,17 @@ pub fn setDeadline(
 
 pub fn cancel(
     self: *Task,
-    ring: *Ring,
+    rt: *Runtime,
     userdata: ?*anyopaque,
     msg: u16,
     callback: io.Callback,
 ) Allocator.Error!void {
-    const task = try ring.getTask();
+    const task = try rt.getTask();
     task.* = .{
         .callback = callback,
         .msg = msg,
         .userdata = userdata,
         .req = .{ .cancel = .{ .task = self } },
     };
-    ring.work_queue.push(task);
+    rt.work_queue.push(task);
 }

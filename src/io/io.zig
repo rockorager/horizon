@@ -4,8 +4,8 @@ const builtin = @import("builtin");
 const posix = std.posix;
 
 pub const Task = @import("Task.zig");
-pub const Callback = *const fn (?*anyopaque, *Ring, u16, Result) anyerror!void;
-pub fn noopCallback(_: ?*anyopaque, _: *Ring, _: u16, _: Result) anyerror!void {}
+pub const Callback = *const fn (?*anyopaque, *Runtime, u16, Result) anyerror!void;
+pub fn noopCallback(_: ?*anyopaque, _: *Runtime, _: u16, _: Result) anyerror!void {}
 
 pub fn ptrCast(comptime T: type, ptr: ?*anyopaque) *T {
     return @ptrCast(@alignCast(ptr));
@@ -28,7 +28,7 @@ pub const Timespec = extern struct {
     }
 };
 
-pub const Ring = switch (builtin.os.tag) {
+pub const Runtime = switch (builtin.os.tag) {
     .dragonfly,
     .freebsd,
     .macos,
@@ -56,6 +56,7 @@ pub const Op = enum {
     socket,
     connect,
 
+    userfd,
     usermsg,
 };
 
@@ -69,7 +70,7 @@ pub const Request = union(Op) {
     },
     accept: posix.fd_t,
     msg_ring: struct {
-        target: *const Ring,
+        target: *const Runtime,
         result: u16,
         task: *Task,
     },
@@ -101,6 +102,7 @@ pub const Request = union(Op) {
         addr_len: posix.socklen_t,
     },
 
+    userfd,
     usermsg,
 };
 
@@ -119,6 +121,7 @@ pub const Result = union(Op) {
     socket: ResultError!posix.fd_t,
     connect: ResultError!void,
 
+    userfd: anyerror!posix.fd_t,
     usermsg: u16,
 };
 
@@ -146,4 +149,5 @@ pub const RecvError = ResultError || error{
 test {
     _ = @import("queue.zig");
     _ = @import("Uring.zig");
+    _ = @import("net.zig");
 }

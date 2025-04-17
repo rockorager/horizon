@@ -189,6 +189,9 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
             } },
 
             .usermsg => .{ .usermsg = @intCast(cqe.res) },
+
+            // userfd should never reach the runtime
+            .userfd => unreachable,
         };
 
         if (cqe.flags & msg_ring_received_cqe != 0) {
@@ -361,8 +364,8 @@ pub fn prepTask(self: *Uring, task: *io.Task) void {
             self.prepDeadline(task, sqe);
         },
 
-        // usermsg is only ever sent from one ring to another. There is nothing to prepare
-        .usermsg => unreachable,
+        // user* is only sent internally between rings and higher level wrappers
+        .userfd, .usermsg => unreachable,
     }
 }
 
@@ -661,7 +664,7 @@ fn unexpectedError(err: posix.E) posix.UnexpectedError {
 const Foo = struct {
     bar: usize = 0,
 
-    fn callback(ptr: ?*anyopaque, _: *io.Ring, _: u16, _: io.Result) anyerror!void {
+    fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
         const self = io.ptrCast(@This(), ptr);
         self.bar += 1;
     }

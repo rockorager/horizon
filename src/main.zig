@@ -35,9 +35,7 @@ pub const Context = struct {
     /// the underlying Connection, meaning users may store a these and perform additional async
     /// tasks before calling ctx.sendResponse. Eg, fetching external data from an API, performing a
     /// DB query asynchronously, etc
-    ring: *io.Ring,
-
-    client: *client.Client,
+    ring: *io.Runtime,
 
     pub fn expired(self: Context) bool {
         if (self.deadline == 0) return false;
