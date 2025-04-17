@@ -324,6 +324,8 @@ const Worker = struct {
     timeout: Timeouts,
     handler: hz.Handler,
 
+    shutting_down: bool = false,
+
     fd: posix.socket_t,
     accept_task: *io.Task,
     server: *Server,
@@ -499,7 +501,13 @@ pub const Connection = struct {
             .ring = &worker.ring,
         };
 
-        const task = try worker.ring.recv(fd, &self.buf, self, 0, Connection.onTaskCompletion);
+        const task = try worker.ring.recv(
+            fd,
+            &self.buf,
+            self,
+            @intFromEnum(Connection.Msg.reading_headers),
+            Connection.handleMsg,
+        );
         if (worker.timeout.read_header > 0) {
             try task.setDeadline(&worker.ring, .{ .sec = self.deadline });
         }
@@ -511,11 +519,21 @@ pub const Connection = struct {
         self.* = undefined;
     }
 
-    fn onTaskCompletion(ptr: ?*anyopaque, ring: *io.Runtime, _: u16, result: io.Result) anyerror!void {
-        const self = io.ptrCast(Connection, ptr);
-        state: switch (self.state) {
-            .init => unreachable,
+    const Msg = enum {
+        reading_headers,
+        reading_body,
+        write_response,
+        close,
+        destroy,
 
+        fn fromInt(v: u16) Connection.Msg {
+            return @enumFromInt(v);
+        }
+    };
+
+    fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
+        const self = io.ptrCast(Connection, ptr);
+        state: switch (Connection.Msg.fromInt(msg)) {
             .reading_headers => {
                 assert(result == .recv);
 
@@ -526,38 +544,34 @@ pub const Connection = struct {
 
                 switch (self.request.receivedHeader()) {
                     // When we receive the full header, we pass it to the handler
-                    true => continue :state .handling_request,
+                    true => {
+                        // Keep the worker alive since we are now handling this request
+                        self.worker.keep_alive += 1;
+
+                        // validate the request
+                        if (try self.request.isValid(self.response.responseWriter())) {
+                            // Call the handler
+                            try self.worker.handler.serveHttp(
+                                &self.ctx,
+                                self.response.responseWriter(),
+                                self.request,
+                            );
+                        }
+                    },
 
                     false => {
                         // We haven't received a full HEAD. prep another recv
-                        const new_task = try ring.recv(
+                        const new_task = try rt.recv(
                             self.fd,
                             &self.buf,
                             self,
-                            0,
-                            Connection.onTaskCompletion,
+                            @intFromEnum(Connection.Msg.reading_headers),
+                            Connection.handleMsg,
                         );
                         if (self.worker.timeout.read_header > 0) {
-                            try new_task.setDeadline(ring, .{ .nsec = self.deadline });
+                            try new_task.setDeadline(rt, .{ .sec = self.deadline });
                         }
                     },
-                }
-            },
-
-            .handling_request => {
-                self.state = .handling_request;
-
-                // Keep the worker alive since we are now handling this request
-                self.worker.keep_alive += 1;
-
-                // validate the request
-                if (try self.request.isValid(self.response.responseWriter())) {
-                    // Call the handler
-                    try self.worker.handler.serveHttp(
-                        &self.ctx,
-                        self.response.responseWriter(),
-                        self.request,
-                    );
                 }
             },
 
@@ -572,7 +586,7 @@ pub const Connection = struct {
                 try self.readBody();
             },
 
-            .waiting_send_response => {
+            .write_response => {
                 assert(result == .write or result == .writev);
                 const n = switch (result) {
                     .write => result.write catch {
@@ -602,29 +616,31 @@ pub const Connection = struct {
                     continue :state .close;
                 }
 
-                continue :state .idle;
-            },
-
-            .idle => {
-                // We'll go back to init state after reinitializing state
-                defer self.state = .reading_headers;
-
+                // Keep the connection alive
                 self.reset();
-
-                const new_task = try ring.recv(self.fd, &self.buf, self, 0, Connection.onTaskCompletion);
-                // prep another recv
+                const new_task = try rt.recv(
+                    self.fd,
+                    &self.buf,
+                    self,
+                    @intFromEnum(Connection.Msg.reading_headers),
+                    Connection.handleMsg,
+                );
                 if (self.worker.timeout.idle > 0) {
                     self.deadline = std.time.timestamp() + self.worker.timeout.idle;
-                    try new_task.setDeadline(ring, .{ .sec = self.deadline });
+                    try new_task.setDeadline(rt, .{ .sec = self.deadline });
                 }
             },
 
             .close => {
-                self.state = .waiting_for_destruction;
-                _ = try ring.close(self.fd, self, 0, Connection.onTaskCompletion);
+                _ = try rt.close(
+                    self.fd,
+                    self,
+                    @intFromEnum(Connection.Msg.destroy),
+                    Connection.handleMsg,
+                );
             },
 
-            .waiting_for_destruction => {
+            .destroy => {
                 assert(result == .close);
                 _ = result.close catch |err| {
                     log.err("close error: {}", .{err});
@@ -705,7 +721,13 @@ pub const Connection = struct {
 
         self.state = .reading_body;
 
-        _ = try self.worker.ring.recv(self.fd, &self.buf, self, 0, Connection.onTaskCompletion);
+        _ = try self.worker.ring.recv(
+            self.fd,
+            &self.buf,
+            self,
+            @intFromEnum(Connection.Msg.reading_body),
+            Connection.handleMsg,
+        );
     }
 
     pub fn prepareResponse(self: *Connection) !void {
@@ -741,8 +763,8 @@ pub const Connection = struct {
                 self.fd,
                 headers[self.written..],
                 self,
-                0,
-                Connection.onTaskCompletion,
+                @intFromEnum(Connection.Msg.write_response),
+                Connection.handleMsg,
             ),
 
             .headers_and_body => blk: {
@@ -760,8 +782,8 @@ pub const Connection = struct {
                     self.fd,
                     &self.vecs,
                     self,
-                    0,
-                    Connection.onTaskCompletion,
+                    @intFromEnum(Connection.Msg.write_response),
+                    Connection.handleMsg,
                 );
             },
 
@@ -772,8 +794,8 @@ pub const Connection = struct {
                     self.fd,
                     unwritten_body,
                     self,
-                    0,
-                    Connection.onTaskCompletion,
+                    @intFromEnum(Connection.Msg.write_response),
+                    Connection.handleMsg,
                 );
             },
         };
