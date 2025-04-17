@@ -248,12 +248,12 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
     try self.worker.ring.submit();
 }
 
-pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !void {
-    self.ring = ioring;
+pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void {
+    self.ring = rt;
 
     {
         self.worker = try .init(self.gpa, self.timeout, handler, self.addr, self);
-        self.worker.ring = try ioring.initChild(64);
+        self.worker.ring = try rt.initChild(64);
         try posix.listen(self.worker.fd, 64);
         self.worker.accept_task = try self.worker.ring.accept(
             self.worker.fd,
@@ -274,22 +274,22 @@ pub fn listenAndServe(self: *Server, ioring: *io.Runtime, handler: hz.Handler) !
         self.threads[i] = try std.Thread.spawn(
             .{},
             Worker.run,
-            .{ worker, ioring },
+            .{ worker, rt },
         );
     }
     // The main server ring needs a callback from the main ioring
-    self.poll_task = try ioring.poll(
+    self.poll_task = try rt.poll(
         try self.worker.ring.pollableFd(),
         posix.POLL.IN,
         self,
-        @intFromEnum(Msg.main_worker_ready),
+        @intFromEnum(Server.Msg.main_worker_ready),
         handleMsg,
     );
-    _ = try ioring.poll(
+    _ = try rt.poll(
         self.stop_pipe[0],
         posix.POLL.IN,
         self,
-        @intFromEnum(Msg.shutdown),
+        @intFromEnum(Server.Msg.shutdown),
         handleMsg,
     );
 }
