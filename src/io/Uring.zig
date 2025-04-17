@@ -381,16 +381,6 @@ fn prepDeadline(self: *Uring, parent_task: *io.Task, parent_sqe: *linux.io_uring
     sqe.user_data = @intFromPtr(task);
 }
 
-pub fn nextCompletion(self: *Uring) ?linux.io_uring_cqe {
-    const ready = self.ring.cq_ready();
-    if (ready == 0) return null;
-    const head = self.ring.cq.head.* & self.ring.cq.mask;
-    const cqe = self.ring.cq.cqes[head];
-    self.ring.cq_advance(1);
-
-    return cqe;
-}
-
 /// Get an sqe from the ring. Caller should only call this function if they are sure we have an SQE
 /// available. Asserts that we have one available
 fn getSqe(self: *Uring) *linux.io_uring_sqe {
