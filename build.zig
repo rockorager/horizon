@@ -10,11 +10,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const use_mock_io = b.option(
+        bool,
+        "use_mock_io",
+        "Use a mocked IO runtime (default=false)",
+    ) orelse false;
+    const io_test_options = b.addOptions();
+    io_test_options.addOption(bool, "use_mock_io", use_mock_io);
+
     const io_module = b.addModule("io", .{
         .root_source_file = b.path("src/io/io.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    io_module.addOptions("test_options", io_test_options);
 
     horizon_module.addImport("io", io_module);
 
@@ -26,12 +36,13 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = horizon_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    const hz_test_step = b.step("test-horizon", "Run horizon unit tests");
+    hz_test_step.dependOn(&run_unit_tests.step);
 
     const io_tests = b.addTest(.{ .root_module = io_module });
     const run_io_tests = b.addRunArtifact(io_tests);
 
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    const test_step = b.step("test-io", "Run io unit tests");
     test_step.dependOn(&run_io_tests.step);
 
     // Bench run command

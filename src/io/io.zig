@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const test_options = @import("test_options");
+const use_mock_io = test_options.use_mock_io;
 
 const posix = std.posix;
 
@@ -28,7 +30,9 @@ pub const Timespec = extern struct {
     }
 };
 
-pub const Runtime = switch (builtin.os.tag) {
+pub const Runtime = if (use_mock_io)
+    @import("MockRuntime.zig")
+else switch (builtin.os.tag) {
     .dragonfly,
     .freebsd,
     .macos,
@@ -150,7 +154,9 @@ pub const RecvError = ResultError || error{
 };
 
 test {
-    _ = @import("queue.zig");
-    _ = @import("Uring.zig");
     _ = @import("net.zig");
+    _ = @import("queue.zig");
+
+    _ = @import("MockRuntime.zig");
+    _ = @import("Uring.zig");
 }
