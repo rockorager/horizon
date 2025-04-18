@@ -113,8 +113,6 @@ pub fn submitAndWait(_: *MockRuntime) !void {}
 
 pub fn submit(_: *MockRuntime) !void {}
 
-pub fn prepTask(_: *MockRuntime, _: *io.Task) void {}
-
 pub fn getTask(self: *MockRuntime) Allocator.Error!*io.Task {
     return self.free_list.pop() orelse try self.gpa.create(io.Task);
 }

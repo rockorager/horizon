@@ -19,6 +19,9 @@ state: enum {
     /// completions, so it is possible to receive a task in Callback and the task is still
     /// considered to be in flight
     in_flight,
+
+    /// The operation was canceled
+    canceled,
 } = .free,
 
 /// Deadline for the task to complete, in absolute time. If 0, there is no deadline
@@ -51,6 +54,7 @@ pub fn cancel(
     msg: u16,
     callback: io.Callback,
 ) Allocator.Error!void {
+    self.state = .canceled;
     const task = try rt.getTask();
     task.* = .{
         .callback = callback,

@@ -36,10 +36,14 @@ pub const Runtime = if (use_mock_io)
 else switch (builtin.os.tag) {
     .dragonfly,
     .freebsd,
+    .ios,
     .macos,
     .netbsd,
     .openbsd,
-    => @compileError("kqueue backend coming soon"),
+    .tvos,
+    .visionos,
+    .watchos,
+    => @import("Kqueue.zig"),
 
     .linux => @import("Uring.zig"),
 
@@ -158,6 +162,7 @@ test {
     _ = @import("net.zig");
     _ = @import("queue.zig");
 
+    _ = @import("Kqueue.zig");
     _ = @import("MockRuntime.zig");
     _ = @import("Uring.zig");
 }

@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
 
     const io_tests = b.addTest(.{ .root_module = io_module });
     const run_io_tests = b.addRunArtifact(io_tests);
+    run_io_tests.skip_foreign_checks = true;
 
     const test_step = b.step("test-io", "Run io unit tests");
     test_step.dependOn(&run_io_tests.step);

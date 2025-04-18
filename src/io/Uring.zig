@@ -96,6 +96,16 @@ pub fn pollableFd(self: *Uring) !posix.fd_t {
     return fd;
 }
 
+pub fn workQueueSize(self: Uring) usize {
+    var count: usize = 0;
+    var maybe_task: ?*io.Task = self.work_queue.head;
+    while (maybe_task) |task| {
+        count += 1;
+        maybe_task = task.next;
+    }
+    return count;
+}
+
 pub fn reapCompletions(self: *Uring) anyerror!void {
     var cqes: [64]linux.io_uring_cqe = undefined;
     const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
@@ -273,7 +283,7 @@ fn sqesAvailable(self: *Uring) u32 {
     return @intCast(self.ring.sq.sqes.len - self.ring.sq_ready());
 }
 
-pub fn prepTask(self: *Uring, task: *io.Task) void {
+fn prepTask(self: *Uring, task: *io.Task) void {
     switch (task.req) {
         .noop => {
             const sqe = self.getSqe();
