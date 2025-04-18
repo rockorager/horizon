@@ -15,7 +15,7 @@ gpa: Allocator,
 free_list: Queue(io.Task, .free) = .{},
 work_queue: Queue(io.Task, .in_flight) = .{},
 inflight: usize = 0,
-run_cond: io.RunCondition,
+run_cond: io.RunCondition = .until_done,
 
 accept_cb: ?*const fn (*io.Task) io.Result = null,
 cancel_cb: ?*const fn (*io.Task) io.Result = null,
@@ -37,10 +37,7 @@ userptr_cb: ?*const fn (*io.Task) io.Result = null,
 
 /// Initialize a Ring
 pub fn init(gpa: Allocator, _: u16) !MockRuntime {
-    return .{
-        .gpa = gpa,
-        .run_cond = .once,
-    };
+    return .{ .gpa = gpa };
 }
 
 pub fn deinit(self: *MockRuntime) void {
