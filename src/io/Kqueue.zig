@@ -170,21 +170,24 @@ pub fn pollableFd(self: Kqueue) !posix.fd_t {
 pub fn reapCompletions(self: *Kqueue) anyerror!void {
     defer self.event_idx = 0;
     for (self.events[0..self.event_idx]) |event| {
-
+        std.log.debug("event={}", .{event});
         // if the event is a USER filter, we check our msg_ring_queue
-        if (event.filter & EVFILT.USER != 0) {
+        if (event.filter == EVFILT.USER) {
             switch (UserMsg.fromInt(event.data)) {
                 .wakeup => {
                     // We got a message in our msg_ring_queue
                     self.msg_ring_mutex.lock();
                     defer self.msg_ring_mutex.unlock();
 
+                    var n: usize = 0;
                     while (self.msg_ring_queue.pop()) |task| {
-                        const result = self.msg_ring_result_queue.orderedRemove(0);
+                        defer n += 1;
+                        const result = self.msg_ring_result_queue.items[n];
                         var ev = event;
                         ev.data = result;
                         try self.handleCompletion(task, ev);
                     }
+                    self.msg_ring_result_queue.replaceRangeAssumeCapacity(0, n, &.{});
                 },
             }
             continue;
@@ -404,6 +407,14 @@ fn waitForCompletions(self: *Kqueue) !void {
             return;
         }
     }
+
+    // We had no timers so we wait indefinitely
+    self.event_idx = try posix.kevent(
+        self.kq,
+        self.submission_queue.items,
+        &self.events,
+        null,
+    );
 }
 
 fn releaseTask(self: *Kqueue, task: *io.Task) void {
@@ -642,17 +653,18 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
 
         .poll => |req| {
             if (req.mask & posix.POLL.IN != 0) {
-                const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ENABLE | EV.CLEAR, task);
+                std.log.debug("prepping poll", .{});
+                const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.CLEAR, task);
                 try self.submission_queue.append(self.gpa, kevent);
             }
             if (req.mask & posix.POLL.OUT != 0) {
-                const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ENABLE | EV.CLEAR, task);
+                const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.CLEAR, task);
                 try self.submission_queue.append(self.gpa, kevent);
             }
         },
 
         .recv => |req| {
-            const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ENABLE | EV.CLEAR, task);
+            const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.CLEAR, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
 
