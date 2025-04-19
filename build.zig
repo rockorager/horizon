@@ -111,13 +111,14 @@ pub fn build(b: *std.Build) void {
     {
         const Examples = enum {
             basic,
+            kqueue,
         };
 
         // Example run commands
         const example = b.option(Examples, "example", "Run an example server") orelse .basic;
         const example_exe = b.addExecutable(.{
             .name = @tagName(example),
-            .root_source_file = b.path("examples/" ++ @tagName(example) ++ ".zig"),
+            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{@tagName(example)})),
             .target = target,
             .optimize = optimize,
         });

@@ -170,7 +170,6 @@ pub fn pollableFd(self: Kqueue) !posix.fd_t {
 pub fn reapCompletions(self: *Kqueue) anyerror!void {
     defer self.event_idx = 0;
     for (self.events[0..self.event_idx]) |event| {
-        std.log.debug("event={}", .{event});
         // if the event is a USER filter, we check our msg_ring_queue
         if (event.filter == EVFILT.USER) {
             switch (UserMsg.fromInt(event.data)) {
@@ -653,7 +652,6 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
 
         .poll => |req| {
             if (req.mask & posix.POLL.IN != 0) {
-                std.log.debug("prepping poll", .{});
                 const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.CLEAR, task);
                 try self.submission_queue.append(self.gpa, kevent);
             }
@@ -1013,8 +1011,6 @@ pub fn connect(
 }
 
 test "kqueue: noop" {
-    std.testing.refAllDecls(@This());
-
     var rt: Kqueue = try .init(std.testing.allocator, 0);
     defer rt.deinit();
 
@@ -1038,8 +1034,6 @@ test "kqueue: noop" {
 }
 
 test "kqueue: timer" {
-    std.testing.refAllDecls(@This());
-
     var rt: Kqueue = try .init(std.testing.allocator, 0);
     defer rt.deinit();
 
@@ -1062,8 +1056,6 @@ test "kqueue: timer" {
 }
 
 test "kqueue: poll" {
-    std.testing.refAllDecls(@This());
-
     var rt: Kqueue = try .init(std.testing.allocator, 0);
     defer rt.deinit();
 
@@ -1082,8 +1074,8 @@ test "kqueue: poll" {
     _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
     try std.testing.expectEqual(1, rt.workQueueSize());
 
-    try rt.submit();
+    _ = try rt.timer(.{ .nsec = 100 * std.time.ns_per_ms }, null, 0, io.noopCallback);
     _ = try posix.write(pipe[1], "io_uring is better");
-    try rt.reapCompletions();
+    try rt.run(.once);
     try std.testing.expectEqual(1, foo.val);
 }
