@@ -2,10 +2,26 @@ const std = @import("std");
 const builtin = @import("builtin");
 const test_options = @import("test_options");
 
+pub const has_kqueue = switch (builtin.os.tag) {
+    .dragonfly,
+    .freebsd,
+    .ios,
+    .macos,
+    .netbsd,
+    .openbsd,
+    .tvos,
+    .visionos,
+    .watchos,
+    => true,
+
+    else => false,
+};
+pub const is_linux = builtin.os.tag == .linux;
+
 const posix = std.posix;
 
 /// True if the io runtime is being mocked. Useful for testing application logic
-pub const use_mock_io = test_options.use_mock_io;
+pub const use_mock = test_options.use_mock_io;
 pub const Task = @import("Task.zig");
 pub const Callback = *const fn (?*anyopaque, *Runtime, u16, Result) anyerror!void;
 pub fn noopCallback(_: ?*anyopaque, _: *Runtime, _: u16, _: Result) anyerror!void {}
@@ -31,7 +47,7 @@ pub const Timespec = extern struct {
     }
 };
 
-pub const Runtime = if (use_mock_io)
+pub const Runtime = if (use_mock)
     @import("MockRuntime.zig")
 else switch (builtin.os.tag) {
     .dragonfly,
@@ -80,7 +96,7 @@ pub const Request = union(Op) {
     },
     accept: posix.fd_t,
     msg_ring: struct {
-        target: *const Runtime,
+        target: *Runtime,
         result: u16,
         task: *Task,
     },
@@ -162,7 +178,11 @@ test {
     _ = @import("net.zig");
     _ = @import("queue.zig");
 
-    _ = @import("Kqueue.zig");
-    _ = @import("MockRuntime.zig");
-    _ = @import("Uring.zig");
+    if (use_mock) {
+        _ = @import("MockRuntime.zig");
+    } else if (is_linux) {
+        _ = @import("Uring.zig");
+    } else if (has_kqueue) {
+        _ = @import("Kqueue.zig");
+    }
 }

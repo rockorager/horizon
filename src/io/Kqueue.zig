@@ -4,20 +4,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const test_options = @import("test_options");
 const use_mock_io = test_options.use_mock_io;
-const has_kqueue = switch (builtin.os.tag) {
-    .dragonfly,
-    .freebsd,
-    .ios,
-    .macos,
-    .netbsd,
-    .openbsd,
-    .tvos,
-    .visionos,
-    .watchos,
-    => true,
-
-    else => false,
-};
 
 const io = @import("io.zig");
 
@@ -29,12 +15,19 @@ const assert = std.debug.assert;
 const posix = std.posix;
 
 gpa: Allocator,
+kq: posix.fd_t,
 /// unused tasks
 free_list: Queue(io.Task, .free) = .{},
 /// Tasks we need to prepare
 work_queue: Queue(io.Task, .in_flight) = .{},
 /// Items we have prepared and waiting to be put into kqueue
 submission_queue: std.ArrayListUnmanaged(posix.Kevent) = .empty,
+
+/// Queue for other kqueue instances to send "completion" tasks to this thread
+msg_ring_queue: Queue(io.Task, .in_flight) = .{},
+msg_ring_result_queue: std.ArrayListUnmanaged(u16) = .empty,
+msg_ring_mutex: std.Thread.Mutex = .{},
+msg_ring_task: ?*io.Task = null,
 
 timers: std.ArrayListUnmanaged(Timer) = .empty,
 
@@ -43,8 +36,6 @@ run_cond: io.RunCondition = .until_done,
 
 events: [128]posix.Kevent = undefined,
 event_idx: usize = 0,
-
-kq: posix.fd_t,
 
 const Timer = union(enum) {
     /// a deadline timer cancels a task if it fires
@@ -94,15 +85,35 @@ const Timer = union(enum) {
     }
 };
 
+const UserMsg = enum {
+    wakeup,
+
+    fn fromInt(v: i64) UserMsg {
+        return @enumFromInt(v);
+    }
+};
+
 /// Initialize a Ring
 pub fn init(gpa: Allocator, _: u16) !Kqueue {
     const kq = try posix.kqueue();
-    return .{ .gpa = gpa, .kq = kq };
+
+    return .{
+        .gpa = gpa,
+        .kq = kq,
+    };
 }
 
 pub fn deinit(self: *Kqueue) void {
     while (self.free_list.pop()) |task| self.gpa.destroy(task);
     while (self.work_queue.pop()) |task| self.gpa.destroy(task);
+    while (self.msg_ring_queue.pop()) |task| self.gpa.destroy(task);
+
+    self.submission_queue.deinit(self.gpa);
+    self.msg_ring_result_queue.deinit(self.gpa);
+    self.timers.deinit(self.gpa);
+    if (self.msg_ring_task) |task| {
+        self.gpa.destroy(task);
+    }
 
     posix.close(self.kq);
     self.* = undefined;
@@ -116,6 +127,20 @@ pub fn initChild(self: Kqueue, entries: u16) !Kqueue {
 
 pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
     self.run_cond = limit;
+
+    if (self.msg_ring_task == null) {
+        self.msg_ring_task = try self.getTask();
+        // Register a user event we can use to wakeup the kqueue
+        var kevent = evSet(
+            @intFromEnum(UserMsg.wakeup),
+            EVFILT.USER,
+            EV.ADD | EV.CLEAR,
+            self.msg_ring_task.?,
+        );
+        kevent.fflags = std.c.NOTE.FFNOP;
+        try self.submission_queue.append(self.gpa, kevent);
+    }
+
     while (true) {
         try self.submitAndWait();
         try self.reapCompletions();
@@ -142,14 +167,31 @@ pub fn pollableFd(self: Kqueue) !posix.fd_t {
     return self.kq;
 }
 
-pub fn msgRingFd(_: Kqueue) posix.fd_t {
-    @panic("TODO");
-}
-
 pub fn reapCompletions(self: *Kqueue) anyerror!void {
     defer self.event_idx = 0;
     for (self.events[0..self.event_idx]) |event| {
-        try self.handleCompletion(event);
+
+        // if the event is a USER filter, we check our msg_ring_queue
+        if (event.filter & EVFILT.USER != 0) {
+            switch (UserMsg.fromInt(event.data)) {
+                .wakeup => {
+                    // We got a message in our msg_ring_queue
+                    self.msg_ring_mutex.lock();
+                    defer self.msg_ring_mutex.unlock();
+
+                    while (self.msg_ring_queue.pop()) |task| {
+                        const result = self.msg_ring_result_queue.orderedRemove(0);
+                        var ev = event;
+                        ev.data = result;
+                        try self.handleCompletion(task, ev);
+                    }
+                },
+            }
+            continue;
+        }
+
+        const task: *io.Task = @ptrFromInt(event.udata);
+        try self.handleCompletion(task, event);
     }
 }
 
@@ -165,8 +207,9 @@ fn unexpectedError(err: posix.E) posix.UnexpectedError {
     return error.Unexpected;
 }
 
-fn handleCompletion(self: *Kqueue, event: posix.Kevent) !void {
-    const task: *io.Task = @ptrFromInt(event.udata);
+fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
+    // If a task was canceled, it's state will not be in_flight. Early return
+    if (task.state != .in_flight) return;
     switch (task.req) {
         .accept => |req| {
             if (event.flags & EV.ERROR != 0) {
@@ -180,7 +223,8 @@ fn handleCompletion(self: *Kqueue, event: posix.Kevent) !void {
             return task.callback(task.userdata, self, task.msg, .{ .accept = fd });
         },
 
-        .cancel => {},
+        // handled synchronously
+        .cancel => unreachable,
 
         // handled synchronously
         .close => unreachable,
@@ -195,9 +239,21 @@ fn handleCompletion(self: *Kqueue, event: posix.Kevent) !void {
             return task.callback(task.userdata, self, task.msg, .{ .connect = {} });
         },
 
-        .deadline => {},
+        // handled separately
+        .deadline => unreachable,
 
-        .msg_ring => {},
+        .msg_ring => |req| {
+            defer self.releaseTask(task);
+
+            req.target.msg_ring_mutex.lock();
+            defer req.target.msg_ring_mutex.unlock();
+            req.target.msg_ring_queue.push(req.task);
+
+            req.target.msg_ring_result_queue.append(req.target.gpa, req.result) catch {
+                // On error we callback msgring parent task
+                try task.callback(task.userdata, self, task.msg, .{ .msg_ring = error.Unexpected });
+            };
+        },
 
         // handled synchronously
         .noop => unreachable,
@@ -225,13 +281,19 @@ fn handleCompletion(self: *Kqueue, event: posix.Kevent) !void {
             return task.callback(task.userdata, self, task.msg, .{ .recv = n });
         },
 
-        // handle synchronously
+        // handled synchronously
         .socket => unreachable,
 
-        .timer => {},
+        // handled separately
+        .timer => unreachable,
 
-        // user* never reaches the runtime
-        .userfd, .usermsg, .userptr => unreachable,
+        .usermsg => {
+            defer self.releaseTask(task);
+            try task.callback(task.userdata, self, task.msg, .{ .usermsg = @intCast(event.data) });
+        },
+
+        // Should never reach the runtime
+        .userfd, .userptr => unreachable,
 
         .write => |req| {
             defer self.releaseTask(task);
@@ -722,7 +784,7 @@ pub fn accept(
 
 pub fn msgRing(
     self: *Kqueue,
-    target: *const Kqueue,
+    target: *Kqueue,
     target_task: *io.Task, // The task that the target ring will receive. The callbacks of
     // this tsak are what will be called when the target receives the message
     result: u16, // We only allow sending a successful result
@@ -898,7 +960,6 @@ pub fn connect(
 }
 
 test "kqueue" {
-    if (!has_kqueue or use_mock_io) return error.SkipZigTest;
     std.testing.refAllDecls(@This());
 
     var rt: Kqueue = try .init(std.testing.allocator, 0);

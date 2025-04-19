@@ -12,9 +12,6 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const posix = std.posix;
 
-const is_linux = builtin.os.tag == .linux;
-const use_mock_io = test_options.use_mock_io;
-
 const common_flags: u32 =
     linux.IORING_SETUP_SUBMIT_ALL | // Keep submitting events even if one had an error
     linux.IORING_SETUP_CLAMP | // Clamp entries to system supported max
@@ -224,7 +221,7 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
 
         // The callback could reschedule the task. So we handle it's state after the callback
         switch (task.state) {
-            .free => {
+            .free, .canceled => {
                 task.* = undefined;
                 // Overcome a nice assertion
                 task.next = null;
@@ -676,8 +673,6 @@ const Foo = struct {
 };
 
 test "uring: inflight" {
-    if (!is_linux or use_mock_io) return error.SkipZigTest;
-
     const gpa = std.testing.allocator;
     var ring: Uring = try .init(gpa, 16);
     defer ring.deinit();
@@ -695,8 +690,6 @@ test "uring: inflight" {
 }
 
 test "uring: deadline doesn't call user callback" {
-    if (!is_linux or use_mock_io) return error.SkipZigTest;
-
     const gpa = std.testing.allocator;
     var ring: Uring = try .init(gpa, 16);
     defer ring.deinit();
@@ -712,8 +705,6 @@ test "uring: deadline doesn't call user callback" {
 }
 
 test "uring: timeout" {
-    if (!is_linux or use_mock_io) return error.SkipZigTest;
-
     const gpa = std.testing.allocator;
     var ring: Uring = try .init(gpa, 16);
     defer ring.deinit();
@@ -735,8 +726,6 @@ test "uring: timeout" {
 }
 
 test "uring: cancel" {
-    if (!is_linux or use_mock_io) return error.SkipZigTest;
-
     const gpa = std.testing.allocator;
     var ring: Uring = try .init(gpa, 16);
     defer ring.deinit();

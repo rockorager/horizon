@@ -80,10 +80,6 @@ pub fn pollableFd(_: *MockRuntime) !posix.fd_t {
     return -1;
 }
 
-pub fn msgRingFd(_: MockRuntime) posix.fd_t {
-    return -1;
-}
-
 pub fn reapCompletions(self: *MockRuntime) anyerror!void {
     while (self.work_queue.pop()) |task| {
         const result = switch (task.req) {
