@@ -965,7 +965,21 @@ test "kqueue" {
     var rt: Kqueue = try .init(std.testing.allocator, 0);
     defer rt.deinit();
 
-    _ = try rt.noop(null, 0, io.noopCallback);
+    const Foo = struct {
+        val: usize = 0,
+        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
+            const self = io.ptrCast(@This(), ptr);
+            self.val += 1;
+        }
+    };
 
+    var foo: Foo = .{};
+
+    _ = try rt.noop(&foo, 0, Foo.callback);
     try rt.run(.once);
+    try std.testing.expectEqual(1, foo.val);
+    _ = try rt.noop(&foo, 0, Foo.callback);
+    _ = try rt.noop(&foo, 0, Foo.callback);
+    try rt.run(.once);
+    try std.testing.expectEqual(3, foo.val);
 }
