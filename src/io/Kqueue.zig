@@ -244,15 +244,29 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .msg_ring => |req| {
             defer self.releaseTask(task);
+            const target = req.target;
 
-            req.target.msg_ring_mutex.lock();
-            defer req.target.msg_ring_mutex.unlock();
-            req.target.msg_ring_queue.push(req.task);
+            {
+                target.msg_ring_mutex.lock();
+                defer target.msg_ring_mutex.unlock();
+                target.msg_ring_queue.push(req.task);
 
-            req.target.msg_ring_result_queue.append(req.target.gpa, req.result) catch {
-                // On error we callback msgring parent task
-                try task.callback(task.userdata, self, task.msg, .{ .msg_ring = error.Unexpected });
-            };
+                target.msg_ring_result_queue.append(target.gpa, req.result) catch {
+                    // On error we callback msgring parent task
+                    try task.callback(task.userdata, self, task.msg, .{ .msg_ring = error.Unexpected });
+                };
+            }
+
+            // wake up the other ring
+            var kevent = evSet(
+                @intFromEnum(UserMsg.wakeup),
+                EVFILT.USER,
+                0,
+                null,
+            );
+            kevent.fflags |= std.c.NOTE.TRIGGER;
+            // Trigger the wakeup
+            _ = try posix.kevent(target.kq, &.{kevent}, &.{}, null);
         },
 
         // handled synchronously
