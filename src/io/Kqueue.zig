@@ -704,7 +704,34 @@ fn evSet(ident: usize, filter: i16, flags: u16, ptr: ?*anyopaque) posix.Kevent {
     };
 }
 
-pub fn submit(_: *Kqueue) !void {}
+pub fn submit(self: *Kqueue) !void {
+    defer self.submission_queue.clearRetainingCapacity();
+    const tail = self.work_queue.tail;
+    while (self.work_queue.pop()) |task| {
+        task.next = null;
+        try self.prepTask(task);
+
+        // If this task is queued and has a deadline we need to schedule a timer
+        if (task.state == .in_flight and task.deadline != null) {
+            const deadline = task.deadline.?;
+            try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
+        }
+
+        // We make sure we never go past the tail we had when we started. We do this to break a
+        // possible infinite loop for tasks which only ever loop through synchronous ops. By
+        // breaking at the tail, we don't go past the submissions we had when we started to submit,
+        // giving asynchronous ops a chance to be reaped
+        if (task == tail.?) break;
+    }
+
+    // Sort our timers
+    const now = std.time.milliTimestamp();
+    std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
+
+    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
+    self.inflight += self.submission_queue.items.len;
+    self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
+}
 
 pub fn getTask(self: *Kqueue) Allocator.Error!*io.Task {
     return self.free_list.pop() orelse try self.gpa.create(io.Task);
@@ -1026,9 +1053,10 @@ test "kqueue: poll" {
     var foo: Foo = .{};
     const pipe = try posix.pipe2(.{ .CLOEXEC = true });
 
-    _ = try posix.write(pipe[1], "io_uring is better");
-
     _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
+    try rt.submit();
+
+    _ = try posix.write(pipe[1], "io_uring is better");
     try rt.run(.once);
     try std.testing.expectEqual(1, foo.val);
 }
