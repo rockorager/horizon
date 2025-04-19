@@ -482,7 +482,7 @@ pub fn accept(
 
 pub fn msgRing(
     self: *Uring,
-    target: *const Uring,
+    target: *Uring,
     target_task: *io.Task, // The task that the target ring will receive. The callbacks of
     // this tsak are what will be called when the target receives the message
     result: u16, // We only allow sending a successful result
