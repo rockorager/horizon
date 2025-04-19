@@ -959,7 +959,7 @@ pub fn connect(
     return task;
 }
 
-test "kqueue" {
+test "kqueue: noop" {
     std.testing.refAllDecls(@This());
 
     var rt: Kqueue = try .init(std.testing.allocator, 0);
@@ -982,4 +982,28 @@ test "kqueue" {
     _ = try rt.noop(&foo, 0, Foo.callback);
     try rt.run(.once);
     try std.testing.expectEqual(3, foo.val);
+}
+
+test "kqueue: timer" {
+    std.testing.refAllDecls(@This());
+
+    var rt: Kqueue = try .init(std.testing.allocator, 0);
+    defer rt.deinit();
+
+    const Foo = struct {
+        val: usize = 0,
+        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
+            const self = io.ptrCast(@This(), ptr);
+            self.val += 1;
+        }
+    };
+
+    var foo: Foo = .{};
+
+    const start = std.time.nanoTimestamp();
+    const end = start + 100 * std.time.ns_per_ms;
+    _ = try rt.timer(.{ .nsec = 100 * std.time.ns_per_ms }, &foo, 0, Foo.callback);
+    try rt.run(.once);
+    try std.testing.expect(std.time.nanoTimestamp() > end);
+    try std.testing.expectEqual(1, foo.val);
 }
