@@ -1054,9 +1054,10 @@ test "kqueue: poll" {
     const pipe = try posix.pipe2(.{ .CLOEXEC = true });
 
     _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
-    try rt.submit();
+    try std.testing.expectEqual(1, rt.workQueueSize());
 
+    try rt.submit();
     _ = try posix.write(pipe[1], "io_uring is better");
-    try rt.run(.once);
+    try rt.reapCompletions();
     try std.testing.expectEqual(1, foo.val);
 }
