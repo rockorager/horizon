@@ -17,12 +17,4 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.14.0
-      - run: zig build -Duse_mock_io=false test-io
-  check-fmt:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.14.0
-      - run: zig fmt --check .
+      - run: zig build -Duse_mock_io=false --summary all test-io

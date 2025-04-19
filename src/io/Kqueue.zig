@@ -1007,3 +1007,28 @@ test "kqueue: timer" {
     try std.testing.expect(std.time.nanoTimestamp() > end);
     try std.testing.expectEqual(1, foo.val);
 }
+
+test "kqueue: poll" {
+    std.testing.refAllDecls(@This());
+
+    var rt: Kqueue = try .init(std.testing.allocator, 0);
+    defer rt.deinit();
+
+    const Foo = struct {
+        val: usize = 0,
+        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, result: io.Result) anyerror!void {
+            _ = result.poll catch |err| return err;
+            const self = io.ptrCast(@This(), ptr);
+            self.val += 1;
+        }
+    };
+
+    var foo: Foo = .{};
+    const pipe = try posix.pipe2(.{ .CLOEXEC = true });
+
+    _ = try posix.write(pipe[1], "io_uring is better");
+
+    _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
+    try rt.run(.once);
+    try std.testing.expectEqual(1, foo.val);
+}
