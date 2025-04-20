@@ -26,7 +26,6 @@ pub fn main() !void {
 
     try server.listenAndServe(&ring, my_handler.handler());
     std.log.debug("listening at {}", .{server.addr});
-
     try ring.run(.until_done);
 }
 

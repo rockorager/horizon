@@ -303,7 +303,6 @@ fn unexpectedError(err: posix.E) posix.UnexpectedError {
 }
 
 fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
-    assert(task.state == .in_flight);
     switch (task.req) {
         .cancel,
         .close,
@@ -496,7 +495,7 @@ fn handleExpiredTimer(self: *Kqueue, t: Timer) !void {
 fn prepTask(self: *Kqueue, task: *io.Task) !void {
     return switch (task.req) {
         .accept => |req| {
-            const kevent = evSet(@intCast(req), EVFILT.READ, EV.ADD | EV.ENABLE, task);
+            const kevent = evSet(@intCast(req), EVFILT.READ, EV.ADD, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
 
@@ -546,11 +545,13 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 => {},
 
                 .accept => |cancel_req| {
+                    self.inflight -= 1;
                     const kevent = evSet(@intCast(cancel_req), EVFILT.READ, EV.DELETE, task_to_cancel);
                     try self.submission_queue.append(self.gpa, kevent);
                 },
 
                 .connect => |cancel_req| {
+                    self.inflight -= 1;
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -561,6 +562,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .deadline => {
+                    self.inflight -= 1;
                     // What does it mean to cancel a deadline? We remove the deadline from
                     // the parent and the timer from our list
                     for (self.timers.items, 0..) |t, i| {
@@ -575,6 +577,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .poll => |cancel_req| {
+                    self.inflight -= 1;
                     if (cancel_req.mask & posix.POLL.IN != 0) {
                         const kevent = evSet(@intCast(cancel_req.fd), EVFILT.READ, EV.DELETE, task);
                         try self.submission_queue.append(self.gpa, kevent);
@@ -586,6 +589,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .recv => |cancel_req| {
+                    self.inflight -= 1;
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.READ,
@@ -606,6 +610,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .write => |cancel_req| {
+                    self.inflight -= 1;
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -616,6 +621,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .writev => |cancel_req| {
+                    self.inflight -= 1;
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -652,7 +658,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 switch (err) {
                     error.WouldBlock => {
                         // This is the error we expect. Add the event to kqueue
-                        const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ENABLE, task);
+                        const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
                         try self.submission_queue.append(self.gpa, kevent);
                     },
                     else => return err,
@@ -692,17 +698,17 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
 
         .poll => |req| {
             if (req.mask & posix.POLL.IN != 0) {
-                const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.CLEAR, task);
+                const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ONESHOT, task);
                 try self.submission_queue.append(self.gpa, kevent);
             }
             if (req.mask & posix.POLL.OUT != 0) {
-                const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.CLEAR, task);
+                const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
                 try self.submission_queue.append(self.gpa, kevent);
             }
         },
 
         .recv => |req| {
-            const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.CLEAR, task);
+            const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
 
@@ -723,12 +729,12 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
         .userfd, .usermsg, .userptr => unreachable,
 
         .write => |req| {
-            const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ENABLE, task);
+            const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
 
         .writev => |req| {
-            const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ENABLE, task);
+            const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
     };

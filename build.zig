@@ -36,8 +36,11 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{ .root_module = horizon_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    run_unit_tests.skip_foreign_checks = true;
+    const install_hz_tests = b.addInstallBinFile(unit_tests.getEmittedBin(), "test-horizon");
     const hz_test_step = b.step("test-horizon", "Run horizon unit tests");
     hz_test_step.dependOn(&run_unit_tests.step);
+    hz_test_step.dependOn(&install_hz_tests.step);
 
     const io_tests = b.addTest(.{ .root_module = io_module });
     const run_io_tests = b.addRunArtifact(io_tests);
