@@ -11,6 +11,8 @@ msg: u16,
 callback: io.Callback,
 req: io.Request,
 
+result: ?io.Result = null,
+
 state: enum {
     /// The task is free to be scheduled
     free,
@@ -19,6 +21,9 @@ state: enum {
     /// completions, so it is possible to receive a task in Callback and the task is still
     /// considered to be in flight
     in_flight,
+
+    /// The task was completed
+    complete,
 
     /// The operation was canceled
     canceled,

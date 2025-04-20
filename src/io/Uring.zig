@@ -221,7 +221,7 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
 
         // The callback could reschedule the task. So we handle it's state after the callback
         switch (task.state) {
-            .free, .canceled => {
+            .free, .canceled, .complete => {
                 task.* = undefined;
                 // Overcome a nice assertion
                 task.next = null;
