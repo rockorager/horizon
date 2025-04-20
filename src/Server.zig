@@ -144,7 +144,7 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
                         }
                     };
                 },
-                else => unreachable,
+                else => {},
             }
 
             // Rearm the poll task
@@ -361,7 +361,13 @@ const Worker = struct {
         try posix.setsockopt(
             fd,
             posix.SOL.SOCKET,
-            posix.SO.REUSEADDR | posix.SO.REUSEPORT,
+            posix.SO.REUSEADDR,
+            &std.mem.toBytes(@as(c_int, 1)),
+        );
+        try posix.setsockopt(
+            fd,
+            posix.SOL.SOCKET,
+            posix.SO.REUSEPORT,
             &std.mem.toBytes(@as(c_int, 1)),
         );
         try posix.bind(fd, &addr.any, addr.getOsSockLen());
@@ -846,7 +852,7 @@ test "server" {
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.got_request = true;
-            w.any().print("hello world", .{}) catch unreachable;
+            try w.any().print("hello world", .{});
             try w.flush();
             try self.server.stop();
         }
