@@ -33,6 +33,7 @@ state: enum {
 deadline: ?*Task = null,
 
 next: ?*Task = null,
+prev: ?*Task = null,
 
 pub fn setDeadline(
     self: *Task,
