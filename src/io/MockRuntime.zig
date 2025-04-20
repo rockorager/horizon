@@ -14,6 +14,7 @@ const posix = std.posix;
 gpa: Allocator,
 free_list: Queue(io.Task, .free) = .{},
 work_queue: Queue(io.Task, .in_flight) = .{},
+completions: Queue(io.Task, .complete) = .{},
 inflight: usize = 0,
 run_cond: io.RunCondition = .until_done,
 
@@ -71,8 +72,19 @@ pub fn pollableFd(_: *MockRuntime) !posix.fd_t {
 }
 
 pub fn reapCompletions(self: *MockRuntime) anyerror!void {
+    while (self.completions.pop()) |task| {
+        try task.callback(task.userdata, self, task.msg, task.result.?);
+        self.free_list.push(task);
+    }
+}
+
+pub fn submitAndWait(self: *MockRuntime) !void {
+    return self.submit();
+}
+
+pub fn submit(self: *MockRuntime) !void {
     while (self.work_queue.pop()) |task| {
-        const result = switch (task.req) {
+        task.result = switch (task.req) {
             .accept => if (self.accept_cb) |cb| cb(task) else return error.NoMockCallback,
             .cancel => if (self.cancel_cb) |cb| cb(task) else return error.NoMockCallback,
             .close => if (self.close_cb) |cb| cb(task) else return error.NoMockCallback,
@@ -90,14 +102,9 @@ pub fn reapCompletions(self: *MockRuntime) anyerror!void {
             .write => if (self.write_cb) |cb| cb(task) else return error.NoMockCallback,
             .writev => if (self.writev_cb) |cb| cb(task) else return error.NoMockCallback,
         };
-        try task.callback(task.userdata, self, task.msg, result);
-        self.free_list.push(task);
+        self.completions.push(task);
     }
 }
-
-pub fn submitAndWait(_: *MockRuntime) !void {}
-
-pub fn submit(_: *MockRuntime) !void {}
 
 pub fn getTask(self: *MockRuntime) Allocator.Error!*io.Task {
     return self.free_list.pop() orelse try self.gpa.create(io.Task);
