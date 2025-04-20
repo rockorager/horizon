@@ -23,7 +23,10 @@ work_queue: Queue(io.Task, .in_flight) = .{},
 /// Items we have prepared and waiting to be put into kqueue
 submission_queue: std.ArrayListUnmanaged(posix.Kevent) = .empty,
 
-/// Tasks which will be completed synchronously when reaping completions
+/// Tasks that have been submitted to kqueue
+in_flight: Queue(io.Task, .in_flight) = .{},
+
+/// Tasks which were completed synchronously during submission
 synchronous_queue: Queue(io.Task, .complete) = .{},
 
 /// Queue for other kqueue instances to send "completion" tasks to this thread
@@ -40,9 +43,6 @@ msg_ring_task: ?*io.Task = null,
 /// List of timers, sorted descending so when we pop we get the next timer to expire
 timers: std.ArrayListUnmanaged(Timer) = .empty,
 
-/// number of inflight tasks in the kqueue. We only track tasks that are submitted to kqueue here.
-/// Synchronous tasks don't count
-inflight: usize = 0,
 run_cond: io.RunCondition = .until_done,
 
 events: [128]posix.Kevent = undefined,
@@ -124,6 +124,7 @@ pub fn deinit(self: *Kqueue) void {
     while (self.free_list.pop()) |task| self.gpa.destroy(task);
     while (self.work_queue.pop()) |task| self.gpa.destroy(task);
     while (self.msg_ring_queue.pop()) |task| self.gpa.destroy(task);
+    while (self.in_flight.pop()) |task| self.gpa.destroy(task);
 
     self.submission_queue.deinit(self.gpa);
     self.timers.deinit(self.gpa);
@@ -162,7 +163,7 @@ pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
         try self.reapCompletions();
         switch (self.run_cond) {
             .once => return,
-            .until_done => if (self.inflight == 0 and self.work_queue.empty()) return,
+            .until_done => if (self.in_flight.empty() and self.work_queue.empty()) return,
             .forever => {},
         }
     }
@@ -174,10 +175,7 @@ pub fn pollableFd(self: Kqueue) !posix.fd_t {
 }
 
 pub fn reapCompletions(self: *Kqueue) anyerror!void {
-    defer {
-        self.inflight -= self.event_idx;
-        self.event_idx = 0;
-    }
+    defer self.event_idx = 0;
 
     for (self.events[0..self.event_idx]) |event| {
         // if the event is a USER filter, we check our msg_ring_queue
@@ -307,8 +305,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
         => unreachable,
 
         .accept => |req| {
-            // Accept is a multishot request, so we have to add one back to the inflight
-            self.inflight += 1;
+            // Accept is a multishot request, so we don't remove it from the in_flight queue
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -322,6 +319,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .connect => {
             defer self.releaseTask(task);
+            self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -332,6 +330,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .poll => {
             defer self.releaseTask(task);
+            self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -342,6 +341,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .recv => |req| {
             defer self.releaseTask(task);
+            self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -355,6 +355,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .write => |req| {
             defer self.releaseTask(task);
+            self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -368,6 +369,7 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
 
         .writev => |req| {
             defer self.releaseTask(task);
+            self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
@@ -413,13 +415,11 @@ pub fn submitAndWait(self: *Kqueue) !void {
     // completions for processing. We do so with a 0 timeout so that we are only grabbing already
     // completed items
     const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    self.inflight += self.submission_queue.items.len;
     self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
 }
 
 fn waitForCompletions(self: *Kqueue) !void {
     assert(self.synchronous_queue.empty());
-    self.inflight += self.submission_queue.items.len;
 
     const now = std.time.milliTimestamp();
     // Go through our times until the first unexpired one
@@ -459,8 +459,11 @@ fn waitForCompletions(self: *Kqueue) !void {
 }
 
 fn releaseTask(self: *Kqueue, task: *io.Task) void {
-    if (task.deadline) |d| d.state = .free;
     self.free_list.push(task);
+    if (task.deadline) |d| {
+        // We know this will never error since we just put the parent back on the free_list
+        d.cancel(self, null, 0, io.noopCallback) catch unreachable;
+    }
 }
 
 fn handleExpiredTimer(self: *Kqueue, t: Timer) !void {
@@ -485,6 +488,7 @@ fn handleExpiredTimer(self: *Kqueue, t: Timer) !void {
 fn prepTask(self: *Kqueue, task: *io.Task) !void {
     return switch (task.req) {
         .accept => |req| {
+            self.in_flight.push(task);
             const kevent = evSet(@intCast(req), EVFILT.READ, EV.ADD, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
@@ -535,13 +539,13 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 => {},
 
                 .accept => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     const kevent = evSet(@intCast(cancel_req), EVFILT.READ, EV.DELETE, task_to_cancel);
                     try self.submission_queue.append(self.gpa, kevent);
                 },
 
                 .connect => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -552,7 +556,6 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .deadline => {
-                    self.inflight -= 1;
                     // What does it mean to cancel a deadline? We remove the deadline from
                     // the parent and the timer from our list
                     for (self.timers.items, 0..) |t, i| {
@@ -567,7 +570,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .poll => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     if (cancel_req.mask & posix.POLL.IN != 0) {
                         const kevent = evSet(@intCast(cancel_req.fd), EVFILT.READ, EV.DELETE, task);
                         try self.submission_queue.append(self.gpa, kevent);
@@ -579,7 +582,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .recv => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.READ,
@@ -600,7 +603,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .write => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -611,7 +614,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                 },
 
                 .writev => |cancel_req| {
-                    self.inflight -= 1;
+                    self.in_flight.remove(task_to_cancel);
                     const kevent = evSet(
                         @intCast(cancel_req.fd),
                         EVFILT.WRITE,
@@ -647,11 +650,12 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             } else |err| {
                 switch (err) {
                     error.WouldBlock => {
+                        self.in_flight.push(task);
                         // This is the error we expect. Add the event to kqueue
                         const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
                         try self.submission_queue.append(self.gpa, kevent);
                     },
-                    else => return err,
+                    else => task.result = .{ .connect = error.Unexpected },
                 }
             }
         },
@@ -687,6 +691,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
         },
 
         .poll => |req| {
+            self.in_flight.push(task);
             if (req.mask & posix.POLL.IN != 0) {
                 const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ONESHOT, task);
                 try self.submission_queue.append(self.gpa, kevent);
@@ -698,6 +703,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
         },
 
         .recv => |req| {
+            self.in_flight.push(task);
             const kevent = evSet(@intCast(req.fd), EVFILT.READ, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
@@ -719,11 +725,13 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
         .userfd, .usermsg, .userptr => unreachable,
 
         .write => |req| {
+            self.in_flight.push(task);
             const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
 
         .writev => |req| {
+            self.in_flight.push(task);
             const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
             try self.submission_queue.append(self.gpa, kevent);
         },
@@ -1109,7 +1117,7 @@ test "kqueue: poll" {
     const pipe = try posix.pipe2(.{ .CLOEXEC = true });
 
     _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
-    try std.testing.expectEqual(1, rt.workQueueSize());
+    try std.testing.expectEqual(1, rt.work_queue.len());
 
     _ = try posix.write(pipe[1], "io_uring is better");
     try rt.run(.once);
