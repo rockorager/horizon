@@ -25,7 +25,7 @@ gpa: Allocator,
 ring: linux.IoUring,
 free_list: Queue(io.Task, .free) = .{},
 work_queue: Queue(io.Task, .in_flight) = .{},
-inflight: usize = 0,
+in_flight: Queue(io.Task, .in_flight) = .{},
 run_cond: io.RunCondition,
 eventfd: ?posix.fd_t = null,
 
@@ -42,6 +42,7 @@ pub fn init(gpa: Allocator, entries: u16) !Uring {
 pub fn deinit(self: *Uring) void {
     while (self.free_list.pop()) |task| self.gpa.destroy(task);
     while (self.work_queue.pop()) |task| self.gpa.destroy(task);
+    while (self.in_flight.pop()) |task| self.gpa.destroy(task);
 
     if (self.ring.fd >= 0) {
         self.ring.deinit();
@@ -78,7 +79,7 @@ pub fn run(self: *Uring, limit: io.RunCondition) !void {
         try self.reapCompletions();
         switch (self.run_cond) {
             .once => return,
-            .until_done => if (self.inflight == 0 and self.work_queue.empty()) return,
+            .until_done => if (self.in_flight.empty() and self.work_queue.empty()) return,
             .forever => {},
         }
     }
@@ -91,16 +92,6 @@ pub fn pollableFd(self: *Uring) !posix.fd_t {
     try self.ring.register_eventfd(fd);
     self.eventfd = fd;
     return fd;
-}
-
-pub fn workQueueSize(self: Uring) usize {
-    var count: usize = 0;
-    var maybe_task: ?*io.Task = self.work_queue.head;
-    while (maybe_task) |task| {
-        count += 1;
-        maybe_task = task.next;
-    }
-    return count;
 }
 
 pub fn reapCompletions(self: *Uring) anyerror!void {
@@ -206,30 +197,18 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
             .userfd, .userptr => unreachable,
         };
 
+        try task.callback(task.userdata, self, task.msg, result);
+
         if (cqe.flags & msg_ring_received_cqe != 0) {
             // This message was received from another ring. We don't decrement inflight for this.
             // But we do need to set the task as free because we will add it to our free list
-            task.state = .free;
+            self.free_list.push(task);
         } else if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
             // If the cqe doesn't have IORING_CQE_F_MORE set, then this task is complete and free to
             // be rescheduled
-            self.inflight -= 1;
-            task.state = .free;
-        }
-
-        try task.callback(task.userdata, self, task.msg, result);
-
-        // The callback could reschedule the task. So we handle it's state after the callback
-        switch (task.state) {
-            .free, .canceled, .complete => {
-                task.* = undefined;
-                // Overcome a nice assertion
-                task.next = null;
-                task.state = .free;
-                self.free_list.push(task);
-            },
-
-            .in_flight => {},
+            task.state = .complete;
+            self.in_flight.remove(task);
+            self.free_list.push(task);
         }
     }
 }
@@ -281,6 +260,7 @@ fn sqesAvailable(self: *Uring) u32 {
 }
 
 fn prepTask(self: *Uring, task: *io.Task) void {
+    self.in_flight.push(task);
     switch (task.req) {
         .noop => {
             const sqe = self.getSqe();
@@ -383,6 +363,7 @@ fn prepTask(self: *Uring, task: *io.Task) void {
 
 fn prepDeadline(self: *Uring, parent_task: *io.Task, parent_sqe: *linux.io_uring_sqe) void {
     const task = parent_task.deadline orelse return;
+    self.in_flight.push(task);
     assert(task.req == .deadline);
     parent_sqe.flags |= linux.IOSQE_IO_LINK;
 
@@ -397,7 +378,6 @@ fn prepDeadline(self: *Uring, parent_task: *io.Task, parent_sqe: *linux.io_uring
 /// available. Asserts that we have one available
 fn getSqe(self: *Uring) *linux.io_uring_sqe {
     assert(self.ring.sq.sqes.len > self.ring.sq_ready());
-    self.inflight += 1;
     return self.ring.get_sqe() catch unreachable;
 }
 
@@ -684,7 +664,7 @@ test "uring: inflight" {
     try ring.submitAndWait();
 
     try std.testing.expect(task.state == .in_flight);
-    try std.testing.expectEqual(2, ring.inflight);
+    try std.testing.expectEqual(2, ring.in_flight.len());
 
     try ring.reapCompletions();
 }

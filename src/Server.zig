@@ -431,7 +431,8 @@ const Worker = struct {
     fn maybeClose(self: *Worker) !void {
         if (self.state != .shutting_down or self.keep_alive > 0) return;
         self.state = .done;
-        if (self.ring.inflight > 0) {
+        if (!self.ring.in_flight.empty()) {
+            // TODO: track only our tasks in a doubly linked list and only cancel our tasks
             try self.ring.cancelAll();
         }
 

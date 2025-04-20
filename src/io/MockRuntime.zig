@@ -59,20 +59,10 @@ pub fn run(self: *MockRuntime, limit: io.RunCondition) !void {
         try self.reapCompletions();
         switch (self.run_cond) {
             .once => return,
-            .until_done => if (self.inflight == 0 and self.work_queue.empty()) return,
+            .until_done => if (self.work_queue.empty()) return,
             .forever => {},
         }
     }
-}
-
-pub fn workQueueSize(self: MockRuntime) usize {
-    var count: usize = 0;
-    var maybe_task: ?*io.Task = self.work_queue.head;
-    while (maybe_task) |task| {
-        count += 1;
-        maybe_task = task.next;
-    }
-    return count;
 }
 
 /// Return a file descriptor which can be used to poll the ring for completions
