@@ -163,7 +163,9 @@ pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
         try self.reapCompletions();
         switch (self.run_cond) {
             .once => return,
-            .until_done => if (self.in_flight.empty() and self.work_queue.empty()) return,
+            .until_done => if (self.in_flight.empty() and
+                self.work_queue.empty() and
+                self.submission_queue.items.len == 0) return,
             .forever => {},
         }
     }
@@ -176,6 +178,10 @@ pub fn pollableFd(self: Kqueue) !posix.fd_t {
 
 pub fn reapCompletions(self: *Kqueue) anyerror!void {
     defer self.event_idx = 0;
+    if (self.event_idx == 0) {
+        const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
+        self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
+    }
 
     for (self.events[0..self.event_idx]) |event| {
         // if the event is a USER filter, we check our msg_ring_queue
@@ -794,9 +800,11 @@ pub fn submit(self: *Kqueue) !void {
     const now = std.time.milliTimestamp();
     std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
 
+    // For submit, we don't try to reap any completions. Calls to submit will likely be relying on a
+    // `poll` of the kqueue. We check in reapCompletinos if we have no reaped events and grab them
+    // there if needed
     const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    self.inflight += self.submission_queue.items.len;
-    self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
+    _ = try posix.kevent(self.kq, self.submission_queue.items, &.{}, &timeout);
 }
 
 pub fn getTask(self: *Kqueue) Allocator.Error!*io.Task {
