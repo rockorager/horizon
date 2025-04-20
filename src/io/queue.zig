@@ -44,6 +44,7 @@ pub fn Intrusive(comptime T: type, comptime state: @Type(.enum_literal)) type {
             if (self.tail) |tail| {
                 // If we have elements in the queue, then we add a new tail.
                 tail.next = v;
+                v.prev = tail;
                 self.tail = v;
             } else {
                 // No elements in the queue we setup the initial state.
@@ -64,16 +65,27 @@ pub fn Intrusive(comptime T: type, comptime state: @Type(.enum_literal)) type {
             // Head is whatever is next (if we're the last element,
             // this will be null);
             self.head = next.next;
+            if (self.head) |head| head.prev = null;
 
             // We set the "next" field to null so that this element
             // can be inserted again.
             next.next = null;
+            next.prev = null;
             return next;
         }
 
         /// Returns true if the queue is empty.
         pub fn empty(self: *const Self) bool {
             return self.head == null;
+        }
+
+        pub fn remove(self: *Self, item: *T) void {
+            if (item.prev) |prev| prev.next = item.next else self.head = item.next;
+
+            if (item.next) |next| next.prev = item.prev else self.tail = item.prev;
+
+            item.prev = null;
+            item.next = null;
         }
     };
 }
