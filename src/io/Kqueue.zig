@@ -168,16 +168,6 @@ pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
     }
 }
 
-pub fn workQueueSize(self: Kqueue) usize {
-    var count: usize = 0;
-    var maybe_task: ?*io.Task = self.work_queue.head;
-    while (maybe_task) |task| {
-        count += 1;
-        maybe_task = task.next;
-    }
-    return count;
-}
-
 /// Return a file descriptor which can be used to poll the ring for completions
 pub fn pollableFd(self: Kqueue) !posix.fd_t {
     return self.kq;
