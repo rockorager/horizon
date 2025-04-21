@@ -23,8 +23,6 @@ pub const has_kqueue = switch (builtin.os.tag) {
 };
 pub const has_io_uring = builtin.os.tag == .linux;
 
-/// True if the io runtime is being mocked. Useful for testing application logic
-pub const use_mock = test_options.use_mock_io;
 pub const Task = @import("Task.zig");
 pub const Callback = *const fn (?*anyopaque, *Runtime, u16, Result) anyerror!void;
 pub fn noopCallback(_: ?*anyopaque, _: *Runtime, _: u16, _: Result) anyerror!void {}
