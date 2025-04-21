@@ -133,33 +133,94 @@ pub fn initChild(self: Kqueue, entries: u16) !Kqueue {
     return init(self.gpa, entries);
 }
 
-pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
-    self.run_cond = limit;
+pub fn submitAndWait(self: *Kqueue, queue: *Queue(io.Task, .in_flight)) !void {
+    defer self.submission_queue.clearRetainingCapacity();
+    const tail = queue.tail;
+    while (queue.pop()) |task| {
+        try self.prepTask(task);
 
-    if (self.msg_ring_task == null) {
-        self.msg_ring_task = try self.getTask();
-        // Register a user event we can use to wakeup the kqueue
-        var kevent = evSet(
-            @intFromEnum(UserMsg.wakeup),
-            EVFILT.USER,
-            EV.ADD | EV.CLEAR,
-            self.msg_ring_task.?,
-        );
-        kevent.fflags = std.c.NOTE.FFNOP;
-        try self.submission_queue.append(self.allocator(), kevent);
-    }
-
-    while (true) {
-        try self.submitAndWait();
-        try self.reapCompletions();
-        switch (self.run_cond) {
-            .once => return,
-            .until_done => if (self.in_flight.empty() and
-                self.work_queue.empty() and
-                self.submission_queue.items.len == 0) return,
-            .forever => {},
+        // If this task is queued and has a deadline we need to schedule a timer
+        if (task.deadline) |deadline| {
+            try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
         }
+
+        // We make sure we never go past the tail we had when we started. We do this to break a
+        // possible infinite loop for tasks which only ever loop through synchronous ops. By
+        // breaking at the tail, we don't go past the submissions we had when we started to submit,
+        // giving asynchronous ops a chance to be reaped
+        if (task == tail.?) break;
     }
+
+    // Sort our timers
+    const now = std.time.milliTimestamp();
+    std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
+
+    if (self.synchronous_queue.empty()) {
+        // We don't have any synchronous completions, so we need to wait for some from kqueue
+        return self.wait();
+    }
+
+    // We already have completions from synchronous tasks. Submit our queued events and grab any new
+    // completions for processing. We do so with a 0 timeout so that we are only grabbing already
+    // completed items
+    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
+    self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
+}
+
+fn wait(self: *Kqueue) !void {
+    assert(self.synchronous_queue.empty());
+
+    // Go through our times until the first unexpired one
+    while (true) {
+        const t = self.timers.getLastOrNull() orelse break;
+        const timeout: posix.timespec = t.timespec();
+
+        self.event_idx = try posix.kevent(
+            self.kq,
+            self.submission_queue.items,
+            &self.events,
+            &timeout,
+        );
+        return;
+    }
+
+    // We had no timers so we wait indefinitely
+    self.event_idx = try posix.kevent(
+        self.kq,
+        self.submission_queue.items,
+        &self.events,
+        null,
+    );
+}
+
+pub fn submit(self: *Kqueue) !void {
+    defer self.submission_queue.clearRetainingCapacity();
+    const tail = self.work_queue.tail;
+    while (self.work_queue.pop()) |task| {
+        try self.prepTask(task);
+
+        // If this task is queued and has a deadline we need to schedule a timer
+        if (task.state == .in_flight and task.deadline != null) {
+            const deadline = task.deadline.?;
+            try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
+        }
+
+        // We make sure we never go past the tail we had when we started. We do this to break a
+        // possible infinite loop for tasks which only ever loop through synchronous ops. By
+        // breaking at the tail, we don't go past the submissions we had when we started to submit,
+        // giving asynchronous ops a chance to be reaped
+        if (task == tail.?) break;
+    }
+
+    // Sort our timers
+    const now = std.time.milliTimestamp();
+    std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
+
+    // For submit, we don't try to reap any completions. Calls to submit will likely be relying on a
+    // `poll` of the kqueue. We check in reapCompletinos if we have no reaped events and grab them
+    // there if needed
+    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = try posix.kevent(self.kq, self.submission_queue.items, &.{}, &timeout);
 }
 
 pub fn done(self: *Kqueue) bool {
@@ -407,66 +468,6 @@ fn handleCompletion(
             return task.callback(task.userdata, rt, task.msg, .{ .writev = n });
         },
     }
-}
-
-pub fn submitAndWait(self: *Kqueue, queue: *Queue(io.Task, .in_flight)) !void {
-    defer self.submission_queue.clearRetainingCapacity();
-    const tail = queue.tail;
-    while (queue.pop()) |task| {
-        try self.prepTask(task);
-
-        // If this task is queued and has a deadline we need to schedule a timer
-        if (task.deadline) |deadline| {
-            try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
-        }
-
-        // We make sure we never go past the tail we had when we started. We do this to break a
-        // possible infinite loop for tasks which only ever loop through synchronous ops. By
-        // breaking at the tail, we don't go past the submissions we had when we started to submit,
-        // giving asynchronous ops a chance to be reaped
-        if (task == tail.?) break;
-    }
-
-    // Sort our timers
-    const now = std.time.milliTimestamp();
-    std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
-
-    if (self.synchronous_queue.empty()) {
-        // We don't have any synchronous completions, so we need to wait for some from kqueue
-        return self.waitForCompletions();
-    }
-
-    // We already have completions from synchronous tasks. Submit our queued events and grab any new
-    // completions for processing. We do so with a 0 timeout so that we are only grabbing already
-    // completed items
-    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
-}
-
-fn waitForCompletions(self: *Kqueue) !void {
-    assert(self.synchronous_queue.empty());
-
-    // Go through our times until the first unexpired one
-    while (true) {
-        const t = self.timers.getLastOrNull() orelse break;
-        const timeout: posix.timespec = t.timespec();
-
-        self.event_idx = try posix.kevent(
-            self.kq,
-            self.submission_queue.items,
-            &self.events,
-            &timeout,
-        );
-        return;
-    }
-
-    // We had no timers so we wait indefinitely
-    self.event_idx = try posix.kevent(
-        self.kq,
-        self.submission_queue.items,
-        &self.events,
-        null,
-    );
 }
 
 fn releaseTask(self: *Kqueue, rt: *io.Runtime, task: *io.Task) void {
@@ -794,34 +795,4 @@ fn evSet(ident: usize, filter: i16, flags: u16, ptr: ?*anyopaque) posix.Kevent {
 
         else => @compileError("kqueue not supported"),
     };
-}
-
-pub fn submit(self: *Kqueue) !void {
-    defer self.submission_queue.clearRetainingCapacity();
-    const tail = self.work_queue.tail;
-    while (self.work_queue.pop()) |task| {
-        try self.prepTask(task);
-
-        // If this task is queued and has a deadline we need to schedule a timer
-        if (task.state == .in_flight and task.deadline != null) {
-            const deadline = task.deadline.?;
-            try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
-        }
-
-        // We make sure we never go past the tail we had when we started. We do this to break a
-        // possible infinite loop for tasks which only ever loop through synchronous ops. By
-        // breaking at the tail, we don't go past the submissions we had when we started to submit,
-        // giving asynchronous ops a chance to be reaped
-        if (task == tail.?) break;
-    }
-
-    // Sort our timers
-    const now = std.time.milliTimestamp();
-    std.sort.insertion(Timer, self.timers.items, now, Timer.lessThan);
-
-    // For submit, we don't try to reap any completions. Calls to submit will likely be relying on a
-    // `poll` of the kqueue. We check in reapCompletinos if we have no reaped events and grab them
-    // there if needed
-    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = try posix.kevent(self.kq, self.submission_queue.items, &.{}, &timeout);
 }

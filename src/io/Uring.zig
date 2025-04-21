@@ -34,10 +34,6 @@ pub fn init(_: Allocator, entries: u16) !Uring {
     return .{ .ring = try .init_params(entries, &params) };
 }
 
-pub fn done(self: *Uring) bool {
-    return self.in_flight.empty();
-}
-
 pub fn deinit(self: *Uring, gpa: Allocator) void {
     while (self.in_flight.pop()) |task| gpa.destroy(task);
 
@@ -69,6 +65,10 @@ pub fn initChild(self: Uring, entries: u16) !Uring {
     };
 }
 
+pub fn done(self: *Uring) bool {
+    return self.in_flight.empty();
+}
+
 /// Return a file descriptor which can be used to poll the ring for completions
 pub fn pollableFd(self: *Uring) !posix.fd_t {
     if (self.eventfd) |fd| return fd;
@@ -76,125 +76,6 @@ pub fn pollableFd(self: *Uring) !posix.fd_t {
     try self.ring.register_eventfd(fd);
     self.eventfd = fd;
     return fd;
-}
-
-pub fn reapCompletions(self: *Uring, rt: *io.Runtime) anyerror!void {
-    var cqes: [64]linux.io_uring_cqe = undefined;
-    const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
-        switch (err) {
-            error.SignalInterrupt => return,
-            else => return err,
-        }
-    };
-    for (cqes[0..n]) |cqe| {
-        const task: *io.Task = @ptrFromInt(cqe.user_data);
-
-        const result: io.Result = switch (task.req) {
-            .noop => .noop,
-
-            // Deadlines we don't do anything for, these are always sent to a noopCallback
-            .deadline => .{ .deadline = {} },
-
-            .timer => .{ .timer = switch (cqeToE(cqe.res)) {
-                .SUCCESS, .TIME => {},
-                .INVAL, .FAULT => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .cancel => .{ .cancel = switch (cqeToE(cqe.res)) {
-                .SUCCESS => {},
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                .NOENT => io.CancelError.EntryNotFound,
-                .ALREADY => io.CancelError.NotCanceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .accept => .{ .accept = switch (cqeToE(cqe.res)) {
-                .SUCCESS => cqe.res,
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .msg_ring => .{ .msg_ring = switch (cqeToE(cqe.res)) {
-                .SUCCESS => {},
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .recv => .{ .recv = switch (cqeToE(cqe.res)) {
-                .SUCCESS => @intCast(cqe.res),
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                .CONNRESET => io.RecvError.ConnectionResetByPeer,
-                else => |e| unexpectedError(e),
-            } },
-
-            .write => .{ .write = switch (cqeToE(cqe.res)) {
-                .SUCCESS => @intCast(cqe.res),
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .writev => .{ .writev = switch (cqeToE(cqe.res)) {
-                .SUCCESS => @intCast(cqe.res),
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .close => .{ .close = switch (cqeToE(cqe.res)) {
-                .SUCCESS => {},
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .poll => .{ .poll = switch (cqeToE(cqe.res)) {
-                .SUCCESS => {},
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .socket => .{ .socket = switch (cqeToE(cqe.res)) {
-                .SUCCESS => @intCast(cqe.res),
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .connect => .{ .connect = switch (cqeToE(cqe.res)) {
-                .SUCCESS => {},
-                .INVAL => io.ResultError.Invalid,
-                .CANCELED => io.ResultError.Canceled,
-                else => |e| unexpectedError(e),
-            } },
-
-            .usermsg => .{ .usermsg = @intCast(cqe.res) },
-
-            // userfd should never reach the runtime
-            .userfd, .userptr => unreachable,
-        };
-
-        try task.callback(task.userdata, rt, task.msg, result);
-
-        if (cqe.flags & msg_ring_received_cqe != 0) {
-            // This message was received from another ring. We don't decrement inflight for this.
-            // But we do need to set the task as free because we will add it to our free list
-            rt.free_q.push(task);
-        } else if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
-            // If the cqe doesn't have IORING_CQE_F_MORE set, then this task is complete and free to
-            // be rescheduled
-            task.state = .complete;
-            self.in_flight.remove(task);
-            rt.free_q.push(task);
-        }
-    }
 }
 
 pub fn submitAndWait(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
@@ -364,6 +245,125 @@ fn prepDeadline(self: *Uring, parent_task: *io.Task, parent_sqe: *linux.io_uring
 fn getSqe(self: *Uring) *linux.io_uring_sqe {
     assert(self.ring.sq.sqes.len > self.ring.sq_ready());
     return self.ring.get_sqe() catch unreachable;
+}
+
+pub fn reapCompletions(self: *Uring, rt: *io.Runtime) anyerror!void {
+    var cqes: [64]linux.io_uring_cqe = undefined;
+    const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
+        switch (err) {
+            error.SignalInterrupt => return,
+            else => return err,
+        }
+    };
+    for (cqes[0..n]) |cqe| {
+        const task: *io.Task = @ptrFromInt(cqe.user_data);
+
+        const result: io.Result = switch (task.req) {
+            .noop => .noop,
+
+            // Deadlines we don't do anything for, these are always sent to a noopCallback
+            .deadline => .{ .deadline = {} },
+
+            .timer => .{ .timer = switch (cqeToE(cqe.res)) {
+                .SUCCESS, .TIME => {},
+                .INVAL, .FAULT => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .cancel => .{ .cancel = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                .NOENT => io.CancelError.EntryNotFound,
+                .ALREADY => io.CancelError.NotCanceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .accept => .{ .accept = switch (cqeToE(cqe.res)) {
+                .SUCCESS => cqe.res,
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .msg_ring => .{ .msg_ring = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .recv => .{ .recv = switch (cqeToE(cqe.res)) {
+                .SUCCESS => @intCast(cqe.res),
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                .CONNRESET => io.RecvError.ConnectionResetByPeer,
+                else => |e| unexpectedError(e),
+            } },
+
+            .write => .{ .write = switch (cqeToE(cqe.res)) {
+                .SUCCESS => @intCast(cqe.res),
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .writev => .{ .writev = switch (cqeToE(cqe.res)) {
+                .SUCCESS => @intCast(cqe.res),
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .close => .{ .close = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .poll => .{ .poll = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .socket => .{ .socket = switch (cqeToE(cqe.res)) {
+                .SUCCESS => @intCast(cqe.res),
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .connect => .{ .connect = switch (cqeToE(cqe.res)) {
+                .SUCCESS => {},
+                .INVAL => io.ResultError.Invalid,
+                .CANCELED => io.ResultError.Canceled,
+                else => |e| unexpectedError(e),
+            } },
+
+            .usermsg => .{ .usermsg = @intCast(cqe.res) },
+
+            // userfd should never reach the runtime
+            .userfd, .userptr => unreachable,
+        };
+
+        try task.callback(task.userdata, rt, task.msg, result);
+
+        if (cqe.flags & msg_ring_received_cqe != 0) {
+            // This message was received from another ring. We don't decrement inflight for this.
+            // But we do need to set the task as free because we will add it to our free list
+            rt.free_q.push(task);
+        } else if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
+            // If the cqe doesn't have IORING_CQE_F_MORE set, then this task is complete and free to
+            // be rescheduled
+            task.state = .complete;
+            self.in_flight.remove(task);
+            rt.free_q.push(task);
+        }
+    }
 }
 
 fn cqeToE(result: i32) std.posix.E {
