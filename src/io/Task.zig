@@ -60,7 +60,6 @@ pub fn cancel(
     msg: u16,
     callback: io.Callback,
 ) Allocator.Error!void {
-    self.state = .canceled;
     const task = try rt.getTask();
     task.* = .{
         .callback = callback,
@@ -68,5 +67,5 @@ pub fn cancel(
         .userdata = userdata,
         .req = .{ .cancel = .{ .task = self } },
     };
-    rt.work_queue.push(task);
+    rt.submission_q.push(task);
 }

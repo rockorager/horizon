@@ -2,8 +2,6 @@ const Kqueue = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const test_options = @import("test_options");
-const use_mock_io = test_options.use_mock_io;
 
 const io = @import("io.zig");
 
@@ -16,10 +14,6 @@ const posix = std.posix;
 
 gpa: Allocator,
 kq: posix.fd_t,
-/// unused tasks
-free_list: Queue(io.Task, .free) = .{},
-/// Tasks we need to prepare
-work_queue: Queue(io.Task, .in_flight) = .{},
 /// Items we have prepared and waiting to be put into kqueue
 submission_queue: std.ArrayListUnmanaged(posix.Kevent) = .empty,
 
@@ -37,13 +31,8 @@ msg_ring_queue: Queue(io.Task, .complete) = .{},
 /// compared to synchronous tasks
 msg_ring_mutex: std.Thread.Mutex = .{},
 
-/// Task which msgring uses to wake up the kqueue
-msg_ring_task: ?*io.Task = null,
-
 /// List of timers, sorted descending so when we pop we get the next timer to expire
 timers: std.ArrayListUnmanaged(Timer) = .empty,
-
-run_cond: io.RunCondition = .until_done,
 
 events: [128]posix.Kevent = undefined,
 event_idx: usize = 0,
@@ -114,23 +103,25 @@ const UserMsg = enum {
 pub fn init(gpa: Allocator, _: u16) !Kqueue {
     const kq = try posix.kqueue();
 
-    return .{
-        .gpa = gpa,
-        .kq = kq,
-    };
+    // Register a wakeup EVFILT.USER to wake up this kqueue
+    var kevent = evSet(
+        @intFromEnum(UserMsg.wakeup),
+        EVFILT.USER,
+        EV.ADD | EV.CLEAR,
+        null,
+    );
+    kevent.fflags = std.c.NOTE.FFNOP;
+    _ = try posix.kevent(kq, &.{kevent}, &.{}, null);
+
+    return .{ .gpa = gpa, .kq = kq };
 }
 
-pub fn deinit(self: *Kqueue) void {
-    while (self.free_list.pop()) |task| self.gpa.destroy(task);
-    while (self.work_queue.pop()) |task| self.gpa.destroy(task);
-    while (self.msg_ring_queue.pop()) |task| self.gpa.destroy(task);
-    while (self.in_flight.pop()) |task| self.gpa.destroy(task);
+pub fn deinit(self: *Kqueue, gpa: Allocator) void {
+    while (self.msg_ring_queue.pop()) |task| gpa.destroy(task);
+    while (self.in_flight.pop()) |task| gpa.destroy(task);
 
-    self.submission_queue.deinit(self.gpa);
-    self.timers.deinit(self.gpa);
-    if (self.msg_ring_task) |task| {
-        self.gpa.destroy(task);
-    }
+    self.submission_queue.deinit(gpa);
+    self.timers.deinit(gpa);
 
     posix.close(self.kq);
     self.* = undefined;
@@ -155,7 +146,7 @@ pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
             self.msg_ring_task.?,
         );
         kevent.fflags = std.c.NOTE.FFNOP;
-        try self.submission_queue.append(self.gpa, kevent);
+        try self.submission_queue.append(self.allocator(), kevent);
     }
 
     while (true) {
@@ -171,12 +162,25 @@ pub fn run(self: *Kqueue, limit: io.RunCondition) !void {
     }
 }
 
+pub fn done(self: *Kqueue) bool {
+    if (self.timers.items.len == 0 and
+        self.in_flight.empty() and
+        self.submission_queue.items.len == 0)
+    {
+        self.msg_ring_mutex.lock();
+        defer self.msg_ring_mutex.unlock();
+        return self.msg_ring_queue.empty();
+    }
+
+    return false;
+}
+
 /// Return a file descriptor which can be used to poll the ring for completions
 pub fn pollableFd(self: Kqueue) !posix.fd_t {
     return self.kq;
 }
 
-pub fn reapCompletions(self: *Kqueue) anyerror!void {
+pub fn reapCompletions(self: *Kqueue, rt: *io.Runtime) anyerror!void {
     defer self.event_idx = 0;
     if (self.event_idx == 0) {
         const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
@@ -196,9 +200,9 @@ pub fn reapCompletions(self: *Kqueue) anyerror!void {
                         // For canceled msg_rings we do nothing
                         if (task.state == .canceled) continue;
 
-                        defer self.releaseTask(task);
+                        defer self.releaseTask(rt, task);
                         const result: io.Result = task.result orelse .noop;
-                        try task.callback(task.userdata, self, task.msg, result);
+                        try task.callback(task.userdata, rt, task.msg, result);
                     }
                 },
             }
@@ -207,18 +211,29 @@ pub fn reapCompletions(self: *Kqueue) anyerror!void {
 
         const task: *io.Task = @ptrFromInt(event.udata);
         if (task.state == .canceled) continue;
-        try self.handleCompletion(task, event);
+        try self.handleCompletion(rt, task, event);
     }
 
     // Return synchronous tasks to the freelist
     while (self.synchronous_queue.pop()) |task| {
-        try self.handleSynchronousCompletion(task);
+        try self.handleSynchronousCompletion(rt, task);
+    }
+
+    const now = std.time.milliTimestamp();
+    while (self.timers.getLastOrNull()) |t| {
+        if (t.expiresInMs(now) > 0) break;
+        _ = self.timers.pop();
+        try self.handleExpiredTimer(rt, t);
     }
 }
 
 /// Handle a completion which was done synchronously. The work has already been done, we just need
 /// to call the callback and return the task(s) to the free list
-fn handleSynchronousCompletion(self: *Kqueue, task: *io.Task) !void {
+fn handleSynchronousCompletion(
+    self: *Kqueue,
+    rt: *io.Runtime,
+    task: *io.Task,
+) !void {
     switch (task.req) {
         // async tasks
         .accept,
@@ -242,14 +257,14 @@ fn handleSynchronousCompletion(self: *Kqueue, task: *io.Task) !void {
         .userptr,
         => {
             assert(task.result != null);
-            defer self.releaseTask(task);
-            try task.callback(task.userdata, self, task.msg, task.result.?);
+            defer self.releaseTask(rt, task);
+            try task.callback(task.userdata, rt, task.msg, task.result.?);
         },
 
         .cancel => |c| {
             assert(task.result != null);
-            defer self.releaseTask(task);
-            try task.callback(task.userdata, self, task.msg, task.result.?);
+            defer self.releaseTask(rt, task);
+            try task.callback(task.userdata, rt, task.msg, task.result.?);
 
             switch (c) {
                 .all => @panic("TODO"),
@@ -259,7 +274,7 @@ fn handleSynchronousCompletion(self: *Kqueue, task: *io.Task) !void {
                     _ = task.result.?.cancel catch return;
                     // On success, it is our job to call the canceled tasks' callback and return the
                     // task to the free list
-                    defer self.releaseTask(ct);
+                    defer self.releaseTask(rt, ct);
                     const result: io.Result = switch (ct.req) {
                         .accept => .{ .accept = error.Canceled },
                         .cancel => .{ .cancel = error.Canceled },
@@ -277,7 +292,7 @@ fn handleSynchronousCompletion(self: *Kqueue, task: *io.Task) !void {
                         .writev => .{ .writev = error.Canceled },
                     };
                     ct.result = result;
-                    try ct.callback(ct.userdata, self, ct.msg, ct.result.?);
+                    try ct.callback(ct.userdata, rt, ct.msg, ct.result.?);
                 },
             }
         },
@@ -296,7 +311,12 @@ fn unexpectedError(err: posix.E) posix.UnexpectedError {
     return error.Unexpected;
 }
 
-fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
+fn handleCompletion(
+    self: *Kqueue,
+    rt: *io.Runtime,
+    task: *io.Task,
+    event: posix.Kevent,
+) !void {
     switch (task.req) {
         .cancel,
         .close,
@@ -315,89 +335,88 @@ fn handleCompletion(self: *Kqueue, task: *io.Task, event: posix.Kevent) !void {
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .accept = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .accept = err });
             }
             const fd = posix.accept(req, null, null, 0) catch {
-                return task.callback(task.userdata, self, task.msg, .{ .accept = error.Unexpected });
+                return task.callback(task.userdata, rt, task.msg, .{ .accept = error.Unexpected });
             };
-            return task.callback(task.userdata, self, task.msg, .{ .accept = fd });
+            return task.callback(task.userdata, rt, task.msg, .{ .accept = fd });
         },
 
         .connect => {
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .connect = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .connect = err });
             }
-            return task.callback(task.userdata, self, task.msg, .{ .connect = {} });
+            return task.callback(task.userdata, rt, task.msg, .{ .connect = {} });
         },
 
         .poll => {
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .poll = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .poll = err });
             }
-            return task.callback(task.userdata, self, task.msg, .{ .poll = {} });
+            return task.callback(task.userdata, rt, task.msg, .{ .poll = {} });
         },
 
         .recv => |req| {
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .recv = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .recv = err });
             }
             const n = posix.recv(req.fd, req.buffer, 0) catch {
-                return task.callback(task.userdata, self, task.msg, .{ .recv = error.Unexpected });
+                return task.callback(task.userdata, rt, task.msg, .{ .recv = error.Unexpected });
             };
-            return task.callback(task.userdata, self, task.msg, .{ .recv = n });
+            return task.callback(task.userdata, rt, task.msg, .{ .recv = n });
         },
 
         .write => |req| {
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .write = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .write = err });
             }
             const n = posix.write(req.fd, req.buffer) catch {
-                return task.callback(task.userdata, self, task.msg, .{ .write = error.Unexpected });
+                return task.callback(task.userdata, rt, task.msg, .{ .write = error.Unexpected });
             };
-            return task.callback(task.userdata, self, task.msg, .{ .write = n });
+            return task.callback(task.userdata, rt, task.msg, .{ .write = n });
         },
 
         .writev => |req| {
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             self.in_flight.remove(task);
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, self, task.msg, .{ .writev = err });
+                return task.callback(task.userdata, rt, task.msg, .{ .writev = err });
             }
             const n = posix.writev(req.fd, req.vecs) catch {
-                return task.callback(task.userdata, self, task.msg, .{ .writev = error.Unexpected });
+                return task.callback(task.userdata, rt, task.msg, .{ .writev = error.Unexpected });
             };
-            return task.callback(task.userdata, self, task.msg, .{ .writev = n });
+            return task.callback(task.userdata, rt, task.msg, .{ .writev = n });
         },
     }
 }
 
-pub fn submitAndWait(self: *Kqueue) !void {
+pub fn submitAndWait(self: *Kqueue, queue: *Queue(io.Task, .in_flight)) !void {
     defer self.submission_queue.clearRetainingCapacity();
-    const tail = self.work_queue.tail;
-    while (self.work_queue.pop()) |task| {
+    const tail = queue.tail;
+    while (queue.pop()) |task| {
         try self.prepTask(task);
 
         // If this task is queued and has a deadline we need to schedule a timer
-        if (task.state == .in_flight and task.deadline != null) {
-            const deadline = task.deadline.?;
+        if (task.deadline) |deadline| {
             try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
         }
 
@@ -427,17 +446,9 @@ pub fn submitAndWait(self: *Kqueue) !void {
 fn waitForCompletions(self: *Kqueue) !void {
     assert(self.synchronous_queue.empty());
 
-    const now = std.time.milliTimestamp();
     // Go through our times until the first unexpired one
     while (true) {
         const t = self.timers.getLastOrNull() orelse break;
-        if (t.expiresInMs(now) <= 0) {
-            // timer expired. H
-            _ = self.timers.pop();
-            try self.handleExpiredTimer(t);
-            continue;
-        }
-
         const timeout: posix.timespec = t.timespec();
 
         self.event_idx = try posix.kevent(
@@ -446,12 +457,6 @@ fn waitForCompletions(self: *Kqueue) !void {
             &self.events,
             &timeout,
         );
-
-        // if we had no returned events, it's because our timer expired
-        if (self.event_idx == 0) {
-            _ = self.timers.pop();
-            try self.handleExpiredTimer(t);
-        }
         return;
     }
 
@@ -464,28 +469,35 @@ fn waitForCompletions(self: *Kqueue) !void {
     );
 }
 
-fn releaseTask(self: *Kqueue, task: *io.Task) void {
-    self.free_list.push(task);
+fn releaseTask(self: *Kqueue, rt: *io.Runtime, task: *io.Task) void {
+    rt.free_q.push(task);
     if (task.deadline) |d| {
-        // We know this will never error since we just put the parent back on the free_list
-        d.cancel(self, null, 0, io.noopCallback) catch unreachable;
+        // remove the deadline
+        for (self.timers.items, 0..) |t, i| {
+            if (t == .deadline and t.deadline.task == d) {
+                // Remove the timer
+                _ = self.timers.orderedRemove(i);
+                rt.free_q.push(t.deadline.task);
+                return;
+            }
+        }
     }
 }
 
-fn handleExpiredTimer(self: *Kqueue, t: Timer) !void {
+fn handleExpiredTimer(self: *Kqueue, rt: *io.Runtime, t: Timer) !void {
     switch (t) {
         .deadline => |deadline| {
-            defer self.releaseTask(deadline.task);
+            defer self.releaseTask(rt, deadline.task);
             if (deadline.task.state == .canceled) return;
 
-            try deadline.parent.cancel(self, null, 0, io.noopCallback);
+            try deadline.parent.cancel(rt, null, 0, io.noopCallback);
         },
 
         .timeout => |timeout| {
             const task = timeout.task;
-            defer self.releaseTask(task);
+            defer self.releaseTask(rt, task);
             if (task.state == .canceled) return;
-            try task.callback(task.userdata, self, task.msg, .{ .timer = {} });
+            try task.callback(task.userdata, rt, task.msg, .{ .timer = {} });
         },
     }
 }
@@ -511,11 +523,9 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             //    cancel_task with error.Canceled in reapCompletions
             // 5. In reapCompletions, we will return both the task and the cancel_task to the free
             //    list
-
             if (req == .all) @panic("todo");
 
-            // Always push the task to the synchronous queue
-            defer self.synchronous_queue.push(task);
+            self.synchronous_queue.push(task);
 
             const task_to_cancel = req.task;
 
@@ -530,6 +540,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             task.result = .{ .cancel = {} };
 
             task_to_cancel.state = .canceled;
+            if (task_to_cancel.deadline) |d| d.state = .canceled;
 
             switch (task_to_cancel.req) {
                 // Handled synchronously. Probably we couldn't cancel it, but if we did somehow we
@@ -644,8 +655,9 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             const arg: posix.O = .{ .NONBLOCK = true };
             const arg_u32: u32 = @bitCast(arg);
             _ = posix.fcntl(req.fd, posix.F.SETFL, arg_u32) catch {
-                defer self.free_list.push(task);
-                try task.callback(task.userdata, self, task.msg, .{ .connect = error.Unexpected });
+                task.result = .{ .connect = error.Unexpected };
+                self.synchronous_queue.push(task);
+                return;
             };
 
             if (posix.connect(req.fd, req.addr, req.addr_len)) {
@@ -661,7 +673,10 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
                         const kevent = evSet(@intCast(req.fd), EVFILT.WRITE, EV.ADD | EV.ONESHOT, task);
                         try self.submission_queue.append(self.gpa, kevent);
                     },
-                    else => task.result = .{ .connect = error.Unexpected },
+                    else => {
+                        task.result = .{ .connect = error.Unexpected };
+                        self.synchronous_queue.push(task);
+                    },
                 }
             }
         },
@@ -672,9 +687,9 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
         .msg_ring => |req| {
             const target = req.target;
 
-            target.msg_ring_mutex.lock();
-            target.msg_ring_queue.push(req.task);
-            target.msg_ring_mutex.unlock();
+            target.backend.platform.msg_ring_mutex.lock();
+            target.backend.platform.msg_ring_queue.push(req.task);
+            target.backend.platform.msg_ring_mutex.unlock();
 
             task.result = .{ .msg_ring = {} };
             self.synchronous_queue.push(task);
@@ -688,7 +703,7 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             );
             kevent.fflags |= std.c.NOTE.TRIGGER;
             // Trigger the wakeup
-            _ = try posix.kevent(target.kq, &.{kevent}, &.{}, null);
+            _ = try posix.kevent(target.backend.platform.kq, &.{kevent}, &.{}, null);
         },
 
         .noop => {
@@ -742,6 +757,10 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             try self.submission_queue.append(self.gpa, kevent);
         },
     };
+}
+
+fn addTimer(self: *Kqueue, t: Timer) !void {
+    try self.timers.append(self.gpa, t);
 }
 
 fn evSet(ident: usize, filter: i16, flags: u16, ptr: ?*anyopaque) posix.Kevent {
@@ -805,329 +824,4 @@ pub fn submit(self: *Kqueue) !void {
     // there if needed
     const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
     _ = try posix.kevent(self.kq, self.submission_queue.items, &.{}, &timeout);
-}
-
-pub fn getTask(self: *Kqueue) Allocator.Error!*io.Task {
-    return self.free_list.pop() orelse try self.gpa.create(io.Task);
-}
-
-pub fn noop(
-    self: *Kqueue,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .noop,
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn timer(
-    self: *Kqueue,
-    duration: io.Timespec,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .timer = duration },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-fn addTimer(self: *Kqueue, t: Timer) !void {
-    try self.timers.append(self.gpa, t);
-}
-
-pub fn cancelAll(self: *Kqueue) Allocator.Error!void {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = null,
-        .msg = 0,
-        .callback = io.noopCallback,
-        .req = .{ .cancel = .all },
-    };
-
-    self.work_queue.push(task);
-}
-
-pub fn accept(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .accept = fd },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-// TODO: get rid of the "result" field across the API. Users can set the task.result field
-// explicitly now
-pub fn msgRing(
-    self: *Kqueue,
-    target: *Kqueue,
-    target_task: *io.Task, // The task that the target ring will receive. The callbacks of
-    // this tsak are what will be called when the target receives the message
-    result: u16, // We only allow sending a successful result
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    // This is the task to send the message
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .msg_ring = .{
-            .target = target,
-            .result = result,
-            .task = target_task,
-        } },
-    };
-    target_task.state = .in_flight;
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn recv(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    buffer: []u8,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .recv = .{
-            .fd = fd,
-            .buffer = buffer,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn write(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    buffer: []const u8,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .write = .{
-            .fd = fd,
-            .buffer = buffer,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn writev(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    vecs: []const posix.iovec_const,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .writev = .{
-            .fd = fd,
-            .vecs = vecs,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn close(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .close = fd },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn poll(
-    self: *Kqueue,
-    fd: posix.fd_t,
-    mask: u32,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .poll = .{ .fd = fd, .mask = mask } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn socket(
-    self: *Kqueue,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .socket = .{ .domain = domain, .type = socket_type, .protocol = protocol } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn connect(
-    self: *Kqueue,
-    fd: posix.socket_t,
-    addr: *posix.sockaddr,
-    addr_len: posix.socklen_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .connect = .{ .fd = fd, .addr = addr, .addr_len = addr_len } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-test "kqueue: noop" {
-    var rt: Kqueue = try .init(std.testing.allocator, 0);
-    defer rt.deinit();
-
-    const Foo = struct {
-        val: usize = 0,
-        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
-            const self = io.ptrCast(@This(), ptr);
-            self.val += 1;
-        }
-    };
-
-    var foo: Foo = .{};
-
-    // noop is triggered synchronously with submit. If we wait, we'll be waiting forever
-    _ = try rt.noop(&foo, 0, Foo.callback);
-    try rt.run(.once);
-    try std.testing.expectEqual(1, foo.val);
-    _ = try rt.noop(&foo, 0, Foo.callback);
-    _ = try rt.noop(&foo, 0, Foo.callback);
-    try rt.run(.once);
-    // try std.testing.expectEqual(3, foo.val);
-}
-
-test "kqueue: timer" {
-    var rt: Kqueue = try .init(std.testing.allocator, 0);
-    defer rt.deinit();
-
-    const Foo = struct {
-        val: usize = 0,
-        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
-            const self = io.ptrCast(@This(), ptr);
-            self.val += 1;
-        }
-    };
-
-    var foo: Foo = .{};
-
-    const start = std.time.nanoTimestamp();
-    const end = start + 100 * std.time.ns_per_ms;
-    _ = try rt.timer(.{ .nsec = 100 * std.time.ns_per_ms }, &foo, 0, Foo.callback);
-    try rt.run(.once);
-    try std.testing.expect(std.time.nanoTimestamp() > end);
-    try std.testing.expectEqual(1, foo.val);
-}
-
-test "kqueue: poll" {
-    var rt: Kqueue = try .init(std.testing.allocator, 0);
-    defer rt.deinit();
-
-    const Foo = struct {
-        val: usize = 0,
-        fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, result: io.Result) anyerror!void {
-            _ = result.poll catch |err| return err;
-            const self = io.ptrCast(@This(), ptr);
-            self.val += 1;
-        }
-    };
-
-    var foo: Foo = .{};
-    const pipe = try posix.pipe2(.{ .CLOEXEC = true });
-
-    _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
-    try std.testing.expectEqual(1, rt.work_queue.len());
-
-    _ = try posix.write(pipe[1], "io_uring is better");
-    try rt.run(.once);
-    try std.testing.expectEqual(1, foo.val);
 }

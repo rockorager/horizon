@@ -10,21 +10,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const use_mock_io = b.option(
-        bool,
-        "use_mock_io",
-        "Use a mocked IO runtime (default=false)",
-    ) orelse false;
-    const io_test_options = b.addOptions();
-    io_test_options.addOption(bool, "use_mock_io", use_mock_io);
-
     const io_module = b.addModule("io", .{
         .root_source_file = b.path("src/io/io.zig"),
         .target = target,
         .optimize = optimize,
     });
-
-    io_module.addOptions("test_options", io_test_options);
 
     horizon_module.addImport("io", io_module);
 

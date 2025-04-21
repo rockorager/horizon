@@ -2,7 +2,6 @@ const Uring = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const test_options = @import("test_options");
 
 const io = @import("io.zig");
 
@@ -21,28 +20,26 @@ const common_flags: u32 =
 
 const msg_ring_received_cqe = 1 << 8;
 
-gpa: Allocator,
 ring: linux.IoUring,
-free_list: Queue(io.Task, .free) = .{},
-work_queue: Queue(io.Task, .in_flight) = .{},
 in_flight: Queue(io.Task, .in_flight) = .{},
-run_cond: io.RunCondition,
 eventfd: ?posix.fd_t = null,
 
 /// Initialize a Ring
-pub fn init(gpa: Allocator, entries: u16) !Uring {
+pub fn init(_: Allocator, entries: u16) !Uring {
     var params = std.mem.zeroInit(linux.io_uring_params, .{
         .flags = common_flags,
         .sq_thread_idle = 1000,
     });
 
-    return .{ .gpa = gpa, .ring = try .init_params(entries, &params), .run_cond = .once };
+    return .{ .ring = try .init_params(entries, &params) };
 }
 
-pub fn deinit(self: *Uring) void {
-    while (self.free_list.pop()) |task| self.gpa.destroy(task);
-    while (self.work_queue.pop()) |task| self.gpa.destroy(task);
-    while (self.in_flight.pop()) |task| self.gpa.destroy(task);
+pub fn done(self: *Uring) bool {
+    return self.in_flight.empty();
+}
+
+pub fn deinit(self: *Uring, gpa: Allocator) void {
+    while (self.in_flight.pop()) |task| gpa.destroy(task);
 
     if (self.ring.fd >= 0) {
         self.ring.deinit();
@@ -72,19 +69,6 @@ pub fn initChild(self: Uring, entries: u16) !Uring {
     };
 }
 
-pub fn run(self: *Uring, limit: io.RunCondition) !void {
-    self.run_cond = limit;
-    while (true) {
-        try self.submitAndWait();
-        try self.reapCompletions();
-        switch (self.run_cond) {
-            .once => return,
-            .until_done => if (self.in_flight.empty() and self.work_queue.empty()) return,
-            .forever => {},
-        }
-    }
-}
-
 /// Return a file descriptor which can be used to poll the ring for completions
 pub fn pollableFd(self: *Uring) !posix.fd_t {
     if (self.eventfd) |fd| return fd;
@@ -94,7 +78,7 @@ pub fn pollableFd(self: *Uring) !posix.fd_t {
     return fd;
 }
 
-pub fn reapCompletions(self: *Uring) anyerror!void {
+pub fn reapCompletions(self: *Uring, rt: *io.Runtime) anyerror!void {
     var cqes: [64]linux.io_uring_cqe = undefined;
     const n = self.ring.copy_cqes(&cqes, 0) catch |err| {
         switch (err) {
@@ -197,25 +181,25 @@ pub fn reapCompletions(self: *Uring) anyerror!void {
             .userfd, .userptr => unreachable,
         };
 
-        try task.callback(task.userdata, self, task.msg, result);
+        try task.callback(task.userdata, rt, task.msg, result);
 
         if (cqe.flags & msg_ring_received_cqe != 0) {
             // This message was received from another ring. We don't decrement inflight for this.
             // But we do need to set the task as free because we will add it to our free list
-            self.free_list.push(task);
+            rt.free_q.push(task);
         } else if (cqe.flags & linux.IORING_CQE_F_MORE == 0) {
             // If the cqe doesn't have IORING_CQE_F_MORE set, then this task is complete and free to
             // be rescheduled
             task.state = .complete;
             self.in_flight.remove(task);
-            self.free_list.push(task);
+            rt.free_q.push(task);
         }
     }
 }
 
-pub fn submitAndWait(self: *Uring) !void {
+pub fn submitAndWait(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
     var sqes_available = self.sqesAvailable();
-    while (self.work_queue.pop()) |task| {
+    while (queue.pop()) |task| {
         const sqes_required = sqesRequired(task);
         if (sqes_available < sqes_required) {
             sqes_available += try self.ring.submit();
@@ -236,9 +220,9 @@ pub fn submitAndWait(self: *Uring) !void {
     }
 }
 
-pub fn submit(self: *Uring) !void {
+pub fn submit(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
     var sqes_available = self.sqesAvailable();
-    while (self.work_queue.pop()) |task| {
+    while (queue.pop()) |task| {
         const sqes_required = sqesRequired(task);
         if (sqes_available < sqes_required) {
             sqes_available += try self.ring.submit();
@@ -298,7 +282,8 @@ fn prepTask(self: *Uring, task: *io.Task) void {
 
         .msg_ring => |msg| {
             const sqe = self.getSqe();
-            sqe.prep_rw(.MSG_RING, msg.target.ring.fd, 0, msg.result, @intFromPtr(msg.task));
+            const fd = msg.target.backend.platform.ring.fd;
+            sqe.prep_rw(.MSG_RING, fd, 0, msg.result, @intFromPtr(msg.task));
             sqe.user_data = @intFromPtr(task);
             // Pass flags on the sent CQE. We use this to distinguish between a received message and
             // a message freom our own loop
@@ -388,343 +373,7 @@ fn cqeToE(result: i32) std.posix.E {
     return .SUCCESS;
 }
 
-pub fn getTask(self: *Uring) Allocator.Error!*io.Task {
-    return self.free_list.pop() orelse try self.gpa.create(io.Task);
-}
-
-pub fn noop(
-    self: *Uring,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .noop,
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn timer(
-    self: *Uring,
-    duration: io.Timespec,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .timer = duration },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn cancelAll(self: *Uring) Allocator.Error!void {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = null,
-        .msg = 0,
-        .callback = io.noopCallback,
-        .req = .{ .cancel = .all },
-    };
-
-    self.work_queue.push(task);
-}
-
-pub fn accept(
-    self: *Uring,
-    fd: posix.fd_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .accept = fd },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn msgRing(
-    self: *Uring,
-    target: *Uring,
-    target_task: *io.Task, // The task that the target ring will receive. The callbacks of
-    // this tsak are what will be called when the target receives the message
-    result: u16, // We only allow sending a successful result
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    // This is the task to send the message
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .msg_ring = .{
-            .target = target,
-            .result = result,
-            .task = target_task,
-        } },
-    };
-    target_task.state = .in_flight;
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn recv(
-    self: *Uring,
-    fd: posix.fd_t,
-    buffer: []u8,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .recv = .{
-            .fd = fd,
-            .buffer = buffer,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn write(
-    self: *Uring,
-    fd: posix.fd_t,
-    buffer: []const u8,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .write = .{
-            .fd = fd,
-            .buffer = buffer,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn writev(
-    self: *Uring,
-    fd: posix.fd_t,
-    vecs: []const posix.iovec_const,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .writev = .{
-            .fd = fd,
-            .vecs = vecs,
-        } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn close(
-    self: *Uring,
-    fd: posix.fd_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .close = fd },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn poll(
-    self: *Uring,
-    fd: posix.fd_t,
-    mask: u32,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .poll = .{ .fd = fd, .mask = mask } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn socket(
-    self: *Uring,
-    domain: u32,
-    socket_type: u32,
-    protocol: u32,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .socket = .{ .domain = domain, .type = socket_type, .protocol = protocol } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
-pub fn connect(
-    self: *Uring,
-    fd: posix.socket_t,
-    addr: *posix.sockaddr,
-    addr_len: posix.socklen_t,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
-) Allocator.Error!*io.Task {
-    const task = try self.getTask();
-    task.* = .{
-        .userdata = userdata,
-        .msg = msg,
-        .callback = callback,
-        .req = .{ .connect = .{ .fd = fd, .addr = addr, .addr_len = addr_len } },
-    };
-
-    self.work_queue.push(task);
-    return task;
-}
-
 fn unexpectedError(err: posix.E) posix.UnexpectedError {
     std.log.err("unexpected posix error: {}", .{err});
     return error.Unexpected;
-}
-
-/// Foo is only for testing
-const Foo = struct {
-    bar: usize = 0,
-
-    fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
-        const self = io.ptrCast(@This(), ptr);
-        self.bar += 1;
-    }
-};
-
-test "uring: inflight" {
-    const gpa = std.testing.allocator;
-    var ring: Uring = try .init(gpa, 16);
-    defer ring.deinit();
-
-    var foo: Foo = .{};
-    const task = try ring.noop(&foo, 0, Foo.callback);
-    try task.setDeadline(&ring, .{ .sec = 1 });
-
-    try ring.submitAndWait();
-
-    try std.testing.expect(task.state == .in_flight);
-    try std.testing.expectEqual(2, ring.in_flight.len());
-
-    try ring.reapCompletions();
-}
-
-test "uring: deadline doesn't call user callback" {
-    const gpa = std.testing.allocator;
-    var ring: Uring = try .init(gpa, 16);
-    defer ring.deinit();
-
-    var foo: Foo = .{};
-    const task = try ring.noop(&foo, 0, Foo.callback);
-    try task.setDeadline(&ring, .{ .sec = 1 });
-
-    try ring.run(.until_done);
-
-    // Callback only called once
-    try std.testing.expectEqual(1, foo.bar);
-}
-
-test "uring: timeout" {
-    const gpa = std.testing.allocator;
-    var ring: Uring = try .init(gpa, 16);
-    defer ring.deinit();
-
-    var foo: Foo = .{};
-
-    const delay = 1 * std.time.ns_per_ms;
-    _ = try ring.timer(
-        .{ .nsec = delay },
-        &foo,
-        0,
-        Foo.callback,
-    );
-
-    const start = std.time.nanoTimestamp();
-    try ring.run(.until_done);
-    try std.testing.expect(start + delay < std.time.nanoTimestamp());
-    try std.testing.expectEqual(1, foo.bar);
-}
-
-test "uring: cancel" {
-    const gpa = std.testing.allocator;
-    var ring: Uring = try .init(gpa, 16);
-    defer ring.deinit();
-
-    var foo: Foo = .{};
-
-    const delay = 1 * std.time.ns_per_ms;
-    const task = try ring.timer(
-        .{ .nsec = delay },
-        &foo,
-        0,
-        Foo.callback,
-    );
-
-    try task.cancel(&ring, null, 0, io.noopCallback);
-
-    const start = std.time.nanoTimestamp();
-    try ring.run(.until_done);
-    // Expect that we didn't delay long enough
-    try std.testing.expect(start + delay > std.time.nanoTimestamp());
-    try std.testing.expectEqual(1, foo.bar);
 }
