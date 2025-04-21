@@ -42,14 +42,15 @@ pub const Client = struct {
                         defer rt.gpa.destroy(self);
                         // send the error to the callback
                         try self.callback(self.userdata, rt, self.msg, .{ .userptr = err });
+                        rt.gpa.destroy(self);
                         return;
                     };
 
                     if (self.handshake.done()) {
+                        defer rt.gpa.destroy(self);
                         // Handshake is done. Create a client and deliver it to the callback
                         const client = try self.initClient(rt.gpa);
                         try self.callback(self.userdata, rt, self.msg, .{ .userptr = client });
-                        rt.gpa.destroy(self);
                         return;
                     }
 
@@ -60,9 +61,9 @@ pub const Client = struct {
                 .recv => {
                     self.recv_task = null;
                     const n = result.recv catch |err| {
+                        defer rt.gpa.destroy(self);
                         // send the error to the callback
                         try self.callback(self.userdata, rt, self.msg, .{ .userptr = err });
-                        rt.gpa.destroy(self);
                         return;
                     };
 
@@ -84,10 +85,10 @@ pub const Client = struct {
                     }
 
                     if (self.handshake.done()) {
+                        defer rt.gpa.destroy(self);
                         // Handshake is done. Create a client and deliver it to the callback
                         const client = try self.initClient(rt.gpa);
                         try self.callback(self.userdata, rt, self.msg, .{ .userptr = client });
-                        rt.gpa.destroy(self);
                         return;
                     }
                 },
