@@ -160,7 +160,7 @@ fn prepTask(self: *Uring, task: *io.Task) void {
         .msg_ring => |msg| {
             const sqe = self.getSqe();
             const fd = msg.target.backend.platform.ring.fd;
-            sqe.prep_rw(.MSG_RING, fd, 0, msg.result, @intFromPtr(msg.task));
+            sqe.prep_rw(.MSG_RING, fd, 0, 0, @intFromPtr(msg.task));
             sqe.user_data = @intFromPtr(task);
             // Pass flags on the sent CQE. We use this to distinguish between a received message and
             // a message freom our own loop

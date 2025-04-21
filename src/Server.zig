@@ -181,7 +181,6 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
                 _ = try rt.msgRing(
                     &self.worker.ring,
                     target_task,
-                    0,
                     self,
                     @intFromEnum(Msg.msg_ring_fail),
                     handleMsg,
@@ -201,7 +200,6 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
                 _ = try rt.msgRing(
                     &worker.ring,
                     target_task,
-                    0,
                     self,
                     @intFromEnum(Msg.msg_ring_fail),
                     handleMsg,
@@ -447,7 +445,6 @@ const Worker = struct {
         _ = try self.ring.msgRing(
             self.server.ring,
             target_task,
-            0,
             null,
             0,
             io.noopCallback,

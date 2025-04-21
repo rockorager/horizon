@@ -251,8 +251,7 @@ pub const Runtime = struct {
         self: *Runtime,
         target: *Runtime,
         target_task: *Task, // The task that the target ring will receive. The callbacks of
-        // this tsak are what will be called when the target receives the message
-        result: u16, // We only allow sending a successful result
+        // this task are what will be called when the target receives the message
         userdata: ?*anyopaque,
         msg: u16,
         callback: Callback,
@@ -265,7 +264,6 @@ pub const Runtime = struct {
             .callback = callback,
             .req = .{ .msg_ring = .{
                 .target = target,
-                .result = result,
                 .task = target_task,
             } },
         };
@@ -440,8 +438,11 @@ pub const Op = enum {
     socket,
     connect,
 
+    /// userfd is meant to send file descriptors between Runtime instances (using msgRing)
     userfd,
+    /// usermsg is meant to send a u16 between runtime instances (using msgRing)
     usermsg,
+    /// userptr is meant to send a pointer between runtime instances (using msgRing)
     userptr,
 };
 
@@ -456,7 +457,6 @@ pub const Request = union(Op) {
     accept: posix.fd_t,
     msg_ring: struct {
         target: *Runtime,
-        result: u16,
         task: *Task,
     },
     recv: struct {
