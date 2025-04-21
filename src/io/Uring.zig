@@ -58,11 +58,7 @@ pub fn initChild(self: Uring, entries: u16) !Uring {
         .wq_fd = @as(u32, @bitCast(self.ring.fd)),
     });
 
-    return .{
-        .gpa = self.gpa,
-        .ring = try .init_params(entries, &params),
-        .run_cond = .once,
-    };
+    return .{ .ring = try .init_params(entries, &params) };
 }
 
 pub fn done(self: *Uring) bool {

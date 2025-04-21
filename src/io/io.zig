@@ -73,7 +73,7 @@ pub const Backend = union(enum) {
     pub fn initChild(self: *Backend, entries: u16) !Backend {
         switch (self.*) {
             .mock => return .{ .mock = .{} },
-            .platfrom => |*p| return .{ .platform = try p.initChild(entries) },
+            .platform => |*p| return .{ .platform = try p.initChild(entries) },
         }
     }
 
@@ -81,6 +81,12 @@ pub const Backend = union(enum) {
         switch (self.*) {
             inline else => |*backend| backend.deinit(gpa),
         }
+    }
+
+    pub fn pollableFd(self: *Backend) !posix.fd_t {
+        return switch (self.*) {
+            inline else => |*backend| backend.pollableFd(),
+        };
     }
 
     pub fn submitAndWait(self: *Backend, queue: *SubmissionQueue) !void {
@@ -119,17 +125,21 @@ pub const Runtime = struct {
     backend: Backend,
     gpa: Allocator,
 
-    completion_q: CompletionQueue,
-    submission_q: SubmissionQueue,
-    free_q: FreeQueue,
+    completion_q: CompletionQueue = .{},
+    submission_q: SubmissionQueue = .{},
+    free_q: FreeQueue = .{},
 
     pub fn init(gpa: Allocator, entries: u16) !Runtime {
         return .{
             .backend = .{ .platform = try .init(gpa, entries) },
             .gpa = gpa,
-            .free_q = .{},
-            .submission_q = .{},
-            .completion_q = .{},
+        };
+    }
+
+    pub fn initChild(self: *Runtime, entries: u16) !Runtime {
+        return .{
+            .backend = try self.backend.initChild(entries),
+            .gpa = self.gpa,
         };
     }
 

@@ -135,7 +135,7 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
 
             switch (builtin.os.tag) {
                 .linux => {
-                    const fd = self.worker.ring.pollableFd() catch unreachable;
+                    const fd = self.worker.ring.backend.pollableFd() catch unreachable;
                     var buf: [8]u8 = undefined;
                     _ = posix.read(fd, &buf) catch |err| {
                         switch (err) {
@@ -149,7 +149,7 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
 
             // Rearm the poll task
             self.poll_task = try rt.poll(
-                try self.worker.ring.pollableFd(),
+                try self.worker.ring.backend.pollableFd(),
                 posix.POLL.IN,
                 self,
                 @intFromEnum(Msg.main_worker_ready),
@@ -244,8 +244,8 @@ fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) any
     // We reap and submit our main worker ring here. It's possible that in this function our eventfd
     // won't wake up when we send a msg_ring message. Both of these calls are nonblocking, and we
     // only are in this function if we are shutting down, so we don't care too much about perf
-    try self.worker.ring.reapCompletions();
-    try self.worker.ring.submit();
+    try self.worker.ring.backend.reapCompletions(&self.worker.ring);
+    try self.worker.ring.backend.submit(&self.worker.ring.submission_q);
 }
 
 pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void {
@@ -265,7 +265,7 @@ pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void
         var sock_len = self.addr.getOsSockLen();
         try posix.getsockname(self.worker.fd, &self.addr.any, &sock_len);
 
-        try self.worker.ring.submit();
+        try self.worker.ring.backend.submit(&self.worker.ring.submission_q);
     }
 
     for (self.workers, 0..) |*worker, i| {
@@ -279,7 +279,7 @@ pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void
     }
     // The main server ring needs a callback from the main ioring
     self.poll_task = try rt.poll(
-        try self.worker.ring.pollableFd(),
+        try self.worker.ring.backend.pollableFd(),
         posix.POLL.IN,
         self,
         @intFromEnum(Server.Msg.main_worker_ready),
@@ -431,7 +431,7 @@ const Worker = struct {
     fn maybeClose(self: *Worker) !void {
         if (self.state != .shutting_down or self.keep_alive > 0) return;
         self.state = .done;
-        if (!self.ring.in_flight.empty()) {
+        if (!self.ring.backend.done()) {
             // TODO: track only our tasks in a doubly linked list and only cancel our tasks
             try self.ring.cancelAll();
         }
