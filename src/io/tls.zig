@@ -39,9 +39,9 @@ pub const Client = struct {
                 .write => {
                     self.write_task = null;
                     _ = result.write catch |err| {
+                        defer rt.gpa.destroy(self);
                         // send the error to the callback
                         try self.callback(self.userdata, rt, self.msg, .{ .userptr = err });
-                        rt.gpa.destroy(self);
                         return;
                     };
 
