@@ -9,12 +9,11 @@ jobs:
   test-io:
     strategy:
       matrix:
-        # os: [ubuntu-latest, macos-latest]
-        os: [macos-latest]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{matrix.os}}
     steps:
       - uses: actions/checkout@v3
       - uses: mlugg/setup-zig@v1
         with:
           version: 0.14.0
-      - run: zig build -Duse_mock_io=false --summary all test-io
+      - run: zig build --summary all test-io
