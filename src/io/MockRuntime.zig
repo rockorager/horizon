@@ -48,19 +48,6 @@ pub fn initChild(_: MockRuntime, entries: u16) !MockRuntime {
     return init(undefined, entries);
 }
 
-pub fn run(self: *MockRuntime, limit: io.RunCondition) !void {
-    self.run_cond = limit;
-    while (true) {
-        try self.submitAndWait();
-        try self.reapCompletions();
-        switch (self.run_cond) {
-            .once => return,
-            .until_done => if (self.work_queue.empty()) return,
-            .forever => {},
-        }
-    }
-}
-
 /// Return a file descriptor which can be used to poll the ring for completions
 pub fn pollableFd(_: *MockRuntime) !posix.fd_t {
     return -1;

@@ -78,7 +78,7 @@ pub fn pollableFd(self: *Uring) !posix.fd_t {
     return fd;
 }
 
-pub fn submitAndWait(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
+pub fn submitAndWait(self: *Uring, queue: *io.SubmissionQueue) !void {
     var sqes_available = self.sqesAvailable();
     while (queue.pop()) |task| {
         const sqes_required = sqesRequired(task);
@@ -101,7 +101,7 @@ pub fn submitAndWait(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
     }
 }
 
-pub fn submit(self: *Uring, queue: *Queue(io.Task, .in_flight)) !void {
+pub fn submit(self: *Uring, queue: *io.SubmissionQueue) !void {
     var sqes_available = self.sqesAvailable();
     while (queue.pop()) |task| {
         const sqes_required = sqesRequired(task);

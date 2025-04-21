@@ -133,9 +133,8 @@ pub fn initChild(self: Kqueue, entries: u16) !Kqueue {
     return init(self.gpa, entries);
 }
 
-pub fn submitAndWait(self: *Kqueue, queue: *Queue(io.Task, .in_flight)) !void {
+pub fn submitAndWait(self: *Kqueue, queue: *io.SubmissionQueue) !void {
     defer self.submission_queue.clearRetainingCapacity();
-    const tail = queue.tail;
     while (queue.pop()) |task| {
         try self.prepTask(task);
 
@@ -143,12 +142,6 @@ pub fn submitAndWait(self: *Kqueue, queue: *Queue(io.Task, .in_flight)) !void {
         if (task.deadline) |deadline| {
             try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
         }
-
-        // We make sure we never go past the tail we had when we started. We do this to break a
-        // possible infinite loop for tasks which only ever loop through synchronous ops. By
-        // breaking at the tail, we don't go past the submissions we had when we started to submit,
-        // giving asynchronous ops a chance to be reaped
-        if (task == tail.?) break;
     }
 
     // Sort our timers
@@ -193,10 +186,9 @@ fn wait(self: *Kqueue) !void {
     );
 }
 
-pub fn submit(self: *Kqueue) !void {
+pub fn submit(self: *Kqueue, queue: *io.SubmissionQueue) !void {
     defer self.submission_queue.clearRetainingCapacity();
-    const tail = self.work_queue.tail;
-    while (self.work_queue.pop()) |task| {
+    while (queue.pop()) |task| {
         try self.prepTask(task);
 
         // If this task is queued and has a deadline we need to schedule a timer
@@ -204,12 +196,6 @@ pub fn submit(self: *Kqueue) !void {
             const deadline = task.deadline.?;
             try self.addTimer(.{ .deadline = .{ .task = deadline, .parent = task } });
         }
-
-        // We make sure we never go past the tail we had when we started. We do this to break a
-        // possible infinite loop for tasks which only ever loop through synchronous ops. By
-        // breaking at the tail, we don't go past the submissions we had when we started to submit,
-        // giving asynchronous ops a chance to be reaped
-        if (task == tail.?) break;
     }
 
     // Sort our timers
@@ -221,286 +207,6 @@ pub fn submit(self: *Kqueue) !void {
     // there if needed
     const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
     _ = try posix.kevent(self.kq, self.submission_queue.items, &.{}, &timeout);
-}
-
-pub fn done(self: *Kqueue) bool {
-    if (self.timers.items.len == 0 and
-        self.in_flight.empty() and
-        self.submission_queue.items.len == 0)
-    {
-        self.msg_ring_mutex.lock();
-        defer self.msg_ring_mutex.unlock();
-        return self.msg_ring_queue.empty();
-    }
-
-    return false;
-}
-
-/// Return a file descriptor which can be used to poll the ring for completions
-pub fn pollableFd(self: Kqueue) !posix.fd_t {
-    return self.kq;
-}
-
-pub fn reapCompletions(self: *Kqueue, rt: *io.Runtime) anyerror!void {
-    defer self.event_idx = 0;
-    if (self.event_idx == 0) {
-        const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-        self.event_idx = try posix.kevent(self.kq, self.submission_queue.items, &self.events, &timeout);
-    }
-
-    for (self.events[0..self.event_idx]) |event| {
-        // if the event is a USER filter, we check our msg_ring_queue
-        if (event.filter == EVFILT.USER) {
-            switch (UserMsg.fromInt(event.data)) {
-                .wakeup => {
-                    // We got a message in our msg_ring_queue
-                    self.msg_ring_mutex.lock();
-                    defer self.msg_ring_mutex.unlock();
-
-                    while (self.msg_ring_queue.pop()) |task| {
-                        // For canceled msg_rings we do nothing
-                        if (task.state == .canceled) continue;
-
-                        defer self.releaseTask(rt, task);
-                        const result: io.Result = task.result orelse .noop;
-                        try task.callback(task.userdata, rt, task.msg, result);
-                    }
-                },
-            }
-            continue;
-        }
-
-        const task: *io.Task = @ptrFromInt(event.udata);
-        if (task.state == .canceled) continue;
-        try self.handleCompletion(rt, task, event);
-    }
-
-    // Return synchronous tasks to the freelist
-    while (self.synchronous_queue.pop()) |task| {
-        try self.handleSynchronousCompletion(rt, task);
-    }
-
-    const now = std.time.milliTimestamp();
-    while (self.timers.getLastOrNull()) |t| {
-        if (t.expiresInMs(now) > 0) break;
-        _ = self.timers.pop();
-        try self.handleExpiredTimer(rt, t);
-    }
-}
-
-/// Handle a completion which was done synchronously. The work has already been done, we just need
-/// to call the callback and return the task(s) to the free list
-fn handleSynchronousCompletion(
-    self: *Kqueue,
-    rt: *io.Runtime,
-    task: *io.Task,
-) !void {
-    switch (task.req) {
-        // async tasks
-        .accept,
-        .poll,
-        .recv,
-        .write,
-        .writev,
-
-        // Deadlines and timers are handled separately
-        .deadline,
-        .timer,
-        => unreachable,
-
-        .connect, // connect is handled both sync and async
-        .close,
-        .msg_ring,
-        .noop,
-        .socket,
-        .userfd,
-        .usermsg,
-        .userptr,
-        => {
-            assert(task.result != null);
-            defer self.releaseTask(rt, task);
-            try task.callback(task.userdata, rt, task.msg, task.result.?);
-        },
-
-        .cancel => |c| {
-            assert(task.result != null);
-            defer self.releaseTask(rt, task);
-            try task.callback(task.userdata, rt, task.msg, task.result.?);
-
-            switch (c) {
-                .all => @panic("TODO"),
-
-                .task => |ct| {
-                    // If the cancel had an error, we don't need to return the task_to_cancel
-                    _ = task.result.?.cancel catch return;
-                    // On success, it is our job to call the canceled tasks' callback and return the
-                    // task to the free list
-                    defer self.releaseTask(rt, ct);
-                    const result: io.Result = switch (ct.req) {
-                        .accept => .{ .accept = error.Canceled },
-                        .cancel => .{ .cancel = error.Canceled },
-                        .close => .{ .close = error.Canceled },
-                        .connect => .{ .connect = error.Canceled },
-                        .deadline => .{ .deadline = error.Canceled },
-                        .msg_ring => .{ .msg_ring = error.Canceled },
-                        .noop => unreachable,
-                        .poll => .{ .poll = error.Canceled },
-                        .recv => .{ .recv = error.Canceled },
-                        .socket => .{ .socket = error.Canceled },
-                        .timer => .{ .timer = error.Canceled },
-                        .userfd, .usermsg, .userptr => unreachable,
-                        .write => .{ .write = error.Canceled },
-                        .writev => .{ .writev = error.Canceled },
-                    };
-                    ct.result = result;
-                    try ct.callback(ct.userdata, rt, ct.msg, ct.result.?);
-                },
-            }
-        },
-    }
-}
-
-fn dataToE(result: i64) std.posix.E {
-    if (result > 0) {
-        return @as(std.posix.E, @enumFromInt(-result));
-    }
-    return .SUCCESS;
-}
-
-fn unexpectedError(err: posix.E) posix.UnexpectedError {
-    std.log.err("unexpected posix error: {}", .{err});
-    return error.Unexpected;
-}
-
-fn handleCompletion(
-    self: *Kqueue,
-    rt: *io.Runtime,
-    task: *io.Task,
-    event: posix.Kevent,
-) !void {
-    switch (task.req) {
-        .cancel,
-        .close,
-        .deadline,
-        .msg_ring,
-        .noop,
-        .socket,
-        .timer,
-        .userfd,
-        .usermsg,
-        .userptr,
-        => unreachable,
-
-        .accept => |req| {
-            // Accept is a multishot request, so we don't remove it from the in_flight queue
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .accept = err });
-            }
-            const fd = posix.accept(req, null, null, 0) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .accept = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .accept = fd });
-        },
-
-        .connect => {
-            defer self.releaseTask(rt, task);
-            self.in_flight.remove(task);
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .connect = err });
-            }
-            return task.callback(task.userdata, rt, task.msg, .{ .connect = {} });
-        },
-
-        .poll => {
-            defer self.releaseTask(rt, task);
-            self.in_flight.remove(task);
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .poll = err });
-            }
-            return task.callback(task.userdata, rt, task.msg, .{ .poll = {} });
-        },
-
-        .recv => |req| {
-            defer self.releaseTask(rt, task);
-            self.in_flight.remove(task);
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .recv = err });
-            }
-            const n = posix.recv(req.fd, req.buffer, 0) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .recv = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .recv = n });
-        },
-
-        .write => |req| {
-            defer self.releaseTask(rt, task);
-            self.in_flight.remove(task);
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .write = err });
-            }
-            const n = posix.write(req.fd, req.buffer) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .write = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .write = n });
-        },
-
-        .writev => |req| {
-            defer self.releaseTask(rt, task);
-            self.in_flight.remove(task);
-            if (event.flags & EV.ERROR != 0) {
-                // Interpret data as an errno
-                const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .writev = err });
-            }
-            const n = posix.writev(req.fd, req.vecs) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .writev = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .writev = n });
-        },
-    }
-}
-
-fn releaseTask(self: *Kqueue, rt: *io.Runtime, task: *io.Task) void {
-    rt.free_q.push(task);
-    if (task.deadline) |d| {
-        // remove the deadline
-        for (self.timers.items, 0..) |t, i| {
-            if (t == .deadline and t.deadline.task == d) {
-                // Remove the timer
-                _ = self.timers.orderedRemove(i);
-                rt.free_q.push(t.deadline.task);
-                return;
-            }
-        }
-    }
-}
-
-fn handleExpiredTimer(self: *Kqueue, rt: *io.Runtime, t: Timer) !void {
-    switch (t) {
-        .deadline => |deadline| {
-            defer self.releaseTask(rt, deadline.task);
-            if (deadline.task.state == .canceled) return;
-
-            try deadline.parent.cancel(rt, null, 0, io.noopCallback);
-        },
-
-        .timeout => |timeout| {
-            const task = timeout.task;
-            defer self.releaseTask(rt, task);
-            if (task.state == .canceled) return;
-            try task.callback(task.userdata, rt, task.msg, .{ .timer = {} });
-        },
-    }
 }
 
 /// preps a task to be submitted into the kqueue
@@ -795,4 +501,289 @@ fn evSet(ident: usize, filter: i16, flags: u16, ptr: ?*anyopaque) posix.Kevent {
 
         else => @compileError("kqueue not supported"),
     };
+}
+
+pub fn done(self: *Kqueue) bool {
+    if (self.timers.items.len == 0 and
+        self.in_flight.empty() and
+        self.submission_queue.items.len == 0)
+    {
+        self.msg_ring_mutex.lock();
+        defer self.msg_ring_mutex.unlock();
+        return self.msg_ring_queue.empty();
+    }
+
+    return false;
+}
+
+/// Return a file descriptor which can be used to poll the ring for completions
+pub fn pollableFd(self: Kqueue) !posix.fd_t {
+    return self.kq;
+}
+
+pub fn reapCompletions(self: *Kqueue, rt: *io.Runtime) anyerror!void {
+    defer self.event_idx = 0;
+
+    if (self.event_idx == 0) {
+        const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
+        self.event_idx = try posix.kevent(
+            self.kq,
+            self.submission_queue.items,
+            &self.events,
+            &timeout,
+        );
+    }
+
+    for (self.events[0..self.event_idx]) |event| {
+        // if the event is a USER filter, we check our msg_ring_queue
+        if (event.filter == EVFILT.USER) {
+            switch (UserMsg.fromInt(event.data)) {
+                .wakeup => {
+                    // We got a message in our msg_ring_queue
+                    self.msg_ring_mutex.lock();
+                    defer self.msg_ring_mutex.unlock();
+
+                    while (self.msg_ring_queue.pop()) |task| {
+                        // For canceled msg_rings we do nothing
+                        if (task.state == .canceled) continue;
+
+                        defer self.releaseTask(rt, task);
+                        const result: io.Result = task.result orelse .noop;
+                        try task.callback(task.userdata, rt, task.msg, result);
+                    }
+                },
+            }
+            continue;
+        }
+
+        const task: *io.Task = @ptrFromInt(event.udata);
+        if (task.state == .canceled) continue;
+        try self.handleCompletion(rt, task, event);
+    }
+
+    while (self.synchronous_queue.pop()) |task| {
+        try self.handleSynchronousCompletion(rt, task);
+    }
+
+    const now = std.time.milliTimestamp();
+    while (self.timers.getLastOrNull()) |t| {
+        if (t.expiresInMs(now) > 0) break;
+        _ = self.timers.pop();
+        try self.handleExpiredTimer(rt, t);
+    }
+}
+
+/// Handle a completion which was done synchronously. The work has already been done, we just need
+/// to call the callback and return the task(s) to the free list
+fn handleSynchronousCompletion(
+    self: *Kqueue,
+    rt: *io.Runtime,
+    task: *io.Task,
+) !void {
+    switch (task.req) {
+        // async tasks
+        .accept,
+        .poll,
+        .recv,
+        .write,
+        .writev,
+
+        // Deadlines and timers are handled separately
+        .deadline,
+        .timer,
+        => unreachable,
+
+        .connect, // connect is handled both sync and async
+        .close,
+        .msg_ring,
+        .noop,
+        .socket,
+        .userfd,
+        .usermsg,
+        .userptr,
+        => {
+            assert(task.result != null);
+            defer self.releaseTask(rt, task);
+            try task.callback(task.userdata, rt, task.msg, task.result.?);
+        },
+
+        .cancel => |c| {
+            assert(task.result != null);
+            defer self.releaseTask(rt, task);
+            try task.callback(task.userdata, rt, task.msg, task.result.?);
+
+            switch (c) {
+                .all => @panic("TODO"),
+
+                .task => |ct| {
+                    // If the cancel had an error, we don't need to return the task_to_cancel
+                    _ = task.result.?.cancel catch return;
+                    // On success, it is our job to call the canceled tasks' callback and return the
+                    // task to the free list
+                    defer self.releaseTask(rt, ct);
+                    const result: io.Result = switch (ct.req) {
+                        .accept => .{ .accept = error.Canceled },
+                        .cancel => .{ .cancel = error.Canceled },
+                        .close => .{ .close = error.Canceled },
+                        .connect => .{ .connect = error.Canceled },
+                        .deadline => .{ .deadline = error.Canceled },
+                        .msg_ring => .{ .msg_ring = error.Canceled },
+                        .noop => unreachable,
+                        .poll => .{ .poll = error.Canceled },
+                        .recv => .{ .recv = error.Canceled },
+                        .socket => .{ .socket = error.Canceled },
+                        .timer => .{ .timer = error.Canceled },
+                        .userfd, .usermsg, .userptr => unreachable,
+                        .write => .{ .write = error.Canceled },
+                        .writev => .{ .writev = error.Canceled },
+                    };
+                    ct.result = result;
+                    try ct.callback(ct.userdata, rt, ct.msg, ct.result.?);
+                },
+            }
+        },
+    }
+}
+
+fn dataToE(result: i64) std.posix.E {
+    if (result > 0) {
+        return @as(std.posix.E, @enumFromInt(-result));
+    }
+    return .SUCCESS;
+}
+
+fn unexpectedError(err: posix.E) posix.UnexpectedError {
+    std.log.err("unexpected posix error: {}", .{err});
+    return error.Unexpected;
+}
+
+fn handleCompletion(
+    self: *Kqueue,
+    rt: *io.Runtime,
+    task: *io.Task,
+    event: posix.Kevent,
+) !void {
+    switch (task.req) {
+        .cancel,
+        .close,
+        .deadline,
+        .msg_ring,
+        .noop,
+        .socket,
+        .timer,
+        .userfd,
+        .usermsg,
+        .userptr,
+        => unreachable,
+
+        .accept => |req| {
+            // Accept is a multishot request, so we don't remove it from the in_flight queue
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .accept = err });
+            }
+            const fd = posix.accept(req, null, null, 0) catch {
+                return task.callback(task.userdata, rt, task.msg, .{ .accept = error.Unexpected });
+            };
+            return task.callback(task.userdata, rt, task.msg, .{ .accept = fd });
+        },
+
+        .connect => {
+            defer self.releaseTask(rt, task);
+            self.in_flight.remove(task);
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .connect = err });
+            }
+            return task.callback(task.userdata, rt, task.msg, .{ .connect = {} });
+        },
+
+        .poll => {
+            defer self.releaseTask(rt, task);
+            self.in_flight.remove(task);
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .poll = err });
+            }
+            return task.callback(task.userdata, rt, task.msg, .{ .poll = {} });
+        },
+
+        .recv => |req| {
+            defer self.releaseTask(rt, task);
+            self.in_flight.remove(task);
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .recv = err });
+            }
+            const n = posix.recv(req.fd, req.buffer, 0) catch {
+                return task.callback(task.userdata, rt, task.msg, .{ .recv = error.Unexpected });
+            };
+            return task.callback(task.userdata, rt, task.msg, .{ .recv = n });
+        },
+
+        .write => |req| {
+            defer self.releaseTask(rt, task);
+            self.in_flight.remove(task);
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .write = err });
+            }
+            const n = posix.write(req.fd, req.buffer) catch {
+                return task.callback(task.userdata, rt, task.msg, .{ .write = error.Unexpected });
+            };
+            return task.callback(task.userdata, rt, task.msg, .{ .write = n });
+        },
+
+        .writev => |req| {
+            defer self.releaseTask(rt, task);
+            self.in_flight.remove(task);
+            if (event.flags & EV.ERROR != 0) {
+                // Interpret data as an errno
+                const err = unexpectedError(dataToE(event.data));
+                return task.callback(task.userdata, rt, task.msg, .{ .writev = err });
+            }
+            const n = posix.writev(req.fd, req.vecs) catch {
+                return task.callback(task.userdata, rt, task.msg, .{ .writev = error.Unexpected });
+            };
+            return task.callback(task.userdata, rt, task.msg, .{ .writev = n });
+        },
+    }
+}
+
+fn releaseTask(self: *Kqueue, rt: *io.Runtime, task: *io.Task) void {
+    rt.free_q.push(task);
+    if (task.deadline) |d| {
+        // remove the deadline
+        for (self.timers.items, 0..) |t, i| {
+            if (t == .deadline and t.deadline.task == d) {
+                // Remove the timer
+                _ = self.timers.orderedRemove(i);
+                rt.free_q.push(t.deadline.task);
+                return;
+            }
+        }
+    }
+}
+
+fn handleExpiredTimer(self: *Kqueue, rt: *io.Runtime, t: Timer) !void {
+    switch (t) {
+        .deadline => |deadline| {
+            defer self.releaseTask(rt, deadline.task);
+            if (deadline.task.state == .canceled) return;
+
+            try deadline.parent.cancel(rt, null, 0, io.noopCallback);
+        },
+
+        .timeout => |timeout| {
+            const task = timeout.task;
+            defer self.releaseTask(rt, task);
+            if (task.state == .canceled) return;
+            try task.callback(task.userdata, rt, task.msg, .{ .timer = {} });
+        },
+    }
 }
