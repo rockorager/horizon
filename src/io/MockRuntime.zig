@@ -30,7 +30,7 @@ usermsg_cb: ?*const fn (*io.Task) io.Result = null,
 userptr_cb: ?*const fn (*io.Task) io.Result = null,
 
 /// Initialize a Ring
-pub fn init(_: Allocator, _: u16) !MockRuntime {
+pub fn init(_: u16) !MockRuntime {
     return .{};
 }
 
@@ -45,7 +45,7 @@ pub fn done(self: *MockRuntime) bool {
 /// Initializes a child Ring which can be woken up by self. This must be called from the thread
 /// which will operate the child ring. Initializes with the same queue size as the parent
 pub fn initChild(_: MockRuntime, entries: u16) !MockRuntime {
-    return init(undefined, entries);
+    return init(entries);
 }
 
 /// Return a file descriptor which can be used to poll the ring for completions

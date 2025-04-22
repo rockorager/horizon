@@ -27,10 +27,6 @@ pub const Task = @import("Task.zig");
 pub const Callback = *const fn (*Runtime, Task) anyerror!void;
 pub fn noopCallback(_: *Runtime, _: Task) anyerror!void {}
 
-pub fn ptrCast(comptime T: type, ptr: ?*anyopaque) *T {
-    return @ptrCast(@alignCast(ptr));
-}
-
 pub const RunCondition = enum {
     once,
     until_done,
@@ -149,7 +145,7 @@ pub const Runtime = struct {
 
     pub fn initMock(gpa: Allocator, entries: u16) !Runtime {
         return .{
-            .backend = .{ .mock = try .init(gpa, entries) },
+            .backend = .{ .mock = try .init(entries) },
             .gpa = gpa,
             .free_q = .{},
             .submission_q = .{},
