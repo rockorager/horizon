@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const horizon = @import("horizon");
-const io = @import("io");
+const io = @import("ourio");
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -15,7 +15,7 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var ring = try io.Runtime.init(gpa, 64);
+    var ring = try io.Ring.init(gpa, 64);
     defer ring.deinit();
 
     var server: horizon.Server = undefined;

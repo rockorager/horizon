@@ -2,7 +2,7 @@ const Server = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const io = @import("io");
+const io = @import("ourio");
 const hz = @import("main.zig");
 const sniff = @import("sniff.zig");
 
@@ -27,7 +27,7 @@ timeout: Timeouts,
 
 shutdown_timeout: u8,
 
-ring: *io.Runtime,
+ring: *io.Ring,
 
 exited_workers: u16 = 0,
 
@@ -113,7 +113,7 @@ const Msg = enum {
     worker_shutdown,
 };
 
-fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
     const self = task.userdataCast(Server);
     const result = task.result.?;
 
@@ -251,7 +251,7 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
     try self.worker.ring.backend.submit(&self.worker.ring.submission_q);
 }
 
-pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void {
+pub fn listenAndServe(self: *Server, rt: *io.Ring, handler: hz.Handler) !void {
     self.ring = rt;
 
     {
@@ -316,7 +316,7 @@ pub fn stop(self: *Server) !void {
 
 const Worker = struct {
     gpa: Allocator,
-    ring: io.Runtime,
+    ring: io.Ring,
     conn_pool: MemoryPool(Connection),
     state: Worker.State,
     timeout: Timeouts,
@@ -380,7 +380,7 @@ const Worker = struct {
         };
     }
 
-    fn run(self: *Worker, main: *io.Runtime) !void {
+    fn run(self: *Worker, main: *io.Ring) !void {
         self.ring = try main.initChild(64);
         try posix.listen(self.fd, 64);
         self.accept_task = try self.ring.accept(
@@ -400,7 +400,7 @@ const Worker = struct {
         self.ring.deinit();
     }
 
-    fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+    fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
         const self = task.userdataCast(Worker);
         const result = task.result.?;
         switch (task.msgToEnum(Worker.Msg)) {
@@ -526,7 +526,7 @@ pub const Connection = struct {
         destroy,
     };
 
-    fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+    fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
         const self = task.userdataCast(Connection);
         const result = task.result.?;
         state: switch (task.msgToEnum(Connection.Msg)) {
@@ -805,7 +805,7 @@ pub const Connection = struct {
 
 test "server" {
     const gpa = std.testing.allocator;
-    var ring = try io.Runtime.init(gpa, 8);
+    var ring = try io.Ring.init(gpa, 8);
     defer ring.deinit();
 
     var server: Server = undefined;

@@ -10,37 +10,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const io_module = b.addModule("io", .{
-        .root_source_file = b.path("src/io/io.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const ourio_dep = b.dependency("ourio", .{ .target = target, .optimize = optimize });
+    const ourio_mod = ourio_dep.module("ourio");
 
-    horizon_module.addImport("io", io_module);
+    horizon_module.addImport("ourio", ourio_mod);
 
     const zeit_dep = b.dependency("zeit", .{ .target = target, .optimize = optimize });
     horizon_module.addImport("zeit", zeit_dep.module("zeit"));
 
     const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
     horizon_module.addImport("tls", tls_dep.module("tls"));
-    io_module.addImport("tls", tls_dep.module("tls"));
 
     const unit_tests = b.addTest(.{ .root_module = horizon_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);
     run_unit_tests.skip_foreign_checks = true;
-    const install_hz_tests = b.addInstallBinFile(unit_tests.getEmittedBin(), "test-horizon");
-    const hz_test_step = b.step("test-horizon", "Run horizon unit tests");
+    const install_hz_tests = b.addInstallBinFile(unit_tests.getEmittedBin(), "test");
+    const hz_test_step = b.step("test", "Run horizon unit tests");
     hz_test_step.dependOn(&run_unit_tests.step);
     hz_test_step.dependOn(&install_hz_tests.step);
-
-    const io_tests = b.addTest(.{ .root_module = io_module });
-    const run_io_tests = b.addRunArtifact(io_tests);
-    run_io_tests.skip_foreign_checks = true;
-    const install_io_tests = b.addInstallBinFile(io_tests.getEmittedBin(), "test-io");
-
-    const test_step = b.step("test-io", "Run io unit tests");
-    test_step.dependOn(&run_io_tests.step);
-    test_step.dependOn(&install_io_tests.step);
 
     // Bench run command
     {
@@ -57,7 +44,7 @@ pub fn build(b: *std.Build) void {
                     .optimize = optimize,
                 });
                 hz_exe.root_module.addImport("horizon", horizon_module);
-                hz_exe.root_module.addImport("io", io_module);
+                hz_exe.root_module.addImport("ourio", ourio_mod);
                 b.installArtifact(hz_exe);
 
                 break :blk b.addRunArtifact(hz_exe);
@@ -119,7 +106,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         example_exe.root_module.addImport("horizon", horizon_module);
-        example_exe.root_module.addImport("io", io_module);
+        example_exe.root_module.addImport("ourio", ourio_mod);
         b.installArtifact(example_exe);
 
         const run_cmd = b.addRunArtifact(example_exe);

@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = @import("io");
+const io = @import("ourio");
 const tls = @import("tls");
 
 const http = std.http;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = @import("io");
+const io = @import("ourio");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -35,7 +35,7 @@ pub const Context = struct {
     /// the underlying Connection, meaning users may store a these and perform additional async
     /// tasks before calling ctx.sendResponse. Eg, fetching external data from an API, performing a
     /// DB query asynchronously, etc
-    ring: *io.Runtime,
+    ring: *io.Ring,
 
     pub fn expired(self: Context) bool {
         if (self.deadline == 0) return false;
