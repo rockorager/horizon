@@ -148,9 +148,11 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
             self.poll_task = try rt.poll(
                 try self.worker.ring.backend.pollableFd(),
                 posix.POLL.IN,
-                self,
-                @intFromEnum(Msg.main_worker_ready),
-                handleMsg,
+                .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Msg.main_worker_ready),
+                    .cb = handleMsg,
+                },
             );
         },
 
@@ -161,9 +163,11 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
             // Set our shutdown timer
             self.shutdown_timer = try rt.timer(
                 .{ .sec = self.shutdown_timeout },
-                self,
-                @intFromEnum(Msg.shutdown_timeout),
-                handleMsg,
+                .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Msg.shutdown_timeout),
+                    .cb = handleMsg,
+                },
             );
 
             {
@@ -178,9 +182,11 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
                 _ = try rt.msgRing(
                     &self.worker.ring,
                     target_task,
-                    self,
-                    @intFromEnum(Msg.msg_ring_fail),
-                    handleMsg,
+                    .{
+                        .ptr = self,
+                        .msg = @intFromEnum(Msg.msg_ring_fail),
+                        .cb = handleMsg,
+                    },
                 );
             }
 
@@ -197,9 +203,11 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
                 _ = try rt.msgRing(
                     &worker.ring,
                     target_task,
-                    self,
-                    @intFromEnum(Msg.msg_ring_fail),
-                    handleMsg,
+                    .{
+                        .ptr = self,
+                        .msg = @intFromEnum(Msg.msg_ring_fail),
+                        .cb = handleMsg,
+                    },
                 );
             }
         },
@@ -207,7 +215,7 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
         .shutdown_timeout => {
             self.shutdown_timer = null;
             if (self.poll_task) |pt| {
-                _ = try pt.cancel(rt, null, 0, io.noopCallback);
+                _ = try pt.cancel(rt, .{});
                 self.poll_task = null;
             }
         },
@@ -225,11 +233,11 @@ fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
                     thread.join();
                 }
                 if (self.poll_task) |pt| {
-                    _ = try pt.cancel(rt, null, 0, io.noopCallback);
+                    _ = try pt.cancel(rt, .{});
                     self.poll_task = null;
                 }
                 if (self.shutdown_timer) |timer| {
-                    _ = try timer.cancel(rt, null, 0, io.noopCallback);
+                    _ = try timer.cancel(rt, .{});
                     self.shutdown_timer = null;
                 }
             }
@@ -250,12 +258,11 @@ pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void
         self.worker = try .init(self.gpa, self.timeout, handler, self.addr, self);
         self.worker.ring = try rt.initChild(64);
         try posix.listen(self.worker.fd, 64);
-        self.worker.accept_task = try self.worker.ring.accept(
-            self.worker.fd,
-            &self.worker,
-            @intFromEnum(Worker.Msg.new_connection),
-            Worker.handleMsg,
-        );
+        self.worker.accept_task = try self.worker.ring.accept(self.worker.fd, .{
+            .ptr = &self.worker,
+            .msg = @intFromEnum(Worker.Msg.new_connection),
+            .cb = Worker.handleMsg,
+        });
 
         var sock_len = self.addr.getOsSockLen();
         try posix.getsockname(self.worker.fd, &self.addr.any, &sock_len);
@@ -273,20 +280,16 @@ pub fn listenAndServe(self: *Server, rt: *io.Runtime, handler: hz.Handler) !void
         );
     }
     // The main server ring needs a callback from the main ioring
-    self.poll_task = try rt.poll(
-        try self.worker.ring.backend.pollableFd(),
-        posix.POLL.IN,
-        self,
-        @intFromEnum(Server.Msg.main_worker_ready),
-        handleMsg,
-    );
-    _ = try rt.poll(
-        self.stop_pipe[0],
-        posix.POLL.IN,
-        self,
-        @intFromEnum(Server.Msg.shutdown),
-        handleMsg,
-    );
+    self.poll_task = try rt.poll(try self.worker.ring.backend.pollableFd(), posix.POLL.IN, .{
+        .ptr = self,
+        .msg = @intFromEnum(Server.Msg.main_worker_ready),
+        .cb = Server.handleMsg,
+    });
+    _ = try rt.poll(self.stop_pipe[0], posix.POLL.IN, .{
+        .ptr = self,
+        .msg = @intFromEnum(Server.Msg.shutdown),
+        .cb = Server.handleMsg,
+    });
 }
 
 pub fn deinit(self: *Server, gpa: Allocator) void {
@@ -296,7 +299,7 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
     }
 
     if (self.poll_task) |pt| {
-        _ = pt.cancel(self.ring, null, 0, io.noopCallback) catch {};
+        _ = pt.cancel(self.ring, .{}) catch {};
         self.poll_task = null;
     }
 
@@ -382,9 +385,11 @@ const Worker = struct {
         try posix.listen(self.fd, 64);
         self.accept_task = try self.ring.accept(
             self.fd,
-            self,
-            @intFromEnum(Worker.Msg.new_connection),
-            Worker.handleMsg,
+            .{
+                .ptr = self,
+                .msg = @intFromEnum(Worker.Msg.new_connection),
+                .cb = Worker.handleMsg,
+            },
         );
 
         try self.ring.run(.until_done);
@@ -414,7 +419,7 @@ const Worker = struct {
 
             .shutdown => {
                 self.state = .shutting_down;
-                _ = try self.accept_task.cancel(rt, null, 0, io.noopCallback);
+                _ = try self.accept_task.cancel(rt, .{});
                 try self.maybeClose();
             },
         }
@@ -436,13 +441,7 @@ const Worker = struct {
             .req = .usermsg,
         };
 
-        _ = try self.ring.msgRing(
-            self.server.ring,
-            target_task,
-            null,
-            0,
-            io.noopCallback,
-        );
+        _ = try self.ring.msgRing(self.server.ring, target_task, .{});
     }
 };
 
@@ -502,9 +501,11 @@ pub const Connection = struct {
         const task = try worker.ring.recv(
             fd,
             &self.buf,
-            self,
-            @intFromEnum(Connection.Msg.reading_headers),
-            Connection.handleMsg,
+            .{
+                .ptr = self,
+                .msg = @intFromEnum(Connection.Msg.reading_headers),
+                .cb = Connection.handleMsg,
+            },
         );
         if (worker.timeout.read_header > 0) {
             try task.setDeadline(&worker.ring, .{ .sec = self.deadline });
@@ -556,13 +557,11 @@ pub const Connection = struct {
 
                     false => {
                         // We haven't received a full HEAD. prep another recv
-                        const new_task = try rt.recv(
-                            self.fd,
-                            &self.buf,
-                            self,
-                            @intFromEnum(Connection.Msg.reading_headers),
-                            Connection.handleMsg,
-                        );
+                        const new_task = try rt.recv(self.fd, &self.buf, .{
+                            .ptr = self,
+                            .msg = @intFromEnum(Connection.Msg.reading_headers),
+                            .cb = Connection.handleMsg,
+                        });
                         if (self.worker.timeout.read_header > 0) {
                             try new_task.setDeadline(rt, .{ .sec = self.deadline });
                         }
@@ -613,13 +612,11 @@ pub const Connection = struct {
 
                 // Keep the connection alive
                 self.reset();
-                const new_task = try rt.recv(
-                    self.fd,
-                    &self.buf,
-                    self,
-                    @intFromEnum(Connection.Msg.reading_headers),
-                    Connection.handleMsg,
-                );
+                const new_task = try rt.recv(self.fd, &self.buf, .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Connection.Msg.reading_headers),
+                    .cb = Connection.handleMsg,
+                });
                 if (self.worker.timeout.idle > 0) {
                     self.deadline = std.time.timestamp() + self.worker.timeout.idle;
                     try new_task.setDeadline(rt, .{ .sec = self.deadline });
@@ -627,12 +624,11 @@ pub const Connection = struct {
             },
 
             .close => {
-                _ = try rt.close(
-                    self.fd,
-                    self,
-                    @intFromEnum(Connection.Msg.destroy),
-                    Connection.handleMsg,
-                );
+                _ = try rt.close(self.fd, .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Connection.Msg.destroy),
+                    .cb = Connection.handleMsg,
+                });
             },
 
             .destroy => {
@@ -716,13 +712,11 @@ pub const Connection = struct {
 
         self.state = .reading_body;
 
-        _ = try self.worker.ring.recv(
-            self.fd,
-            &self.buf,
-            self,
-            @intFromEnum(Connection.Msg.reading_body),
-            Connection.handleMsg,
-        );
+        _ = try self.worker.ring.recv(self.fd, &self.buf, .{
+            .ptr = self,
+            .msg = @intFromEnum(Connection.Msg.reading_body),
+            .cb = Connection.handleMsg,
+        });
     }
 
     pub fn prepareResponse(self: *Connection) !void {
@@ -754,13 +748,11 @@ pub const Connection = struct {
                 .body_only;
 
         const new_task = switch (wstate) {
-            .headers_only => try self.worker.ring.write(
-                self.fd,
-                headers[self.written..],
-                self,
-                @intFromEnum(Connection.Msg.write_response),
-                Connection.handleMsg,
-            ),
+            .headers_only => try self.worker.ring.write(self.fd, headers[self.written..], .{
+                .ptr = self,
+                .msg = @intFromEnum(Connection.Msg.write_response),
+                .cb = Connection.handleMsg,
+            }),
 
             .headers_and_body => blk: {
                 const unwritten = headers[self.written..];
@@ -773,25 +765,21 @@ pub const Connection = struct {
                     .len = body.len,
                 };
 
-                break :blk try self.worker.ring.writev(
-                    self.fd,
-                    &self.vecs,
-                    self,
-                    @intFromEnum(Connection.Msg.write_response),
-                    Connection.handleMsg,
-                );
+                break :blk try self.worker.ring.writev(self.fd, &self.vecs, .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Connection.Msg.write_response),
+                    .cb = Connection.handleMsg,
+                });
             },
 
             .body_only => blk: {
                 const offset = self.written - headers.len;
                 const unwritten_body = body[offset..];
-                break :blk try self.worker.ring.write(
-                    self.fd,
-                    unwritten_body,
-                    self,
-                    @intFromEnum(Connection.Msg.write_response),
-                    Connection.handleMsg,
-                );
+                break :blk try self.worker.ring.write(self.fd, unwritten_body, .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Connection.Msg.write_response),
+                    .cb = Connection.handleMsg,
+                });
             },
         };
 
