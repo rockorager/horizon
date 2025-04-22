@@ -637,8 +637,22 @@ test "runtime: cancel all" {
     var rt = try io.Runtime.init(gpa, 16);
     defer rt.deinit();
 
-    var foo: Foo = .{};
-    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+    const Foo2 = struct {
+        bar: usize = 0,
+
+        fn callback(_: *io.Runtime, task: io.Task) anyerror!void {
+            const self = task.userdataCast(@This());
+            const result = task.result.?;
+            _ = result.timer catch |err| {
+                switch (err) {
+                    error.Canceled => self.bar += 1,
+                    else => {},
+                }
+            };
+        }
+    };
+    var foo: Foo2 = .{};
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo2.callback };
 
     const delay = 1 * std.time.ns_per_s;
     _ = try rt.timer(.{ .nsec = delay }, ctx);
