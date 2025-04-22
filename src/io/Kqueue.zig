@@ -785,7 +785,7 @@ fn handleExpiredTimer(self: *Kqueue, rt: *io.Runtime, t: Timer) !void {
             defer self.releaseTask(rt, deadline.task);
             if (deadline.task.state == .canceled) return;
 
-            try deadline.parent.cancel(rt, null, 0, io.noopCallback);
+            try deadline.parent.cancel(rt, .{});
         },
 
         .timeout => |timeout| {
