@@ -634,3 +634,25 @@ test "runtime: cancel" {
     try std.testing.expect(start + delay > std.time.nanoTimestamp());
     try std.testing.expectEqual(1, foo.bar);
 }
+
+test "runtime: cancel all" {
+    const gpa = std.testing.allocator;
+    var rt = try io.Runtime.init(gpa, 16);
+    defer rt.deinit();
+
+    var foo: Foo = .{};
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+
+    const delay = 1 * std.time.ns_per_s;
+    _ = try rt.timer(.{ .nsec = delay }, ctx);
+    _ = try rt.timer(.{ .nsec = delay }, ctx);
+    _ = try rt.timer(.{ .nsec = delay }, ctx);
+    _ = try rt.timer(.{ .nsec = delay }, ctx);
+
+    try rt.cancelAll();
+    const start = std.time.nanoTimestamp();
+    try rt.run(.until_done);
+    // Expect that we didn't delay long enough
+    try std.testing.expect(start + delay > std.time.nanoTimestamp());
+    try std.testing.expectEqual(4, foo.bar);
+}

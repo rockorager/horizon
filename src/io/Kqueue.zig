@@ -230,122 +230,36 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
             //    cancel_task with error.Canceled in reapCompletions
             // 5. In reapCompletions, we will return both the task and the cancel_task to the free
             //    list
-            if (req == .all) @panic("todo");
 
             self.synchronous_queue.push(task);
 
-            const task_to_cancel = req.task;
-
-            switch (task_to_cancel.state) {
-                .free, .canceled, .complete => {
-                    task.result = .{ .cancel = error.NotCanceled };
-                    return;
-                },
-                .in_flight => {},
-            }
-
             task.result = .{ .cancel = {} };
+            switch (req) {
+                .all => {
+                    while (self.in_flight.head) |t| {
+                        defer self.synchronous_queue.push(t);
 
-            task_to_cancel.state = .canceled;
-            if (task_to_cancel.deadline) |d| d.state = .canceled;
-
-            switch (task_to_cancel.req) {
-                // Handled synchronously. Probably we couldn't cancel it, but if we did somehow we
-                // don't need to do anything either way
-                .cancel,
-                .close,
-                .msg_ring,
-                .noop,
-                .socket,
-                .userfd,
-                .usermsg,
-                .userptr,
-                => {},
-
-                .accept => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    const kevent = evSet(@intCast(cancel_req), EVFILT.READ, EV.DELETE, task_to_cancel);
-                    try self.submission_queue.append(self.gpa, kevent);
-                },
-
-                .connect => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    const kevent = evSet(
-                        @intCast(cancel_req.fd),
-                        EVFILT.WRITE,
-                        EV.DELETE,
-                        task_to_cancel,
-                    );
-                    try self.submission_queue.append(self.gpa, kevent);
-                },
-
-                .deadline => {
-                    // What does it mean to cancel a deadline? We remove the deadline from
-                    // the parent and the timer from our list
-                    for (self.timers.items, 0..) |t, i| {
-                        if (t == .deadline and t.deadline.task == task_to_cancel) {
-                            // Set the parent deadline to null
-                            t.deadline.parent.deadline = null;
-                            // Remove the timer
-                            _ = self.timers.orderedRemove(i);
-                            return;
-                        }
-                    } else task.result = .{ .cancel = error.EntryNotFound };
-                },
-
-                .poll => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    if (cancel_req.mask & posix.POLL.IN != 0) {
-                        const kevent = evSet(@intCast(cancel_req.fd), EVFILT.READ, EV.DELETE, task);
-                        try self.submission_queue.append(self.gpa, kevent);
+                        self.cancelTask(t) catch continue;
                     }
-                    if (cancel_req.mask & posix.POLL.OUT != 0) {
-                        const kevent = evSet(@intCast(cancel_req.fd), EVFILT.WRITE, EV.DELETE, task);
-                        try self.submission_queue.append(self.gpa, kevent);
+
+                    while (self.timers.getLastOrNull()) |tmr| {
+                        switch (tmr) {
+                            inline else => |v| {
+                                defer self.synchronous_queue.push(v.task);
+                                self.cancelTask(v.task) catch continue;
+                            },
+                        }
                     }
                 },
-
-                .recv => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    const kevent = evSet(
-                        @intCast(cancel_req.fd),
-                        EVFILT.READ,
-                        EV.DELETE,
-                        task_to_cancel,
-                    );
-                    try self.submission_queue.append(self.gpa, kevent);
-                },
-
-                .timer => {
-                    for (self.timers.items, 0..) |t, i| {
-                        if (t == .timeout and t.timeout.task == task_to_cancel) {
-                            // Remove the timer
-                            _ = self.timers.orderedRemove(i);
+                .task => |task_to_cancel| {
+                    switch (task_to_cancel.state) {
+                        .free, .canceled, .complete => {
+                            task.result = .{ .cancel = error.NotCanceled };
                             return;
-                        }
-                    } else task.result = .{ .cancel = error.EntryNotFound };
-                },
-
-                .write => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    const kevent = evSet(
-                        @intCast(cancel_req.fd),
-                        EVFILT.WRITE,
-                        EV.DELETE,
-                        task_to_cancel,
-                    );
-                    try self.submission_queue.append(self.gpa, kevent);
-                },
-
-                .writev => |cancel_req| {
-                    self.in_flight.remove(task_to_cancel);
-                    const kevent = evSet(
-                        @intCast(cancel_req.fd),
-                        EVFILT.WRITE,
-                        EV.DELETE,
-                        task_to_cancel,
-                    );
-                    try self.submission_queue.append(self.gpa, kevent);
+                        },
+                        .in_flight => {},
+                    }
+                    try self.cancelTask(task_to_cancel);
                 },
             }
         },
@@ -466,6 +380,119 @@ fn prepTask(self: *Kqueue, task: *io.Task) !void {
     };
 }
 
+fn cancelTask(self: *Kqueue, task: *io.Task) !void {
+    task.state = .canceled;
+    if (task.deadline) |d| d.state = .canceled;
+
+    switch (task.req) {
+        // Handled synchronously. Probably we couldn't cancel it, but if we did somehow we
+        // don't need to do anything either way
+        .cancel,
+        .close,
+        .msg_ring,
+        .noop,
+        .socket,
+        .userfd,
+        .usermsg,
+        .userptr,
+        => {},
+
+        .accept => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .accept = error.Canceled };
+            const kevent = evSet(@intCast(cancel_req), EVFILT.READ, EV.DELETE, task);
+            try self.submission_queue.append(self.gpa, kevent);
+        },
+
+        .connect => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .connect = error.Canceled };
+            const kevent = evSet(
+                @intCast(cancel_req.fd),
+                EVFILT.WRITE,
+                EV.DELETE,
+                task,
+            );
+            try self.submission_queue.append(self.gpa, kevent);
+        },
+
+        .deadline => {
+            // What does it mean to cancel a deadline? We remove the deadline from
+            // the parent and the timer from our list
+            for (self.timers.items, 0..) |t, i| {
+                if (t == .deadline and t.deadline.task == task) {
+                    // Set the parent deadline to null
+                    t.deadline.parent.deadline = null;
+                    // Remove the timer
+                    _ = self.timers.orderedRemove(i);
+                    task.result = .{ .deadline = error.Canceled };
+                    return;
+                }
+            } else task.result = .{ .cancel = error.EntryNotFound };
+        },
+
+        .poll => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .poll = error.Canceled };
+            if (cancel_req.mask & posix.POLL.IN != 0) {
+                const kevent = evSet(@intCast(cancel_req.fd), EVFILT.READ, EV.DELETE, task);
+                try self.submission_queue.append(self.gpa, kevent);
+            }
+            if (cancel_req.mask & posix.POLL.OUT != 0) {
+                const kevent = evSet(@intCast(cancel_req.fd), EVFILT.WRITE, EV.DELETE, task);
+                try self.submission_queue.append(self.gpa, kevent);
+            }
+        },
+
+        .recv => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .recv = error.Canceled };
+            const kevent = evSet(
+                @intCast(cancel_req.fd),
+                EVFILT.READ,
+                EV.DELETE,
+                task,
+            );
+            try self.submission_queue.append(self.gpa, kevent);
+        },
+
+        .timer => {
+            for (self.timers.items, 0..) |t, i| {
+                if (t == .timeout and t.timeout.task == task) {
+                    // Remove the timer
+                    _ = self.timers.orderedRemove(i);
+                    task.result = .{ .timer = error.Canceled };
+                    return;
+                }
+            } else task.result = .{ .cancel = error.EntryNotFound };
+        },
+
+        .write => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .write = error.Canceled };
+            const kevent = evSet(
+                @intCast(cancel_req.fd),
+                EVFILT.WRITE,
+                EV.DELETE,
+                task,
+            );
+            try self.submission_queue.append(self.gpa, kevent);
+        },
+
+        .writev => |cancel_req| {
+            self.in_flight.remove(task);
+            task.result = .{ .writev = error.Canceled };
+            const kevent = evSet(
+                @intCast(cancel_req.fd),
+                EVFILT.WRITE,
+                EV.DELETE,
+                task,
+            );
+            try self.submission_queue.append(self.gpa, kevent);
+        },
+    }
+}
+
 fn addTimer(self: *Kqueue, t: Timer) !void {
     try self.timers.append(self.gpa, t);
 }
@@ -581,17 +608,16 @@ fn handleSynchronousCompletion(
     task: *io.Task,
 ) !void {
     switch (task.req) {
-        // async tasks
+        // async tasks. These can be handled synchronously in a cancel all
         .accept,
         .poll,
         .recv,
         .write,
         .writev,
 
-        // Deadlines and timers are handled separately
+        // Timers can be handled synchronously in a cancel all
         .deadline,
         .timer,
-        => unreachable,
 
         .connect, // connect is handled both sync and async
         .close,
@@ -613,7 +639,7 @@ fn handleSynchronousCompletion(
             try task.callback(rt, task.*);
 
             switch (c) {
-                .all => @panic("TODO"),
+                .all => {},
 
                 .task => |ct| {
                     // If the cancel had an error, we don't need to return the task_to_cancel
