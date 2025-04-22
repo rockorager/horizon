@@ -111,16 +111,13 @@ const Msg = enum {
     shutdown_timeout,
     msg_ring_fail,
     worker_shutdown,
-
-    fn fromInt(v: u16) Msg {
-        return @enumFromInt(v);
-    }
 };
 
-fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
-    const self = io.ptrCast(Server, ptr);
+fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+    const self = task.userdataCast(Server);
+    const result = task.result.?;
 
-    switch (Msg.fromInt(msg)) {
+    switch (task.msgToEnum(Server.Msg)) {
         .main_worker_ready => {
             assert(result == .poll);
 
@@ -341,10 +338,6 @@ const Worker = struct {
     const Msg = enum {
         new_connection,
         shutdown,
-
-        fn fromInt(v: u16) Worker.Msg {
-            return @enumFromInt(v);
-        }
     };
 
     fn init(
@@ -402,9 +395,10 @@ const Worker = struct {
         self.ring.deinit();
     }
 
-    fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
-        const self = io.ptrCast(Worker, ptr);
-        switch (Worker.Msg.fromInt(msg)) {
+    fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+        const self = task.userdataCast(Worker);
+        const result = task.result.?;
+        switch (task.msgToEnum(Worker.Msg)) {
             .new_connection => {
                 const fd = result.accept catch |err| {
                     switch (err) {
@@ -529,15 +523,12 @@ pub const Connection = struct {
         write_response,
         close,
         destroy,
-
-        fn fromInt(v: u16) Connection.Msg {
-            return @enumFromInt(v);
-        }
     };
 
-    fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
-        const self = io.ptrCast(Connection, ptr);
-        state: switch (Connection.Msg.fromInt(msg)) {
+    fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+        const self = task.userdataCast(Connection);
+        const result = task.result.?;
+        state: switch (task.msgToEnum(Connection.Msg)) {
             .reading_headers => {
                 assert(result == .recv);
 
