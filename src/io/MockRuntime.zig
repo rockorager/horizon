@@ -83,7 +83,7 @@ pub fn submit(self: *MockRuntime, queue: *Queue(io.Task, .in_flight)) !void {
 
 pub fn reapCompletions(self: *MockRuntime, rt: *io.Runtime) anyerror!void {
     while (self.completions.pop()) |task| {
-        try task.callback(task.userdata, rt, task.msg, task.result.?);
+        try task.callback(rt, task.*);
         rt.free_q.push(task);
     }
 }

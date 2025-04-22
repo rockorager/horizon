@@ -24,8 +24,8 @@ pub const has_kqueue = switch (builtin.os.tag) {
 pub const has_io_uring = builtin.os.tag == .linux;
 
 pub const Task = @import("Task.zig");
-pub const Callback = *const fn (?*anyopaque, *Runtime, u16, Result) anyerror!void;
-pub fn noopCallback(_: ?*anyopaque, _: *Runtime, _: u16, _: Result) anyerror!void {}
+pub const Callback = *const fn (*Runtime, Task) anyerror!void;
+pub fn noopCallback(_: *Runtime, _: Task) anyerror!void {}
 
 pub fn ptrCast(comptime T: type, ptr: ?*anyopaque) *T {
     return @ptrCast(@alignCast(ptr));
@@ -162,9 +162,6 @@ pub const Runtime = struct {
         while (true) {
             try self.backend.submitAndWait(&self.submission_q);
             try self.backend.reapCompletions(self);
-            while (self.completion_q.pop()) |task| {
-                try task.callback(task.userdata, self, task.msg, task.result.?);
-            }
             switch (condition) {
                 .once => return,
                 .until_done => if (self.backend.done() and self.submission_q.empty()) return,
@@ -545,8 +542,8 @@ test {
 const Foo = struct {
     bar: usize = 0,
 
-    fn callback(ptr: ?*anyopaque, _: *io.Runtime, _: u16, _: io.Result) anyerror!void {
-        const self = io.ptrCast(@This(), ptr);
+    fn callback(_: *io.Runtime, task: io.Task) anyerror!void {
+        const self = task.userdataCast(Foo);
         self.bar += 1;
     }
 };

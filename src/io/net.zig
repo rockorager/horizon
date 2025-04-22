@@ -86,14 +86,21 @@ pub const ConnectTask = struct {
         _ = self.task.cancel(rt, null, 0, io.noopCallback) catch {};
     }
 
-    pub fn handleMsg(ptr: ?*anyopaque, rt: *io.Runtime, msg: u16, result: io.Result) anyerror!void {
-        const self = io.ptrCast(ConnectTask, ptr);
-        switch (Msg.fromInt(msg)) {
+    pub fn handleMsg(rt: *io.Runtime, task: io.Task) anyerror!void {
+        const self = task.userdataCast(ConnectTask);
+        const result = task.result.?;
+        switch (task.msgToEnum(Msg)) {
             .socket => {
                 assert(result == .socket);
                 self.fd = result.socket catch |err| {
                     defer rt.gpa.destroy(self);
-                    try self.callback(self.userdata, rt, self.msg, .{ .userfd = err });
+                    try self.callback(rt, .{
+                        .userdata = self.userdata,
+                        .msg = self.msg,
+                        .result = .{ .userfd = err },
+                        .callback = self.callback,
+                        .req = .userfd,
+                    });
                     return;
                 };
 
@@ -112,12 +119,24 @@ pub const ConnectTask = struct {
                 defer rt.gpa.destroy(self);
 
                 _ = result.connect catch |err| {
-                    try self.callback(self.userdata, rt, self.msg, .{ .userfd = err });
+                    try self.callback(rt, .{
+                        .userdata = self.userdata,
+                        .msg = self.msg,
+                        .result = .{ .userfd = err },
+                        .callback = self.callback,
+                        .req = .userfd,
+                    });
                     _ = try rt.close(self.fd.?, null, 0, io.noopCallback);
                     return;
                 };
 
-                try self.callback(self.userdata, rt, self.msg, .{ .userfd = self.fd.? });
+                try self.callback(rt, .{
+                    .userdata = self.userdata,
+                    .msg = self.msg,
+                    .result = .{ .userfd = self.fd.? },
+                    .callback = self.callback,
+                    .req = .userfd,
+                });
             },
         }
     }
@@ -140,14 +159,26 @@ test "tcp connect" {
         try std.testing.expect(rt.submission_q.pop() == null);
 
         const fd: posix.fd_t = 7;
-        try ConnectTask.handleMsg(conn, &rt, @intFromEnum(ConnectTask.Msg.socket), .{ .socket = fd });
+        try ConnectTask.handleMsg(&rt, .{
+            .userdata = conn,
+            .msg = @intFromEnum(ConnectTask.Msg.socket),
+            .result = .{ .socket = fd },
+            .req = .userfd,
+            .callback = io.noopCallback,
+        });
 
         const task2 = rt.submission_q.pop().?;
         defer std.testing.allocator.destroy(task2);
         try std.testing.expect(task2.req == .connect);
         try std.testing.expect(rt.submission_q.pop() == null);
 
-        try ConnectTask.handleMsg(conn, &rt, @intFromEnum(ConnectTask.Msg.connect), .{ .connect = {} });
+        try ConnectTask.handleMsg(&rt, .{
+            .userdata = conn,
+            .msg = @intFromEnum(ConnectTask.Msg.connect),
+            .result = .{ .connect = {} },
+            .req = .userfd,
+            .callback = io.noopCallback,
+        });
         try std.testing.expect(rt.submission_q.pop() == null);
     }
 
@@ -159,7 +190,13 @@ test "tcp connect" {
         const task1 = rt.submission_q.pop().?;
         defer std.testing.allocator.destroy(task1);
 
-        try ConnectTask.handleMsg(conn, &rt, @intFromEnum(ConnectTask.Msg.socket), .{ .socket = error.Canceled });
+        try ConnectTask.handleMsg(&rt, .{
+            .userdata = conn,
+            .msg = @intFromEnum(ConnectTask.Msg.socket),
+            .result = .{ .socket = error.Canceled },
+            .req = .userfd,
+            .callback = io.noopCallback,
+        });
         try std.testing.expect(rt.submission_q.pop() == null);
     }
 
@@ -174,14 +211,26 @@ test "tcp connect" {
         try std.testing.expect(rt.submission_q.pop() == null);
 
         const fd: posix.fd_t = 7;
-        try ConnectTask.handleMsg(conn, &rt, @intFromEnum(ConnectTask.Msg.socket), .{ .socket = fd });
+        try ConnectTask.handleMsg(&rt, .{
+            .userdata = conn,
+            .msg = @intFromEnum(ConnectTask.Msg.socket),
+            .result = .{ .socket = fd },
+            .req = .userfd,
+            .callback = io.noopCallback,
+        });
 
         const task2 = rt.submission_q.pop().?;
         defer std.testing.allocator.destroy(task2);
         try std.testing.expect(task2.req == .connect);
         try std.testing.expect(rt.submission_q.pop() == null);
 
-        try ConnectTask.handleMsg(conn, &rt, @intFromEnum(ConnectTask.Msg.connect), .{ .connect = error.Canceled });
+        try ConnectTask.handleMsg(&rt, .{
+            .userdata = conn,
+            .msg = @intFromEnum(ConnectTask.Msg.connect),
+            .result = .{ .connect = error.Canceled },
+            .req = .noop,
+            .callback = io.noopCallback,
+        });
         const task3 = rt.submission_q.pop().?;
         defer std.testing.allocator.destroy(task3);
         try std.testing.expect(task3.req == .close);

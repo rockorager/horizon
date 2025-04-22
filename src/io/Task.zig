@@ -69,3 +69,11 @@ pub fn cancel(
     };
     rt.submission_q.push(task);
 }
+
+pub fn userdataCast(self: Task, comptime T: type) *T {
+    return @ptrCast(@alignCast(self.userdata));
+}
+
+pub fn msgToEnum(self: Task, comptime Enum: type) Enum {
+    return @enumFromInt(self.msg);
+}

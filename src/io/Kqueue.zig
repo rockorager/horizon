@@ -548,8 +548,8 @@ pub fn reapCompletions(self: *Kqueue, rt: *io.Runtime) anyerror!void {
                         if (task.state == .canceled) continue;
 
                         defer self.releaseTask(rt, task);
-                        const result: io.Result = task.result orelse .noop;
-                        try task.callback(task.userdata, rt, task.msg, result);
+                        if (task.result == null) task.result = .noop;
+                        try task.callback(rt, task.*);
                     }
                 },
             }
@@ -604,13 +604,13 @@ fn handleSynchronousCompletion(
         => {
             assert(task.result != null);
             defer self.releaseTask(rt, task);
-            try task.callback(task.userdata, rt, task.msg, task.result.?);
+            try task.callback(rt, task.*);
         },
 
         .cancel => |c| {
             assert(task.result != null);
             defer self.releaseTask(rt, task);
-            try task.callback(task.userdata, rt, task.msg, task.result.?);
+            try task.callback(rt, task.*);
 
             switch (c) {
                 .all => @panic("TODO"),
@@ -638,7 +638,7 @@ fn handleSynchronousCompletion(
                         .writev => .{ .writev = error.Canceled },
                     };
                     ct.result = result;
-                    try ct.callback(ct.userdata, rt, ct.msg, ct.result.?);
+                    try ct.callback(rt, ct.*);
                 },
             }
         },
@@ -681,12 +681,15 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .accept = err });
+                task.result = .{ .accept = err };
+                return task.callback(rt, task.*);
             }
-            const fd = posix.accept(req, null, null, 0) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .accept = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .accept = fd });
+
+            if (posix.accept(req, null, null, 0)) |fd|
+                task.result = .{ .accept = fd }
+            else |_|
+                task.result = .{ .accept = error.Unexpected };
+            return task.callback(rt, task.*);
         },
 
         .connect => {
@@ -695,9 +698,9 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .connect = err });
-            }
-            return task.callback(task.userdata, rt, task.msg, .{ .connect = {} });
+                task.result = .{ .connect = err };
+            } else task.result = .{ .connect = {} };
+            return task.callback(rt, task.*);
         },
 
         .poll => {
@@ -706,9 +709,9 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .poll = err });
-            }
-            return task.callback(task.userdata, rt, task.msg, .{ .poll = {} });
+                task.result = .{ .poll = err };
+            } else task.result = .{ .poll = {} };
+            return task.callback(rt, task.*);
         },
 
         .recv => |req| {
@@ -717,12 +720,14 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .recv = err });
+                task.result = .{ .recv = err };
+                return task.callback(rt, task.*);
             }
-            const n = posix.recv(req.fd, req.buffer, 0) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .recv = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .recv = n });
+            if (posix.recv(req.fd, req.buffer, 0)) |n|
+                task.result = .{ .recv = n }
+            else |_|
+                task.result = .{ .recv = error.Unexpected };
+            return task.callback(rt, task.*);
         },
 
         .write => |req| {
@@ -731,12 +736,14 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .write = err });
+                task.result = .{ .write = err };
+                return task.callback(rt, task.*);
             }
-            const n = posix.write(req.fd, req.buffer) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .write = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .write = n });
+            if (posix.write(req.fd, req.buffer)) |n|
+                task.result = .{ .write = n }
+            else |_|
+                task.result = .{ .write = error.Unexpected };
+            return task.callback(rt, task.*);
         },
 
         .writev => |req| {
@@ -745,12 +752,14 @@ fn handleCompletion(
             if (event.flags & EV.ERROR != 0) {
                 // Interpret data as an errno
                 const err = unexpectedError(dataToE(event.data));
-                return task.callback(task.userdata, rt, task.msg, .{ .writev = err });
+                task.result = .{ .writev = err };
+                return task.callback(rt, task.*);
             }
-            const n = posix.writev(req.fd, req.vecs) catch {
-                return task.callback(task.userdata, rt, task.msg, .{ .writev = error.Unexpected });
-            };
-            return task.callback(task.userdata, rt, task.msg, .{ .writev = n });
+            if (posix.writev(req.fd, req.vecs)) |n|
+                task.result = .{ .writev = n }
+            else |_|
+                task.result = .{ .writev = error.Unexpected };
+            return task.callback(rt, task.*);
         },
     }
 }
@@ -783,7 +792,8 @@ fn handleExpiredTimer(self: *Kqueue, rt: *io.Runtime, t: Timer) !void {
             const task = timeout.task;
             defer self.releaseTask(rt, task);
             if (task.state == .canceled) return;
-            try task.callback(task.userdata, rt, task.msg, .{ .timer = {} });
+            task.result = .{ .timer = {} };
+            try task.callback(rt, task.*);
         },
     }
 }

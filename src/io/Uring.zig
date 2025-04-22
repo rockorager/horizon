@@ -254,7 +254,7 @@ pub fn reapCompletions(self: *Uring, rt: *io.Runtime) anyerror!void {
     for (cqes[0..n]) |cqe| {
         const task: *io.Task = @ptrFromInt(cqe.user_data);
 
-        const result: io.Result = switch (task.req) {
+        task.result = switch (task.req) {
             .noop => .noop,
 
             // Deadlines we don't do anything for, these are always sent to a noopCallback
@@ -346,7 +346,7 @@ pub fn reapCompletions(self: *Uring, rt: *io.Runtime) anyerror!void {
             .userfd, .userptr => unreachable,
         };
 
-        try task.callback(task.userdata, rt, task.msg, result);
+        try task.callback(rt, task.*);
 
         if (cqe.flags & msg_ring_received_cqe != 0) {
             // This message was received from another ring. We don't decrement inflight for this.
