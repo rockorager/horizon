@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const test_options = @import("test_options");
 
 const Allocator = std.mem.Allocator;
+pub const Mock = @import("Mock.zig");
 const Queue = @import("queue.zig").Intrusive;
 const io = @This();
 const posix = std.posix;
@@ -51,7 +52,7 @@ pub const Timespec = extern struct {
 };
 
 pub const Backend = union(enum) {
-    mock: @import("MockRuntime.zig"),
+    mock: Mock,
 
     platform: switch (builtin.os.tag) {
         .dragonfly,
@@ -511,7 +512,7 @@ test {
     _ = @import("queue.zig");
     _ = @import("tls.zig");
 
-    _ = @import("MockRuntime.zig");
+    _ = @import("Mock.zig");
 
     if (has_io_uring) _ = @import("Uring.zig");
     if (has_kqueue) _ = @import("Kqueue.zig");

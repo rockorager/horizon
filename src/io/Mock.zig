@@ -1,4 +1,4 @@
-const MockRuntime = @This();
+const Mock = @This();
 
 const std = @import("std");
 
@@ -30,34 +30,34 @@ usermsg_cb: ?*const fn (*io.Task) io.Result = null,
 userptr_cb: ?*const fn (*io.Task) io.Result = null,
 
 /// Initialize a Ring
-pub fn init(_: u16) !MockRuntime {
+pub fn init(_: u16) !Mock {
     return .{};
 }
 
-pub fn deinit(self: *MockRuntime, _: Allocator) void {
+pub fn deinit(self: *Mock, _: Allocator) void {
     self.* = undefined;
 }
 
-pub fn done(self: *MockRuntime) bool {
+pub fn done(self: *Mock) bool {
     return self.completions.empty();
 }
 
 /// Initializes a child Ring which can be woken up by self. This must be called from the thread
 /// which will operate the child ring. Initializes with the same queue size as the parent
-pub fn initChild(_: MockRuntime, entries: u16) !MockRuntime {
+pub fn initChild(_: Mock, entries: u16) !Mock {
     return init(entries);
 }
 
 /// Return a file descriptor which can be used to poll the ring for completions
-pub fn pollableFd(_: *MockRuntime) !posix.fd_t {
+pub fn pollableFd(_: *Mock) !posix.fd_t {
     return -1;
 }
 
-pub fn submitAndWait(self: *MockRuntime, queue: *Queue(io.Task, .in_flight)) !void {
+pub fn submitAndWait(self: *Mock, queue: *Queue(io.Task, .in_flight)) !void {
     return self.submit(queue);
 }
 
-pub fn submit(self: *MockRuntime, queue: *Queue(io.Task, .in_flight)) !void {
+pub fn submit(self: *Mock, queue: *Queue(io.Task, .in_flight)) !void {
     while (queue.pop()) |task| {
         task.result = switch (task.req) {
             .accept => if (self.accept_cb) |cb| cb(task) else return error.NoMockCallback,
@@ -81,7 +81,7 @@ pub fn submit(self: *MockRuntime, queue: *Queue(io.Task, .in_flight)) !void {
     }
 }
 
-pub fn reapCompletions(self: *MockRuntime, rt: *io.Runtime) anyerror!void {
+pub fn reapCompletions(self: *Mock, rt: *io.Runtime) anyerror!void {
     while (self.completions.pop()) |task| {
         try task.callback(rt, task.*);
         rt.free_q.push(task);
