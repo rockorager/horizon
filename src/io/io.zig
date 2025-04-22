@@ -656,3 +656,50 @@ test "runtime: cancel all" {
     try std.testing.expect(start + delay > std.time.nanoTimestamp());
     try std.testing.expectEqual(4, foo.bar);
 }
+
+test "runtime: msgRing" {
+    const gpa = std.testing.allocator;
+    var rt1 = try io.Runtime.init(gpa, 16);
+    defer rt1.deinit();
+
+    var rt2 = try rt1.initChild(16);
+    defer rt2.deinit();
+
+    const Foo2 = struct {
+        rt1: bool = false,
+        rt2: bool = true,
+
+        const Msg = enum { rt1, rt2 };
+
+        fn callback(_: *io.Runtime, task: io.Task) anyerror!void {
+            const self = task.userdataCast(@This());
+            const msg = task.msgToEnum(Msg);
+            switch (msg) {
+                .rt1 => self.rt1 = true,
+                .rt2 => self.rt2 = true,
+            }
+        }
+    };
+
+    var foo: Foo2 = .{};
+
+    // The task we will send from rt1 to rt2
+    const target_task = try rt1.getTask();
+    target_task.* = .{
+        .userdata = &foo,
+        .msg = @intFromEnum(Foo2.Msg.rt2),
+        .result = .{ .usermsg = 0 },
+    };
+
+    _ = try rt1.msgRing(
+        &rt2,
+        target_task,
+        .{ .cb = Foo2.callback, .msg = @intFromEnum(Foo2.Msg.rt1), .ptr = &foo },
+    );
+
+    try rt1.run(.until_done);
+    try rt2.run(.until_done);
+    // Expect that we didn't delay long enough
+    try std.testing.expect(foo.rt1);
+    try std.testing.expect(foo.rt2);
+}
