@@ -347,7 +347,7 @@ pub const Client = struct {
     }
 };
 
-test "tls" {
+test "tls: Client" {
     const net = @import("net.zig");
     const gpa = std.testing.allocator;
 
