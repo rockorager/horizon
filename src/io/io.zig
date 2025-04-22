@@ -678,7 +678,7 @@ test "runtime: msgRing" {
 
     const Foo2 = struct {
         rt1: bool = false,
-        rt2: bool = true,
+        rt2: bool = false,
 
         const Msg = enum { rt1, rt2 };
 
@@ -698,6 +698,7 @@ test "runtime: msgRing" {
     const target_task = try rt1.getTask();
     target_task.* = .{
         .userdata = &foo,
+        .callback = Foo2.callback,
         .msg = @intFromEnum(Foo2.Msg.rt2),
         .result = .{ .usermsg = 0 },
     };
@@ -709,8 +710,9 @@ test "runtime: msgRing" {
     );
 
     try rt1.run(.until_done);
+    try std.testing.expect(foo.rt1);
+    try std.testing.expect(!foo.rt2);
     try rt2.run(.until_done);
-    // Expect that we didn't delay long enough
     try std.testing.expect(foo.rt1);
     try std.testing.expect(foo.rt2);
 }
