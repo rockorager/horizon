@@ -11,9 +11,7 @@ pub fn tcpConnectToHost(
     rt: *io.Runtime,
     host: []const u8,
     port: u16,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
+    ctx: io.Context,
 ) !*ConnectTask {
     // TODO: getAddressList could be rewritten to be async. It accesses the filesystem and could
     // make a DNS request
@@ -24,23 +22,19 @@ pub fn tcpConnectToHost(
         break addr;
     } else return error.AddressNotFound;
 
-    return tcpConnectToAddr(rt, addr, userdata, msg, callback);
+    return tcpConnectToAddr(rt, addr, ctx);
 }
 
 pub fn tcpConnectToAddr(
     rt: *io.Runtime,
     addr: std.net.Address,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
+    ctx: io.Context,
 ) Allocator.Error!*ConnectTask {
     const conn = try rt.gpa.create(ConnectTask);
     errdefer rt.gpa.destroy(conn);
 
     conn.* = .{
-        .userdata = userdata,
-        .callback = callback,
-        .msg = msg,
+        .ctx = ctx,
 
         .addr = addr,
         .fd = null,
@@ -51,18 +45,14 @@ pub fn tcpConnectToAddr(
         conn.addr.any.family,
         posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
         posix.IPPROTO.TCP,
-        conn,
-        @intFromEnum(ConnectTask.Msg.socket),
-        ConnectTask.handleMsg,
+        .{ .ptr = conn, .msg = @intFromEnum(ConnectTask.Msg.socket), .cb = ConnectTask.handleMsg },
     );
 
     return conn;
 }
 
 pub const ConnectTask = struct {
-    userdata: ?*anyopaque,
-    callback: io.Callback,
-    msg: u16,
+    ctx: io.Context,
 
     addr: std.net.Address,
     fd: ?posix.fd_t,
@@ -73,10 +63,6 @@ pub const ConnectTask = struct {
     pub const Msg = enum {
         socket,
         connect,
-
-        fn fromInt(v: u16) Msg {
-            return @enumFromInt(v);
-        }
     };
 
     /// Cancels the current task. Not guaranteed to actually cancel. User's callback will get an
@@ -94,11 +80,11 @@ pub const ConnectTask = struct {
                 assert(result == .socket);
                 self.fd = result.socket catch |err| {
                     defer rt.gpa.destroy(self);
-                    try self.callback(rt, .{
-                        .userdata = self.userdata,
-                        .msg = self.msg,
+                    try self.ctx.cb(rt, .{
+                        .userdata = self.ctx.ptr,
+                        .msg = self.ctx.msg,
                         .result = .{ .userfd = err },
-                        .callback = self.callback,
+                        .callback = self.ctx.cb,
                         .req = .userfd,
                     });
                     return;
@@ -108,9 +94,7 @@ pub const ConnectTask = struct {
                     self.fd.?,
                     &self.addr.any,
                     self.addr.getOsSockLen(),
-                    self,
-                    @intFromEnum(Msg.connect),
-                    ConnectTask.handleMsg,
+                    .{ .ptr = self, .msg = @intFromEnum(Msg.connect), .cb = ConnectTask.handleMsg },
                 );
             },
 
@@ -119,22 +103,22 @@ pub const ConnectTask = struct {
                 defer rt.gpa.destroy(self);
 
                 _ = result.connect catch |err| {
-                    try self.callback(rt, .{
-                        .userdata = self.userdata,
-                        .msg = self.msg,
+                    try self.ctx.cb(rt, .{
+                        .userdata = self.ctx.ptr,
+                        .msg = self.ctx.msg,
                         .result = .{ .userfd = err },
-                        .callback = self.callback,
+                        .callback = self.ctx.cb,
                         .req = .userfd,
                     });
-                    _ = try rt.close(self.fd.?, null, 0, io.noopCallback);
+                    _ = try rt.close(self.fd.?, .{});
                     return;
                 };
 
-                try self.callback(rt, .{
-                    .userdata = self.userdata,
-                    .msg = self.msg,
+                try self.ctx.cb(rt, .{
+                    .userdata = self.ctx.ptr,
+                    .msg = self.ctx.msg,
                     .result = .{ .userfd = self.fd.? },
-                    .callback = self.callback,
+                    .callback = self.ctx.cb,
                     .req = .userfd,
                 });
             },
@@ -150,7 +134,7 @@ test "tcp connect" {
 
     {
         // Happy path
-        const conn = try tcpConnectToAddr(&rt, addr, null, 0, io.noopCallback);
+        const conn = try tcpConnectToAddr(&rt, addr, .{});
         errdefer std.testing.allocator.destroy(conn);
 
         const task1 = rt.submission_q.pop().?;
@@ -164,7 +148,6 @@ test "tcp connect" {
             .msg = @intFromEnum(ConnectTask.Msg.socket),
             .result = .{ .socket = fd },
             .req = .userfd,
-            .callback = io.noopCallback,
         });
 
         const task2 = rt.submission_q.pop().?;
@@ -177,14 +160,13 @@ test "tcp connect" {
             .msg = @intFromEnum(ConnectTask.Msg.connect),
             .result = .{ .connect = {} },
             .req = .userfd,
-            .callback = io.noopCallback,
         });
         try std.testing.expect(rt.submission_q.pop() == null);
     }
 
     {
         // socket error
-        const conn = try tcpConnectToAddr(&rt, addr, null, 0, io.noopCallback);
+        const conn = try tcpConnectToAddr(&rt, addr, .{});
         errdefer std.testing.allocator.destroy(conn);
 
         const task1 = rt.submission_q.pop().?;
@@ -195,14 +177,13 @@ test "tcp connect" {
             .msg = @intFromEnum(ConnectTask.Msg.socket),
             .result = .{ .socket = error.Canceled },
             .req = .userfd,
-            .callback = io.noopCallback,
         });
         try std.testing.expect(rt.submission_q.pop() == null);
     }
 
     {
         // connect error
-        const conn = try tcpConnectToAddr(&rt, addr, null, 0, io.noopCallback);
+        const conn = try tcpConnectToAddr(&rt, addr, .{});
         errdefer std.testing.allocator.destroy(conn);
 
         const task1 = rt.submission_q.pop().?;
@@ -216,7 +197,6 @@ test "tcp connect" {
             .msg = @intFromEnum(ConnectTask.Msg.socket),
             .result = .{ .socket = fd },
             .req = .userfd,
-            .callback = io.noopCallback,
         });
 
         const task2 = rt.submission_q.pop().?;
@@ -229,7 +209,6 @@ test "tcp connect" {
             .msg = @intFromEnum(ConnectTask.Msg.connect),
             .result = .{ .connect = error.Canceled },
             .req = .noop,
-            .callback = io.noopCallback,
         });
         const task3 = rt.submission_q.pop().?;
         defer std.testing.allocator.destroy(task3);

@@ -37,6 +37,12 @@ pub const RunCondition = enum {
     forever,
 };
 
+pub const Context = struct {
+    ptr: ?*anyopaque = null,
+    msg: u16 = 0,
+    cb: Callback = noopCallback,
+};
+
 /// Used for timeouts and deadlines. We make this struct extern because we will ptrCast it to the
 /// linux kernel timespec struct
 pub const Timespec = extern struct {
@@ -176,15 +182,13 @@ pub const Runtime = struct {
 
     pub fn noop(
         self: *Runtime,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .noop,
         };
 
@@ -195,15 +199,13 @@ pub const Runtime = struct {
     pub fn timer(
         self: *Runtime,
         duration: Timespec,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .timer = duration },
         };
 
@@ -214,9 +216,6 @@ pub const Runtime = struct {
     pub fn cancelAll(self: *Runtime) Allocator.Error!void {
         const task = try self.getTask();
         task.* = .{
-            .userdata = null,
-            .msg = 0,
-            .callback = noopCallback,
             .req = .{ .cancel = .all },
         };
 
@@ -226,15 +225,13 @@ pub const Runtime = struct {
     pub fn accept(
         self: *Runtime,
         fd: posix.fd_t,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .accept = fd },
         };
 
@@ -247,16 +244,15 @@ pub const Runtime = struct {
         target: *Runtime,
         target_task: *Task, // The task that the target ring will receive. The callbacks of
         // this task are what will be called when the target receives the message
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+
+        ctx: Context,
     ) Allocator.Error!*Task {
         // This is the task to send the message
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .msg_ring = .{
                 .target = target,
                 .task = target_task,
@@ -271,15 +267,13 @@ pub const Runtime = struct {
         self: *Runtime,
         fd: posix.fd_t,
         buffer: []u8,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .recv = .{
                 .fd = fd,
                 .buffer = buffer,
@@ -294,15 +288,13 @@ pub const Runtime = struct {
         self: *Runtime,
         fd: posix.fd_t,
         buffer: []const u8,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .write = .{
                 .fd = fd,
                 .buffer = buffer,
@@ -317,15 +309,13 @@ pub const Runtime = struct {
         self: *Runtime,
         fd: posix.fd_t,
         vecs: []const posix.iovec_const,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .writev = .{
                 .fd = fd,
                 .vecs = vecs,
@@ -339,15 +329,13 @@ pub const Runtime = struct {
     pub fn close(
         self: *Runtime,
         fd: posix.fd_t,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .close = fd },
         };
 
@@ -359,15 +347,13 @@ pub const Runtime = struct {
         self: *Runtime,
         fd: posix.fd_t,
         mask: u32,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .poll = .{ .fd = fd, .mask = mask } },
         };
 
@@ -380,15 +366,13 @@ pub const Runtime = struct {
         domain: u32,
         socket_type: u32,
         protocol: u32,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .socket = .{ .domain = domain, .type = socket_type, .protocol = protocol } },
         };
 
@@ -401,15 +385,13 @@ pub const Runtime = struct {
         fd: posix.socket_t,
         addr: *posix.sockaddr,
         addr_len: posix.socklen_t,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: Callback,
+        ctx: Context,
     ) Allocator.Error!*Task {
         const task = try self.getTask();
         task.* = .{
-            .userdata = userdata,
-            .msg = msg,
-            .callback = callback,
+            .userdata = ctx.ptr,
+            .msg = ctx.msg,
+            .callback = ctx.cb,
             .req = .{ .connect = .{ .fd = fd, .addr = addr, .addr_len = addr_len } },
         };
 
@@ -555,12 +537,14 @@ test "runtime: noop" {
 
     var foo: Foo = .{};
 
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+
     // noop is triggered synchronously with submit. If we wait, we'll be waiting forever
-    _ = try rt.noop(&foo, 0, Foo.callback);
+    _ = try rt.noop(ctx);
     try rt.run(.once);
     try std.testing.expectEqual(1, foo.bar);
-    _ = try rt.noop(&foo, 0, Foo.callback);
-    _ = try rt.noop(&foo, 0, Foo.callback);
+    _ = try rt.noop(ctx);
+    _ = try rt.noop(ctx);
     try rt.run(.once);
     try std.testing.expectEqual(3, foo.bar);
 }
@@ -571,9 +555,11 @@ test "runtime: timer" {
 
     var foo: Foo = .{};
 
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+
     const start = std.time.nanoTimestamp();
     const end = start + 100 * std.time.ns_per_ms;
-    _ = try rt.timer(.{ .nsec = 100 * std.time.ns_per_ms }, &foo, 0, Foo.callback);
+    _ = try rt.timer(.{ .nsec = 100 * std.time.ns_per_ms }, ctx);
     try rt.run(.once);
     try std.testing.expect(std.time.nanoTimestamp() > end);
     try std.testing.expectEqual(1, foo.bar);
@@ -586,7 +572,9 @@ test "runtime: poll" {
     var foo: Foo = .{};
     const pipe = try posix.pipe2(.{ .CLOEXEC = true });
 
-    _ = try rt.poll(pipe[0], posix.POLL.IN, &foo, 0, Foo.callback);
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+
+    _ = try rt.poll(pipe[0], posix.POLL.IN, ctx);
     try std.testing.expectEqual(1, rt.submission_q.len());
 
     _ = try posix.write(pipe[1], "io_uring is the best");
@@ -600,7 +588,8 @@ test "runtime: deadline doesn't call user callback" {
     defer rt.deinit();
 
     var foo: Foo = .{};
-    const task = try rt.noop(&foo, 0, Foo.callback);
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
+    const task = try rt.noop(ctx);
     try task.setDeadline(&rt, .{ .sec = 1 });
 
     try rt.run(.until_done);
@@ -615,14 +604,10 @@ test "runtime: timeout" {
     defer rt.deinit();
 
     var foo: Foo = .{};
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
 
     const delay = 1 * std.time.ns_per_ms;
-    _ = try rt.timer(
-        .{ .nsec = delay },
-        &foo,
-        0,
-        Foo.callback,
-    );
+    _ = try rt.timer(.{ .nsec = delay }, ctx);
 
     const start = std.time.nanoTimestamp();
     try rt.run(.until_done);
@@ -636,16 +621,12 @@ test "runtime: cancel" {
     defer rt.deinit();
 
     var foo: Foo = .{};
+    const ctx: Context = .{ .ptr = &foo, .cb = Foo.callback };
 
     const delay = 1 * std.time.ns_per_s;
-    const task = try rt.timer(
-        .{ .nsec = delay },
-        &foo,
-        0,
-        Foo.callback,
-    );
+    const task = try rt.timer(.{ .nsec = delay }, ctx);
 
-    try task.cancel(&rt, null, 0, io.noopCallback);
+    try task.cancel(&rt, .{});
 
     const start = std.time.nanoTimestamp();
     try rt.run(.until_done);

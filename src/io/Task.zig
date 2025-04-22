@@ -6,10 +6,10 @@ const io = @import("io.zig");
 const Allocator = std.mem.Allocator;
 const Runtime = io.Runtime;
 
-userdata: ?*anyopaque,
-msg: u16,
-callback: io.Callback,
-req: io.Request,
+userdata: ?*anyopaque = null,
+msg: u16 = 0,
+callback: io.Callback = io.noopCallback,
+req: io.Request = .noop,
 
 result: ?io.Result = null,
 
@@ -56,15 +56,13 @@ pub fn setDeadline(
 pub fn cancel(
     self: *Task,
     rt: *Runtime,
-    userdata: ?*anyopaque,
-    msg: u16,
-    callback: io.Callback,
+    ctx: io.Context,
 ) Allocator.Error!void {
     const task = try rt.getTask();
     task.* = .{
-        .callback = callback,
-        .msg = msg,
-        .userdata = userdata,
+        .callback = ctx.cb,
+        .msg = ctx.msg,
+        .userdata = ctx.ptr,
         .req = .{ .cancel = .{ .task = self } },
     };
     rt.submission_q.push(task);

@@ -34,6 +34,7 @@ pub const Client = struct {
 
         fd: posix.fd_t,
         buffer: [tls.max_ciphertext_record_len]u8 = undefined,
+        read_end: usize = 0,
         handshake: tls.nonblock.Client,
         task: *io.Task,
 
@@ -53,7 +54,6 @@ pub const Client = struct {
                             .callback = self.callback,
                             .req = .userptr,
                         });
-                        rt.gpa.destroy(self);
                         return;
                     };
 
@@ -72,7 +72,10 @@ pub const Client = struct {
                     }
 
                     // Arm a recv task
-                    self.task = try rt.recv(self.fd, &self.buffer, self, 0, handleMsg);
+                    self.task = try rt.recv(self.fd, &self.buffer, .{
+                        .ptr = self,
+                        .cb = handleMsg,
+                    });
                 },
 
                 .recv => {
@@ -89,9 +92,19 @@ pub const Client = struct {
                         return;
                     };
 
-                    const slice = self.buffer[0..n];
+                    self.read_end += n;
+                    const slice = self.buffer[0..self.read_end];
                     var scratch: [tls.max_ciphertext_record_len]u8 = undefined;
                     const r = try self.handshake.run(slice, &scratch);
+
+                    if (r.unused_recv.len > 0) {
+                        // Arm a recv task
+                        self.task = try rt.recv(self.fd, self.buffer[self.read_end..], .{
+                            .ptr = self,
+                            .cb = handleMsg,
+                        });
+                        return;
+                    }
 
                     if (r.send.len > 0) {
                         // Queue another send
@@ -99,9 +112,7 @@ pub const Client = struct {
                         self.task = try rt.write(
                             self.fd,
                             self.buffer[0..r.send.len],
-                            self,
-                            0,
-                            HandshakeTask.handleMsg,
+                            .{ .ptr = self, .cb = HandshakeTask.handleMsg },
                         );
                         return;
                     }
@@ -154,15 +165,13 @@ pub const Client = struct {
         rt: *io.Runtime,
         fd: posix.fd_t,
         opts: tls.config.Client,
-        userdata: ?*anyopaque,
-        msg: u16,
-        callback: io.Callback,
+        ctx: io.Context,
     ) !*HandshakeTask {
         const hs = try rt.gpa.create(HandshakeTask);
         hs.* = .{
-            .userdata = userdata,
-            .callback = callback,
-            .msg = msg,
+            .userdata = ctx.ptr,
+            .callback = ctx.cb,
+            .msg = ctx.msg,
 
             .fd = fd,
             .handshake = .init(opts),
@@ -170,7 +179,8 @@ pub const Client = struct {
         };
 
         const result = try hs.handshake.run("", &hs.buffer);
-        hs.task = try rt.write(hs.fd, result.send, hs, 0, HandshakeTask.handleMsg);
+        const hs_ctx: io.Context = .{ .ptr = hs, .cb = HandshakeTask.handleMsg };
+        hs.task = try rt.write(hs.fd, result.send, hs_ctx);
         return hs;
     }
 
@@ -187,16 +197,14 @@ pub const Client = struct {
         const msg = try self.tls.close(buf);
 
         self.ciphertext_buf.items.len += msg.len;
-        _ = try rt.write(
-            self.fd,
-            self.ciphertext_buf.items[self.written..],
-            self,
-            @intFromEnum(Client.Msg.close_notify),
-            Client.onCompletion,
-        );
+        _ = try rt.write(self.fd, self.ciphertext_buf.items[self.written..], .{
+            .ptr = self,
+            .cb = Client.onCompletion,
+            .msg = @intFromEnum(Client.Msg.close_notify),
+        });
 
         if (self.recv_task) |task| {
-            try task.cancel(rt, null, 0, io.noopCallback);
+            try task.cancel(rt, .{});
             self.recv_task = null;
         }
     }
@@ -231,19 +239,18 @@ pub const Client = struct {
                         .result = .{ .recv = r.cleartext.len },
                     });
                 }
-                mem.copyForwards(u8, &self.read_buf, self.read_buf[r.ciphertext_pos..end]);
+                mem.copyForwards(u8, &self.read_buf, r.unused_ciphertext);
+                self.read_end = r.unused_ciphertext.len;
 
                 if (r.closed) {
-                    _ = try rt.close(self.fd, self.userdata, self.close_msg, self.callback);
+                    _ = try rt.close(self.fd, self.closeContext());
                     return;
                 }
 
                 self.recv_task = try rt.recv(
                     self.fd,
                     self.read_buf[self.read_end..],
-                    self,
-                    @intFromEnum(Client.Msg.recv),
-                    Client.onCompletion,
+                    self.recvContext(),
                 );
             },
 
@@ -264,9 +271,7 @@ pub const Client = struct {
                     _ = try rt.write(
                         self.fd,
                         self.ciphertext_buf.items[self.written..],
-                        self,
-                        @intFromEnum(Client.Msg.write),
-                        Client.onCompletion,
+                        self.writeContext(),
                     );
                 } else {
                     defer {
@@ -298,17 +303,15 @@ pub const Client = struct {
                 self.written += n;
 
                 if (self.written < self.ciphertext_buf.items.len) {
-                    _ = try rt.write(
-                        self.fd,
-                        self.ciphertext_buf.items[self.written..],
-                        self,
-                        @intFromEnum(Client.Msg.close_notify),
-                        Client.onCompletion,
-                    );
+                    _ = try rt.write(self.fd, self.ciphertext_buf.items[self.written..], .{
+                        .ptr = self,
+                        .cb = Client.onCompletion,
+                        .msg = @intFromEnum(Client.Msg.close_notify),
+                    });
                 } else {
                     self.written = 0;
                     self.ciphertext_buf.clearRetainingCapacity();
-                    _ = try rt.close(self.fd, self.userdata, self.close_msg, self.callback);
+                    _ = try rt.close(self.fd, self.closeContext());
                 }
             },
         }
@@ -319,9 +322,7 @@ pub const Client = struct {
         self.recv_task = try rt.recv(
             self.fd,
             self.read_buf[self.read_end..],
-            self,
-            @intFromEnum(Client.Msg.recv),
-            Client.onCompletion,
+            self.recvContext(),
         );
     }
 
@@ -345,6 +346,26 @@ pub const Client = struct {
             Client.onCompletion,
         );
     }
+
+    fn closeContext(self: Client) io.Context {
+        return .{ .ptr = self.userdata, .cb = self.callback, .msg = self.close_msg };
+    }
+
+    fn recvContext(self: *Client) io.Context {
+        return .{
+            .ptr = self,
+            .cb = Client.onCompletion,
+            .msg = @intFromEnum(Client.Msg.recv),
+        };
+    }
+
+    fn writeContext(self: *Client) io.Context {
+        return .{
+            .ptr = self,
+            .cb = Client.onCompletion,
+            .msg = @intFromEnum(Client.Msg.write),
+        };
+    }
 };
 
 test "tls: Client" {
@@ -367,9 +388,17 @@ test "tls: Client" {
             write,
             recv,
         };
+
         fn callback(_: *io.Runtime, task: io.Task) anyerror!void {
             const self = task.userdataCast(Self);
             const result = task.result.?;
+            errdefer {
+                if (self.tls) |client| {
+                    client.deinit(self.gpa);
+                    self.gpa.destroy(client);
+                    self.tls = null;
+                }
+            }
 
             switch (task.msgToEnum(Msg)) {
                 .connect => {
@@ -407,11 +436,9 @@ test "tls: Client" {
 
     _ = try net.tcpConnectToHost(
         &rt,
-        "badssl.com",
+        "google.com",
         443,
-        &foo,
-        @intFromEnum(Foo.Msg.connect),
-        Foo.callback,
+        .{ .ptr = &foo, .cb = Foo.callback, .msg = @intFromEnum(Foo.Msg.connect) },
     );
 
     try rt.run(.until_done);
@@ -425,10 +452,8 @@ test "tls: Client" {
     _ = try Client.init(
         &rt,
         foo.fd.?,
-        .{ .root_ca = bundle, .host = "badssl.com" },
-        &foo,
-        @intFromEnum(Foo.Msg.handshake),
-        Foo.callback,
+        .{ .root_ca = bundle, .host = "google.com" },
+        .{ .ptr = &foo, .cb = Foo.callback, .msg = @intFromEnum(Foo.Msg.handshake) },
     );
     try rt.run(.until_done);
     try std.testing.expect(foo.tls != null);
