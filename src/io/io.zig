@@ -531,6 +531,7 @@ pub const RecvError = ResultError || error{
 test {
     _ = @import("net.zig");
     _ = @import("queue.zig");
+    _ = @import("tls.zig");
 
     _ = @import("MockRuntime.zig");
 

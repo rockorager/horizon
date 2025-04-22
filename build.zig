@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
 
     const tls_dep = b.dependency("tls", .{ .target = target, .optimize = optimize });
     horizon_module.addImport("tls", tls_dep.module("tls"));
+    io_module.addImport("tls", tls_dep.module("tls"));
 
     const unit_tests = b.addTest(.{ .root_module = horizon_module });
     const run_unit_tests = b.addRunArtifact(unit_tests);

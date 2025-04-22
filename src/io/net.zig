@@ -14,7 +14,7 @@ pub fn tcpConnectToHost(
     userdata: ?*anyopaque,
     msg: u16,
     callback: io.Callback,
-) std.net.GetAddressListError!*ConnectTask {
+) !*ConnectTask {
     // TODO: getAddressList could be rewritten to be async. It accesses the filesystem and could
     // make a DNS request
     const list = try std.net.getAddressList(rt.gpa, host, port);
