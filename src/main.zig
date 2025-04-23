@@ -5,7 +5,6 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const http = std.http;
 const posix = std.posix;
-pub const client = @import("client.zig");
 
 pub const Server = @import("Server.zig");
 
@@ -322,7 +321,6 @@ pub fn errorResponse(
 
 test {
     _ = @import("Server.zig");
-    // _ = @import("client.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
 }
