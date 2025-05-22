@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const horizon = @import("horizon");
-const io = @import("ourio");
+const ourio = @import("ourio");
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -15,8 +15,8 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var ring = try io.Ring.init(gpa, 64);
-    defer ring.deinit();
+    var io = try ourio.Ring.init(gpa, 64);
+    defer io.deinit();
 
     var server: horizon.Server = undefined;
     try server.init(gpa, .{});
@@ -24,9 +24,9 @@ pub fn main() !void {
 
     var my_handler: MyHandler = .{};
 
-    try server.listenAndServe(&ring, my_handler.handler());
+    try server.listenAndServe(&io, my_handler.handler());
     std.log.debug("listening at {}", .{server.addr});
-    try ring.run(.until_done);
+    try io.run(.until_done);
 }
 
 const MyHandler = struct {

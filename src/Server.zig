@@ -2,7 +2,7 @@ const Server = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const io = @import("ourio");
+const ourio = @import("ourio");
 const hz = @import("main.zig");
 const sniff = @import("sniff.zig");
 
@@ -27,12 +27,12 @@ timeout: Timeouts,
 
 shutdown_timeout: u8,
 
-ring: *io.Ring,
+io: *ourio.Ring,
 
 exited_workers: u16 = 0,
 
-poll_task: ?*io.Task = null,
-shutdown_timer: ?*io.Task = null,
+poll_task: ?*ourio.Task = null,
+shutdown_timer: ?*ourio.Task = null,
 
 pub const Options = struct {
     /// Address to listen on
@@ -100,7 +100,7 @@ pub fn init(self: *Server, gpa: Allocator, opts: Options) !void {
             .write = opts.write_timeout,
         },
         .shutdown_timeout = opts.shutdown_timeout,
-        .ring = undefined,
+        .io = undefined,
         .poll_task = undefined,
     };
 }
@@ -113,7 +113,7 @@ const Msg = enum {
     worker_shutdown,
 };
 
-fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
+fn handleMsg(io: *ourio.Ring, task: ourio.Task) anyerror!void {
     const self = task.userdataCast(Server);
     const result = task.result.?;
 
@@ -132,7 +132,7 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
 
             switch (builtin.os.tag) {
                 .linux => {
-                    const fd = self.worker.ring.backend.pollableFd() catch unreachable;
+                    const fd = self.worker.io.backend.pollableFd() catch unreachable;
                     var buf: [8]u8 = undefined;
                     _ = posix.read(fd, &buf) catch |err| {
                         switch (err) {
@@ -145,8 +145,8 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
             }
 
             // Rearm the poll task
-            self.poll_task = try rt.poll(
-                try self.worker.ring.backend.pollableFd(),
+            self.poll_task = try io.poll(
+                try self.worker.io.backend.pollableFd(),
                 posix.POLL.IN,
                 .{
                     .ptr = self,
@@ -161,7 +161,7 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
             _ = posix.read(self.stop_pipe[0], &buf) catch 0;
 
             // Set our shutdown timer
-            self.shutdown_timer = try rt.timer(
+            self.shutdown_timer = try io.timer(
                 .{ .sec = self.shutdown_timeout },
                 .{
                     .ptr = self,
@@ -171,7 +171,7 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
             );
 
             {
-                const target_task = try rt.getTask();
+                const target_task = try io.getTask();
                 target_task.* = .{
                     .userdata = &self.worker,
                     .msg = @intFromEnum(Worker.Msg.shutdown),
@@ -179,8 +179,8 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
                     .req = .usermsg,
                 };
 
-                _ = try rt.msgRing(
-                    &self.worker.ring,
+                _ = try io.msgRing(
+                    &self.worker.io,
                     target_task,
                     .{
                         .ptr = self,
@@ -192,7 +192,7 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
 
             // Message each worker ring to shut down
             for (self.workers) |*worker| {
-                const target_task = try rt.getTask();
+                const target_task = try io.getTask();
                 target_task.* = .{
                     .userdata = worker,
                     .msg = @intFromEnum(Worker.Msg.shutdown),
@@ -200,8 +200,8 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
                     .req = .usermsg,
                 };
 
-                _ = try rt.msgRing(
-                    &worker.ring,
+                _ = try io.msgRing(
+                    &worker.io,
                     target_task,
                     .{
                         .ptr = self,
@@ -215,7 +215,7 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
         .shutdown_timeout => {
             self.shutdown_timer = null;
             if (self.poll_task) |pt| {
-                _ = try pt.cancel(rt, .{});
+                _ = try pt.cancel(io, .{});
                 self.poll_task = null;
             }
         },
@@ -233,11 +233,11 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
                     thread.join();
                 }
                 if (self.poll_task) |pt| {
-                    _ = try pt.cancel(rt, .{});
+                    _ = try pt.cancel(io, .{});
                     self.poll_task = null;
                 }
                 if (self.shutdown_timer) |timer| {
-                    _ = try timer.cancel(rt, .{});
+                    _ = try timer.cancel(io, .{});
                     self.shutdown_timer = null;
                 }
             }
@@ -247,18 +247,18 @@ fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
     // We reap and submit our main worker ring here. It's possible that in this function our eventfd
     // won't wake up when we send a msg_ring message. Both of these calls are nonblocking, and we
     // only are in this function if we are shutting down, so we don't care too much about perf
-    try self.worker.ring.backend.reapCompletions(&self.worker.ring);
-    try self.worker.ring.backend.submit(&self.worker.ring.submission_q);
+    try self.worker.io.backend.reapCompletions(&self.worker.io);
+    try self.worker.io.backend.submit(&self.worker.io.submission_q);
 }
 
-pub fn listenAndServe(self: *Server, rt: *io.Ring, handler: hz.Handler) !void {
-    self.ring = rt;
+pub fn listenAndServe(self: *Server, io: *ourio.Ring, handler: hz.Handler) !void {
+    self.io = io;
 
     {
         self.worker = try .init(self.gpa, self.timeout, handler, self.addr, self);
-        self.worker.ring = try rt.initChild(64);
+        self.worker.io = try io.initChild(64);
         try posix.listen(self.worker.fd, 64);
-        self.worker.accept_task = try self.worker.ring.accept(self.worker.fd, .{
+        self.worker.accept_task = try self.worker.io.accept(self.worker.fd, .{
             .ptr = &self.worker,
             .msg = @intFromEnum(Worker.Msg.new_connection),
             .cb = Worker.handleMsg,
@@ -267,7 +267,7 @@ pub fn listenAndServe(self: *Server, rt: *io.Ring, handler: hz.Handler) !void {
         var sock_len = self.addr.getOsSockLen();
         try posix.getsockname(self.worker.fd, &self.addr.any, &sock_len);
 
-        try self.worker.ring.backend.submit(&self.worker.ring.submission_q);
+        try self.worker.io.backend.submit(&self.worker.io.submission_q);
     }
 
     for (self.workers, 0..) |*worker, i| {
@@ -276,16 +276,16 @@ pub fn listenAndServe(self: *Server, rt: *io.Ring, handler: hz.Handler) !void {
         self.threads[i] = try std.Thread.spawn(
             .{},
             Worker.run,
-            .{ worker, rt },
+            .{ worker, io },
         );
     }
     // The main server ring needs a callback from the main ioring
-    self.poll_task = try rt.poll(try self.worker.ring.backend.pollableFd(), posix.POLL.IN, .{
+    self.poll_task = try io.poll(try self.worker.io.backend.pollableFd(), posix.POLL.IN, .{
         .ptr = self,
         .msg = @intFromEnum(Server.Msg.main_worker_ready),
         .cb = Server.handleMsg,
     });
-    _ = try rt.poll(self.stop_pipe[0], posix.POLL.IN, .{
+    _ = try io.poll(self.stop_pipe[0], posix.POLL.IN, .{
         .ptr = self,
         .msg = @intFromEnum(Server.Msg.shutdown),
         .cb = Server.handleMsg,
@@ -299,7 +299,7 @@ pub fn deinit(self: *Server, gpa: Allocator) void {
     }
 
     if (self.poll_task) |pt| {
-        _ = pt.cancel(self.ring, .{}) catch {};
+        _ = pt.cancel(self.io, .{}) catch {};
         self.poll_task = null;
     }
 
@@ -316,7 +316,7 @@ pub fn stop(self: *Server) !void {
 
 const Worker = struct {
     gpa: Allocator,
-    ring: io.Ring,
+    io: ourio.Ring,
     conn_pool: MemoryPool(Connection),
     state: Worker.State,
     timeout: Timeouts,
@@ -325,7 +325,7 @@ const Worker = struct {
     shutting_down: bool = false,
 
     fd: posix.socket_t,
-    accept_task: *io.Task,
+    accept_task: *ourio.Task,
     server: *Server,
 
     /// Number of active completions we have on the queue that we want to wait for before gracefully
@@ -368,7 +368,7 @@ const Worker = struct {
 
         return .{
             .gpa = gpa,
-            .ring = undefined,
+            .io = undefined,
             .state = .running,
             .conn_pool = .empty,
             .timeout = timeout,
@@ -380,10 +380,10 @@ const Worker = struct {
         };
     }
 
-    fn run(self: *Worker, main: *io.Ring) !void {
-        self.ring = try main.initChild(64);
+    fn run(self: *Worker, main: *ourio.Ring) !void {
+        self.io = try main.initChild(64);
         try posix.listen(self.fd, 64);
-        self.accept_task = try self.ring.accept(
+        self.accept_task = try self.io.accept(
             self.fd,
             .{
                 .ptr = self,
@@ -392,15 +392,15 @@ const Worker = struct {
             },
         );
 
-        try self.ring.run(.until_done);
+        try self.io.run(.until_done);
     }
 
     fn deinit(self: *Worker) void {
         self.conn_pool.deinit(self.gpa);
-        self.ring.deinit();
+        self.io.deinit();
     }
 
-    fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
+    fn handleMsg(io: *ourio.Ring, task: ourio.Task) anyerror!void {
         const self = task.userdataCast(Worker);
         const result = task.result.?;
         switch (task.msgToEnum(Worker.Msg)) {
@@ -419,7 +419,7 @@ const Worker = struct {
 
             .shutdown => {
                 self.state = .shutting_down;
-                _ = try self.accept_task.cancel(rt, .{});
+                _ = try self.accept_task.cancel(io, .{});
                 try self.maybeClose();
             },
         }
@@ -428,12 +428,12 @@ const Worker = struct {
     fn maybeClose(self: *Worker) !void {
         if (self.state != .shutting_down or self.keep_alive > 0) return;
         self.state = .done;
-        if (!self.ring.backend.done()) {
+        if (!self.io.backend.done()) {
             // TODO: track only our tasks in a doubly linked list and only cancel our tasks
-            try self.ring.cancelAll();
+            try self.io.cancelAll();
         }
 
-        const target_task = try self.ring.getTask();
+        const target_task = try self.io.getTask();
         target_task.* = .{
             .userdata = self.server,
             .msg = @intFromEnum(Server.Msg.worker_shutdown),
@@ -441,7 +441,7 @@ const Worker = struct {
             .req = .usermsg,
         };
 
-        _ = try self.ring.msgRing(self.server.ring, target_task, .{});
+        _ = try self.io.msgRing(self.server.io, target_task, .{});
     }
 };
 
@@ -495,10 +495,10 @@ pub const Connection = struct {
         self.ctx = .{
             .arena = self.arena.allocator(),
             .deadline = 0,
-            .ring = &worker.ring,
+            .ring = &worker.io,
         };
 
-        const task = try worker.ring.recv(
+        const task = try worker.io.recv(
             fd,
             &self.buf,
             .{
@@ -508,7 +508,7 @@ pub const Connection = struct {
             },
         );
         if (worker.timeout.read_header > 0) {
-            try task.setDeadline(&worker.ring, .{ .sec = self.deadline });
+            try task.setDeadline(&worker.io, .{ .sec = self.deadline });
         }
         self.state = .reading_headers;
     }
@@ -526,7 +526,7 @@ pub const Connection = struct {
         destroy,
     };
 
-    fn handleMsg(rt: *io.Ring, task: io.Task) anyerror!void {
+    fn handleMsg(io: *ourio.Ring, task: ourio.Task) anyerror!void {
         const self = task.userdataCast(Connection);
         const result = task.result.?;
         state: switch (task.msgToEnum(Connection.Msg)) {
@@ -557,13 +557,13 @@ pub const Connection = struct {
 
                     false => {
                         // We haven't received a full HEAD. prep another recv
-                        const new_task = try rt.recv(self.fd, &self.buf, .{
+                        const new_task = try io.recv(self.fd, &self.buf, .{
                             .ptr = self,
                             .msg = @intFromEnum(Connection.Msg.reading_headers),
                             .cb = Connection.handleMsg,
                         });
                         if (self.worker.timeout.read_header > 0) {
-                            try new_task.setDeadline(rt, .{ .sec = self.deadline });
+                            try new_task.setDeadline(io, .{ .sec = self.deadline });
                         }
                     },
                 }
@@ -612,19 +612,19 @@ pub const Connection = struct {
 
                 // Keep the connection alive
                 self.reset();
-                const new_task = try rt.recv(self.fd, &self.buf, .{
+                const new_task = try io.recv(self.fd, &self.buf, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.reading_headers),
                     .cb = Connection.handleMsg,
                 });
                 if (self.worker.timeout.idle > 0) {
                     self.deadline = std.time.timestamp() + self.worker.timeout.idle;
-                    try new_task.setDeadline(rt, .{ .sec = self.deadline });
+                    try new_task.setDeadline(io, .{ .sec = self.deadline });
                 }
             },
 
             .close => {
-                _ = try rt.close(self.fd, .{
+                _ = try io.close(self.fd, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.destroy),
                     .cb = Connection.handleMsg,
@@ -712,7 +712,7 @@ pub const Connection = struct {
 
         self.state = .reading_body;
 
-        _ = try self.worker.ring.recv(self.fd, &self.buf, .{
+        _ = try self.worker.io.recv(self.fd, &self.buf, .{
             .ptr = self,
             .msg = @intFromEnum(Connection.Msg.reading_body),
             .cb = Connection.handleMsg,
@@ -748,7 +748,7 @@ pub const Connection = struct {
                 .body_only;
 
         const new_task = switch (wstate) {
-            .headers_only => try self.worker.ring.write(self.fd, headers[self.written..], .{
+            .headers_only => try self.worker.io.write(self.fd, headers[self.written..], .{
                 .ptr = self,
                 .msg = @intFromEnum(Connection.Msg.write_response),
                 .cb = Connection.handleMsg,
@@ -765,7 +765,7 @@ pub const Connection = struct {
                     .len = body.len,
                 };
 
-                break :blk try self.worker.ring.writev(self.fd, &self.vecs, .{
+                break :blk try self.worker.io.writev(self.fd, &self.vecs, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.write_response),
                     .cb = Connection.handleMsg,
@@ -775,7 +775,7 @@ pub const Connection = struct {
             .body_only => blk: {
                 const offset = self.written - headers.len;
                 const unwritten_body = body[offset..];
-                break :blk try self.worker.ring.write(self.fd, unwritten_body, .{
+                break :blk try self.worker.io.write(self.fd, unwritten_body, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.write_response),
                     .cb = Connection.handleMsg,
@@ -784,7 +784,7 @@ pub const Connection = struct {
         };
 
         if (self.worker.timeout.write > 0) {
-            try new_task.setDeadline(&self.worker.ring, .{ .sec = self.deadline });
+            try new_task.setDeadline(&self.worker.io, .{ .sec = self.deadline });
         }
     }
 
@@ -805,7 +805,7 @@ pub const Connection = struct {
 
 test "server" {
     const gpa = std.testing.allocator;
-    var ring = try io.Ring.init(gpa, 8);
+    var ring = try ourio.Ring.init(gpa, 8);
     defer ring.deinit();
 
     var server: Server = undefined;
