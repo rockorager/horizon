@@ -24,25 +24,35 @@ pub fn main() !void {
 
     var my_handler: MyHandler = .{};
 
-    try server.listenAndServe(&io, my_handler.handler());
+    var router: horizon.Router = .{};
+    defer router.deinit(gpa);
+
+    try router.use(gpa, .{ .serveFn = requestLogger });
+
+    try router.get(gpa, "/", &.{my_handler.rootHandler()});
+
+    try server.listenAndServe(&io, router.handler());
     std.log.debug("listening at {}", .{server.addr});
     try io.run(.until_done);
 }
 
+fn requestLogger(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
+    if (ctx.get("request_start_time")) |v| {
+        std.log.err("status={} request took {d} microseconds", .{ ctx.response.status.?, std.time.microTimestamp() - v.int });
+    } else {
+        try ctx.put("request_start_time", .{ .int = std.time.microTimestamp() });
+    }
+    return ctx.next();
+}
+
 const MyHandler = struct {
-    fn handler(self: *MyHandler) horizon.Handler {
-        // Not much magic here. If your type has a serveHttp method, this is a helper to make the
-        // interface from the type and pointer
-        return .init(MyHandler, self);
+    fn rootHandler(self: *MyHandler) horizon.Handler {
+        return .{ .ptr = self, .serveFn = handleRoot };
     }
 
-    pub fn serveHttp(
-        _: *anyopaque,
-        _: *horizon.Context,
-        w: horizon.ResponseWriter,
-        _: horizon.Request,
-    ) anyerror!void {
-        try w.any().print("Hello, world", .{});
-        return w.flush();
+    fn handleRoot(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
+        try ctx.response.any().print("root", .{});
+        ctx.response.setStatus(.ok);
+        return ctx.response.flush();
     }
 };

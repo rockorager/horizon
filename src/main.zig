@@ -6,19 +6,20 @@ const assert = std.debug.assert;
 const http = std.http;
 const posix = std.posix;
 
+pub const Router = @import("Router.zig");
 pub const Server = @import("Server.zig");
 
 pub const Handler = struct {
-    ptr: *anyopaque,
-    serveFn: *const fn (*anyopaque, *Context, ResponseWriter, Request) anyerror!void,
+    ptr: ?*anyopaque = null,
+    serveFn: *const fn (?*anyopaque, *Context) anyerror!void,
 
     /// Initialize a handler from a Type which has a serveHttp method
     pub fn init(comptime T: type, ptr: *T) Handler {
         return .{ .ptr = ptr, .serveFn = T.serveHttp };
     }
 
-    pub fn serveHttp(self: Handler, ctx: *Context, w: ResponseWriter, r: Request) anyerror!void {
-        return self.serveFn(self.ptr, ctx, w, r);
+    pub fn serveHttp(self: Handler, ctx: *Context) anyerror!void {
+        return self.serveFn(self.ptr, ctx);
     }
 };
 
@@ -27,14 +28,63 @@ pub const Context = struct {
     arena: Allocator,
 
     /// Deadline for the response, in seconds from unix epoch
-    deadline: u64,
+    deadline: u64 = 0,
 
     /// The io.Ring for this thread. Users may schedule additional tasks to be completed as part of
     /// the Request process. The lifetime of context, request, and responsewriter are all tied to
     /// the underlying Connection, meaning users may store a these and perform additional async
     /// tasks before calling ctx.sendResponse. Eg, fetching external data from an API, performing a
     /// DB query asynchronously, etc
-    ring: *io.Ring,
+    io: *io.Ring,
+
+    pattern: []const u8 = "",
+    handlers: []const Handler = &.{},
+    idx: usize = 0,
+    request: Request = .{},
+    response: Response,
+    kv: std.StringHashMapUnmanaged(Value) = .empty,
+    direction: enum { wind, unwind } = .wind,
+
+    pub const Value = union(enum) {
+        int: i64,
+        bytes: []const u8,
+    };
+
+    pub fn put(self: *Context, key: []const u8, value: Value) Allocator.Error!void {
+        return self.kv.put(self.arena, key, value);
+    }
+
+    pub fn get(self: *Context, key: []const u8) ?Value {
+        return self.kv.get(key);
+    }
+
+    pub fn next(self: *Context) anyerror!void {
+        switch (self.direction) {
+            .wind => {
+                const handler = self.handlers[self.idx];
+
+                if (self.idx == self.handlers.len - 1) {
+                    self.direction = .unwind;
+                } else {
+                    self.idx += 1;
+                }
+
+                return handler.serveHttp(self);
+            },
+
+            .unwind => {
+                if (self.idx == 0) {
+                    const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
+                    try conn.prepareResponse();
+                    try conn.sendResponse();
+                    return;
+                }
+                self.idx -= 1;
+                const handler = self.handlers[self.idx];
+                return handler.serveHttp(self);
+            },
+        }
+    }
 
     pub fn expired(self: Context) bool {
         if (self.deadline == 0) return false;
@@ -46,7 +96,27 @@ pub const Context = struct {
         assert(conn.request.body() == null);
         try conn.readBody();
     }
+
+    pub fn param(self: Context, key: []const u8) ?[]const u8 {
+        return extractParam(self.pattern, self.request.path(), key);
+    }
 };
+
+fn extractParam(pattern: []const u8, path: []const u8, key: []const u8) ?[]const u8 {
+    if (key.len == 0) return null;
+    var iter = std.mem.splitScalar(u8, pattern, '/');
+    var path_iter = std.mem.splitScalar(u8, path, '/');
+    while (iter.next()) |segment| {
+        const val = path_iter.next() orelse return null;
+        if (!std.mem.startsWith(u8, segment, "{")) continue;
+
+        if (segment.len < 2) continue;
+        const p = segment[1 .. segment.len - 1];
+        if (std.ascii.eqlIgnoreCase(p, key)) return val;
+    }
+
+    return null;
+}
 
 pub const Request = struct {
     /// The raw bytes of the request. This may not be the full request - handlers are called when we
@@ -139,65 +209,17 @@ pub const Request = struct {
     }
 
     /// Validates a request
-    pub fn isValid(self: Request, w: ResponseWriter) !bool {
+    pub fn isValid(self: Request, w: *Response) !bool {
+        _ = w;
         const m = self.method();
         if (m.requestHasBody()) {
             // We require a content length
             if (self.contentLength() == null) {
-                try errorResponse(w, .bad_request, "Content-Length is required", .{});
+                // try errorResponse(w, .bad_request, "Content-Length is required", .{});
                 return false;
             }
         }
         return true;
-    }
-};
-
-pub const ResponseWriter = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub const VTable = struct {
-        flush: *const fn (*anyopaque) anyerror!void,
-        setHeader: *const fn (*anyopaque, []const u8, ?[]const u8) Allocator.Error!void,
-        setStatus: *const fn (*anyopaque, status: http.Status) void,
-        write: *const fn (*const anyopaque, []const u8) anyerror!usize,
-
-        pub fn init(comptime T: type) *const VTable {
-            return &.{
-                .flush = T.flush,
-                .setHeader = T.setHeader,
-                .setStatus = T.setStatus,
-                .write = T.write,
-            };
-        }
-    };
-
-    pub fn init(comptime T: type, ptr: *T) ResponseWriter {
-        return .{
-            .ptr = ptr,
-            .vtable = .init(T),
-        };
-    }
-
-    /// Flush the response to the connection
-    pub fn flush(self: ResponseWriter) anyerror!void {
-        return self.vtable.flush(self.ptr);
-    }
-
-    pub fn setHeader(self: ResponseWriter, name: []const u8, value: ?[]const u8) Allocator.Error!void {
-        return self.vtable.setHeader(self.ptr, name, value);
-    }
-
-    pub fn setStatus(self: ResponseWriter, status: http.Status) void {
-        return self.vtable.setStatus(self.ptr, status);
-    }
-
-    pub fn write(self: ResponseWriter, bytes: []const u8) Allocator.Error!usize {
-        return self.vtable.write(self.ptr, bytes);
-    }
-
-    pub fn any(self: ResponseWriter) std.io.AnyWriter {
-        return .{ .context = self.ptr, .writeFn = self.vtable.write };
     }
 };
 
@@ -209,13 +231,6 @@ pub const Response = struct {
     headers: std.StringHashMapUnmanaged([]const u8) = .{},
 
     status: ?http.Status = null,
-
-    pub const VTable: ResponseWriter.VTable = .{
-        .flush = Response.flush,
-        .setHeader = Response.setHeader,
-        .setStatus = Response.setStatus,
-        .write = Response.typeErasedWrite,
-    };
 
     pub const Body = union(enum) {
         file: struct {
@@ -234,12 +249,7 @@ pub const Response = struct {
         }
     };
 
-    pub fn responseWriter(self: *Response) ResponseWriter {
-        return .{ .ptr = self, .vtable = &VTable };
-    }
-
-    pub fn setHeader(ptr: *anyopaque, k: []const u8, maybe_v: ?[]const u8) Allocator.Error!void {
-        const self: *Response = @ptrCast(@alignCast(ptr));
+    pub fn setHeader(self: *Response, k: []const u8, maybe_v: ?[]const u8) Allocator.Error!void {
         if (maybe_v) |v| {
             return self.headers.put(self.arena, k, v);
         }
@@ -247,8 +257,7 @@ pub const Response = struct {
         _ = self.headers.remove(k);
     }
 
-    pub fn setStatus(ptr: *anyopaque, status: http.Status) void {
-        const self: *Response = @ptrCast(@alignCast(ptr));
+    pub fn setStatus(self: *Response, status: http.Status) void {
         self.status = status;
     }
 
@@ -267,11 +276,14 @@ pub const Response = struct {
         return bytes.len;
     }
 
-    pub fn flush(ptr: *anyopaque) anyerror!void {
-        const self: *Response = @ptrCast(@alignCast(ptr));
-        const conn: *Server.Connection = @alignCast(@fieldParentPtr("response", self));
-        try conn.prepareResponse();
-        try conn.sendResponse();
+    pub fn flush(self: *Response) anyerror!void {
+        const ctx: *Context = @alignCast(@fieldParentPtr("response", self));
+        ctx.direction = .unwind;
+        return ctx.next();
+    }
+
+    pub fn any(self: *Response) std.io.AnyWriter {
+        return .{ .context = self, .writeFn = Response.typeErasedWrite };
     }
 };
 
@@ -302,25 +314,40 @@ pub const HeaderIterator = struct {
     }
 };
 
+pub fn notFound(_: ?*anyopaque, ctx: *Context) anyerror!void {
+    try ctx.response.any().writeAll("404 page not found\n");
+    ctx.response.setStatus(.not_found);
+    try ctx.response.flush();
+}
+
 pub fn errorResponse(
-    w: ResponseWriter,
+    ctx: *Context,
     status: http.Status,
     comptime format: []const u8,
     args: anytype,
 ) anyerror!void {
-    w.setStatus(status);
+    ctx.response.setStatus(status);
     // Clear the Content-Length header
-    try w.setHeader("Content-Length", null);
+    try ctx.response.setHeader("Content-Length", null);
     // Set content type
-    try w.setHeader("Content-Type", "text/plain");
+    try ctx.response.setHeader("Content-Type", "text/plain");
     // Print the body
-    try w.any().print(format, args);
+    try ctx.response.any().print(format, args);
 
-    return w.flush();
+    return ctx.response.flush();
 }
 
 test {
+    _ = @import("Router.zig");
     _ = @import("Server.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
+}
+
+test "extractParam" {
+    const expectEqualStrings = std.testing.expectEqualStrings;
+
+    try expectEqualStrings("foo", extractParam("/{bar}", "/foo", "bar").?);
+    try expectEqualStrings("foo", extractParam("/root/{bar}", "/root/foo", "bar").?);
+    try std.testing.expect(extractParam("/root/{bar}", "/root/foo", "foo") == null);
 }

@@ -449,7 +449,7 @@ pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     worker: *Worker,
 
-    buf: [1024]u8 = undefined,
+    buf: [4096]u8 = undefined,
     fd: posix.socket_t,
     write_buf: std.ArrayListUnmanaged(u8) = .empty,
     vecs: [2]posix.iovec_const = undefined,
@@ -458,8 +458,6 @@ pub const Connection = struct {
     deadline: i64,
 
     ctx: hz.Context,
-    response: hz.Response,
-    request: hz.Request,
 
     state: Connection.State = .init,
 
@@ -486,16 +484,15 @@ pub const Connection = struct {
             .worker = worker,
             .fd = fd,
             .ctx = undefined,
-            .response = undefined,
-            .request = .{},
             .deadline = std.time.timestamp() + worker.timeout.read_header,
         };
 
-        self.response = .{ .arena = self.arena.allocator() };
         self.ctx = .{
             .arena = self.arena.allocator(),
             .deadline = 0,
-            .ring = &worker.io,
+            .io = &worker.io,
+            .request = .{},
+            .response = .{ .arena = self.arena.allocator() },
         };
 
         const task = try worker.io.recv(
@@ -536,22 +533,18 @@ pub const Connection = struct {
                 const n = result.recv catch continue :state .close;
                 if (n == 0) continue :state .close;
 
-                try self.request.appendSlice(self.arena.allocator(), self.buf[0..n]);
+                try self.ctx.request.appendSlice(self.arena.allocator(), self.buf[0..n]);
 
-                switch (self.request.receivedHeader()) {
+                switch (self.ctx.request.receivedHeader()) {
                     // When we receive the full header, we pass it to the handler
                     true => {
                         // Keep the worker alive since we are now handling this request
                         self.worker.keep_alive += 1;
 
                         // validate the request
-                        if (try self.request.isValid(self.response.responseWriter())) {
+                        if (try self.ctx.request.isValid(&self.ctx.response)) {
                             // Call the handler
-                            try self.worker.handler.serveHttp(
-                                &self.ctx,
-                                self.response.responseWriter(),
-                                self.request,
-                            );
+                            try self.worker.handler.serveHttp(&self.ctx);
                         }
                     },
 
@@ -575,7 +568,7 @@ pub const Connection = struct {
                 const n = result.recv catch continue :state .close;
                 if (n == 0) continue :state .close;
 
-                try self.request.appendSlice(self.arena.allocator(), self.buf[0..n]);
+                try self.ctx.request.appendSlice(self.arena.allocator(), self.buf[0..n]);
 
                 try self.readBody();
             },
@@ -606,7 +599,7 @@ pub const Connection = struct {
                 self.worker.keep_alive -= 1;
 
                 // If the worker is quitting, we can close this connection
-                if (self.worker.state == .shutting_down or !self.request.keepAlive()) {
+                if (self.worker.state == .shutting_down or !self.ctx.request.keepAlive()) {
                     continue :state .close;
                 }
 
@@ -651,7 +644,7 @@ pub const Connection = struct {
     /// Writes the header into write_buf
     pub fn prepareHeader(self: *Connection) !void {
         var headers = &self.write_buf;
-        const resp = self.response;
+        const resp = self.ctx.response;
         const status = resp.status orelse .ok;
 
         // Base amount to cover start line, content-length, content-type, and trailing \r\n
@@ -699,15 +692,11 @@ pub const Connection = struct {
     /// Prepares a recv request to read the body of the request. If the body is fully read, the
     /// handler is called again
     pub fn readBody(self: *Connection) !void {
-        const head_len = self.request.headLen() orelse @panic("TODO");
-        const cl = self.request.contentLength() orelse @panic("TODO");
+        const head_len = self.ctx.request.headLen() orelse @panic("TODO");
+        const cl = self.ctx.request.contentLength() orelse @panic("TODO");
 
-        if (head_len + cl == self.request.bytes.items.len) {
-            return self.worker.handler.serveHttp(
-                &self.ctx,
-                self.response.responseWriter(),
-                self.request,
-            );
+        if (head_len + cl == self.ctx.request.bytes.items.len) {
+            return self.worker.handler.serveHttp(&self.ctx);
         }
 
         self.state = .reading_body;
@@ -733,7 +722,7 @@ pub const Connection = struct {
         self.state = .waiting_send_response;
 
         const headers = self.write_buf.items;
-        const body = switch (self.response.body) {
+        const body = switch (self.ctx.response.body) {
             .file => @panic("TODO"),
             .static => |s| s,
             .dynamic => |*d| d.items,
@@ -789,17 +778,19 @@ pub const Connection = struct {
     }
 
     fn reset(self: *Connection) void {
-        _ = self.arena.reset(.retain_capacity);
-        self.request = .{};
-        self.write_buf = .empty;
-        self.response = .{ .arena = self.arena.allocator() };
-        self.written = 0;
+        _ = self.arena.reset(.free_all);
+        self.ctx = .{
+            .arena = self.arena.allocator(),
+            .io = &self.worker.io,
+            .response = .{ .arena = self.arena.allocator() },
+        };
 
-        self.ctx.deadline = 0;
+        self.write_buf = .empty;
+        self.written = 0;
     }
 
     fn responseComplete(self: *Connection) bool {
-        return self.written == (self.write_buf.items.len + self.response.body.len());
+        return self.written == (self.write_buf.items.len + self.ctx.response.body.len());
     }
 };
 
@@ -822,15 +813,13 @@ test "server" {
         }
 
         pub fn serveHttp(
-            ptr: *anyopaque,
-            _: *hz.Context,
-            w: hz.ResponseWriter,
-            _: hz.Request,
+            ptr: ?*anyopaque,
+            ctx: *hz.Context,
         ) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.got_request = true;
-            try w.any().print("hello world", .{});
-            try w.flush();
+            try ctx.response.any().print("hello world", .{});
+            try ctx.response.flush();
             try self.server.stop();
         }
     };
