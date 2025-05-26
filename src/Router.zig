@@ -112,6 +112,8 @@ pub const Route = struct {
 
             if (startsWith(u8, route_segment, "{")) continue;
 
+            if (std.mem.eql(u8, route_segment, "*")) return true;
+
             if (!eqlIgnoreCase(route_segment, path_segment)) return false;
         }
     }
@@ -138,6 +140,9 @@ pub const Route = struct {
                 assert(std.mem.endsWith(u8, rhs_cmp, "}"));
                 continue;
             }
+
+            if (std.mem.eql(u8, lhs_cmp, "*")) return .gt;
+            if (std.mem.eql(u8, rhs_cmp, "*")) return .lt;
 
             if (lhs_cmp[0] == '{') {
                 assert(std.mem.endsWith(u8, lhs_cmp, "}"));
@@ -187,6 +192,13 @@ test "Route: lessThan" {
     }
 
     {
+        const lhs: Route = .{ .handlers = undefined, .pattern = "/a/*" };
+        const rhs: Route = .{ .handlers = undefined, .pattern = "/a/{b}" };
+        try expectEqual(Order.gt, lhs.compare(rhs));
+        try expectEqual(Order.lt, rhs.compare(lhs));
+    }
+
+    {
         const lhs: Route = .{ .handlers = undefined, .pattern = "/a/{b}/c" };
         const rhs: Route = .{ .handlers = undefined, .pattern = "/a/{b}/{c}" };
         try expectEqual(Order.lt, lhs.compare(rhs));
@@ -203,4 +215,5 @@ test "Route: match" {
     try expect(Route._match("/root/{p}", "/root/index.html"));
     try expect(Route._match("/root/{p}/abc", "/root/foo/abc"));
     try expect(!Route._match("/root/{p}/abc", "/root/foo/foo"));
+    try expect(Route._match("/*", "/root/foo/foo"));
 }
