@@ -258,11 +258,16 @@ pub fn listenAndServe(self: *Server, io: *ourio.Ring, handler: hz.Handler) !void
         self.worker = try .init(self.gpa, self.timeout, handler, self.addr, self);
         self.worker.io = try io.initChild(64);
         try posix.listen(self.worker.fd, 64);
-        self.worker.accept_task = try self.worker.io.accept(self.worker.fd, .{
-            .ptr = &self.worker,
-            .msg = @intFromEnum(Worker.Msg.new_connection),
-            .cb = Worker.handleMsg,
-        });
+        self.worker.accept_task = try self.worker.io.accept(
+            self.worker.fd,
+            &self.worker.new_conn_addr.any,
+            &self.worker.addr_size,
+            .{
+                .ptr = &self.worker,
+                .msg = @intFromEnum(Worker.Msg.new_connection),
+                .cb = Worker.handleMsg,
+            },
+        );
 
         var sock_len = self.addr.getOsSockLen();
         try posix.getsockname(self.worker.fd, &self.addr.any, &sock_len);
@@ -327,6 +332,8 @@ const Worker = struct {
     fd: posix.socket_t,
     accept_task: *ourio.Task,
     server: *Server,
+    new_conn_addr: net.Address,
+    addr_size: posix.socklen_t,
 
     /// Number of active completions we have on the queue that we want to wait for before gracefully
     /// shutting down
@@ -377,20 +384,19 @@ const Worker = struct {
             .keep_alive = 0,
             .accept_task = undefined,
             .server = server,
+            .new_conn_addr = undefined,
+            .addr_size = posix.sockaddr.SS_MAXSIZE,
         };
     }
 
     fn run(self: *Worker, main: *ourio.Ring) !void {
         self.io = try main.initChild(64);
         try posix.listen(self.fd, 64);
-        self.accept_task = try self.io.accept(
-            self.fd,
-            .{
-                .ptr = self,
-                .msg = @intFromEnum(Worker.Msg.new_connection),
-                .cb = Worker.handleMsg,
-            },
-        );
+        self.accept_task = try self.io.accept(self.fd, &self.new_conn_addr.any, &self.addr_size, .{
+            .ptr = self,
+            .msg = @intFromEnum(Worker.Msg.new_connection),
+            .cb = Worker.handleMsg,
+        });
 
         try self.io.run(.until_done);
     }
@@ -412,8 +418,12 @@ const Worker = struct {
                     }
                     return;
                 };
+                // We have to reset the addr_size before calling accept again
+                self.addr_size = posix.sockaddr.SS_MAXSIZE;
                 self.accept_task = try self.io.accept(
                     self.fd,
+                    &self.new_conn_addr.any,
+                    &self.addr_size,
                     .{
                         .ptr = self,
                         .msg = @intFromEnum(Worker.Msg.new_connection),
