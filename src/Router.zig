@@ -6,8 +6,11 @@ const horizon = @import("main.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+userdata: ?*anyopaque = null,
 routes: std.ArrayListUnmanaged(Route) = .empty,
-globals: std.ArrayListUnmanaged(horizon.Handler) = .empty,
+globals: std.ArrayListUnmanaged(horizon.HandleFn) = .empty,
+
+pub const init: Router = .{};
 
 pub fn deinit(self: *Router, gpa: Allocator) void {
     self.routes.deinit(gpa);
@@ -17,22 +20,23 @@ pub fn handler(self: *Router) horizon.Handler {
     return .{ .ptr = self, .serveFn = serveHttp };
 }
 
-pub fn use(self: *Router, gpa: Allocator, middleware: horizon.Handler) Allocator.Error!void {
+pub fn use(self: *Router, gpa: Allocator, middleware: horizon.HandleFn) Allocator.Error!void {
     try self.globals.append(gpa, middleware);
 }
 
-pub fn serveHttp(
-    ptr: ?*anyopaque,
-    ctx: *horizon.Context,
-) anyerror!void {
-    const self: *Router = @ptrCast(@alignCast(ptr));
+pub fn serveHttp(ctx: *horizon.Context) anyerror!void {
+    const self: *Router = @ptrCast(@alignCast(ctx.userdata));
+    ctx.userdata = self.userdata;
 
     const method = ctx.request.method();
     const path = ctx.request.path();
     for (self.routes.items) |route| {
         if (route.method == method and route.match(path)) {
             ctx.pattern = route.pattern;
-            const handlers = try ctx.arena.alloc(horizon.Handler, self.globals.items.len + route.handlers.len);
+            const handlers = try ctx.arena.alloc(
+                horizon.HandleFn,
+                self.globals.items.len + route.handlers.len,
+            );
             @memcpy(handlers[0..self.globals.items.len], self.globals.items);
             @memcpy(handlers[self.globals.items.len..], route.handlers);
             ctx.handlers = handlers;
@@ -40,9 +44,9 @@ pub fn serveHttp(
         }
     }
 
-    const handlers = try ctx.arena.alloc(horizon.Handler, self.globals.items.len + 1);
+    const handlers = try ctx.arena.alloc(horizon.HandleFn, self.globals.items.len + 1);
     @memcpy(handlers[0..self.globals.items.len], self.globals.items);
-    handlers[self.globals.items.len] = .{ .ptr = null, .serveFn = horizon.notFound };
+    handlers[self.globals.items.len] = horizon.notFound;
     ctx.handlers = handlers;
     return ctx.next();
 }
@@ -51,7 +55,7 @@ pub fn get(
     self: *Router,
     gpa: Allocator,
     pattern: []const u8,
-    handlers: []const horizon.Handler,
+    handlers: []const horizon.HandleFn,
 ) Allocator.Error!void {
     return self.addRoute(gpa, .GET, pattern, handlers);
 }
@@ -60,7 +64,7 @@ pub fn post(
     self: *Router,
     gpa: Allocator,
     pattern: []const u8,
-    handlers: []const horizon.Handler,
+    handlers: []const horizon.HandleFn,
 ) Allocator.Error!void {
     return self.addRoute(gpa, .POST, pattern, handlers);
 }
@@ -70,14 +74,14 @@ pub fn addRoute(
     gpa: Allocator,
     method: std.http.Method,
     pattern: []const u8,
-    handlers: []const horizon.Handler,
+    handlers: []const horizon.HandleFn,
 ) Allocator.Error!void {
     try self.routes.append(gpa, .{ .handlers = handlers, .method = method, .pattern = pattern });
     std.sort.pdq(Route, self.routes.items, {}, Route.lessThan);
 }
 
 pub const Route = struct {
-    handlers: []const horizon.Handler,
+    handlers: []const horizon.HandleFn,
     method: std.http.Method = .GET,
     pattern: []const u8,
 

@@ -11,7 +11,7 @@ pub const Server = @import("Server.zig");
 
 pub const Handler = struct {
     ptr: ?*anyopaque = null,
-    serveFn: *const fn (?*anyopaque, *Context) anyerror!void,
+    serveFn: HandleFn,
 
     /// Initialize a handler from a Type which has a serveHttp method
     pub fn init(comptime T: type, ptr: *T) Handler {
@@ -19,9 +19,12 @@ pub const Handler = struct {
     }
 
     pub fn serveHttp(self: Handler, ctx: *Context) anyerror!void {
-        return self.serveFn(self.ptr, ctx);
+        ctx.userdata = self.ptr;
+        return self.serveFn(ctx);
     }
 };
+
+pub const HandleFn = *const fn (*Context) anyerror!void;
 
 pub const Context = struct {
     /// Arena allocator which will be freed once the response has been written
@@ -37,8 +40,9 @@ pub const Context = struct {
     /// DB query asynchronously, etc
     io: *io.Ring,
 
+    userdata: ?*anyopaque = null,
     pattern: []const u8 = "",
-    handlers: []const Handler = &.{},
+    handlers: []const HandleFn = &.{},
     idx: usize = 0,
     request: Request = .{},
     response: Response,
@@ -73,7 +77,7 @@ pub const Context = struct {
                     self.idx += 1;
                 }
 
-                return handler.serveHttp(self);
+                return handler(self);
             },
 
             .unwind => {
@@ -85,7 +89,7 @@ pub const Context = struct {
                 }
                 self.idx -= 1;
                 const handler = self.handlers[self.idx];
-                return handler.serveHttp(self);
+                return handler(self);
             },
         }
     }
@@ -318,7 +322,7 @@ pub const HeaderIterator = struct {
     }
 };
 
-pub fn notFound(_: ?*anyopaque, ctx: *Context) anyerror!void {
+pub fn notFound(ctx: *Context) anyerror!void {
     try ctx.response.any().writeAll("404 page not found\n");
     ctx.response.setStatus(.not_found);
     try ctx.response.flush();

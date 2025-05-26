@@ -22,21 +22,19 @@ pub fn main() !void {
     try server.init(gpa, .{});
     defer server.deinit(gpa);
 
-    var my_handler: MyHandler = .{};
-
     var router: horizon.Router = .{};
     defer router.deinit(gpa);
 
-    try router.use(gpa, .{ .serveFn = requestLogger });
+    try router.use(gpa, requestLogger);
 
-    try router.get(gpa, "/", &.{my_handler.rootHandler()});
+    try router.get(gpa, "/", &.{handleRoot});
 
     try server.listenAndServe(&io, router.handler());
     std.log.debug("listening at {}", .{server.addr});
     try io.run(.until_done);
 }
 
-fn requestLogger(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
+fn requestLogger(ctx: *horizon.Context) anyerror!void {
     if (ctx.get("request_start_time")) |v| {
         std.log.err("status={} request took {d} microseconds", .{ ctx.response.status.?, std.time.microTimestamp() - @as(i64, @intCast(v.int)) });
     } else {
@@ -45,14 +43,8 @@ fn requestLogger(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
     return ctx.next();
 }
 
-const MyHandler = struct {
-    fn rootHandler(self: *MyHandler) horizon.Handler {
-        return .{ .ptr = self, .serveFn = handleRoot };
-    }
-
-    fn handleRoot(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
-        try ctx.response.any().print("root", .{});
-        ctx.response.setStatus(.ok);
-        return ctx.response.flush();
-    }
-};
+fn handleRoot(ctx: *horizon.Context) anyerror!void {
+    try ctx.response.any().print("root", .{});
+    ctx.response.setStatus(.ok);
+    return ctx.response.flush();
+}
