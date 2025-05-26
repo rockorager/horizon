@@ -412,6 +412,14 @@ const Worker = struct {
                     }
                     return;
                 };
+                self.accept_task = try self.io.accept(
+                    self.fd,
+                    .{
+                        .ptr = self,
+                        .msg = @intFromEnum(Worker.Msg.new_connection),
+                        .cb = Worker.handleMsg,
+                    },
+                );
                 const conn = try self.conn_pool.create(self.gpa);
 
                 try conn.init(self.gpa, self, fd);
@@ -737,7 +745,7 @@ pub const Connection = struct {
                 .body_only;
 
         const new_task = switch (wstate) {
-            .headers_only => try self.worker.io.write(self.fd, headers[self.written..], .{
+            .headers_only => try self.worker.io.write(self.fd, headers[self.written..], .beginning, .{
                 .ptr = self,
                 .msg = @intFromEnum(Connection.Msg.write_response),
                 .cb = Connection.handleMsg,
@@ -754,7 +762,7 @@ pub const Connection = struct {
                     .len = body.len,
                 };
 
-                break :blk try self.worker.io.writev(self.fd, &self.vecs, .{
+                break :blk try self.worker.io.writev(self.fd, &self.vecs, .beginning, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.write_response),
                     .cb = Connection.handleMsg,
@@ -764,7 +772,7 @@ pub const Connection = struct {
             .body_only => blk: {
                 const offset = self.written - headers.len;
                 const unwritten_body = body[offset..];
-                break :blk try self.worker.io.write(self.fd, unwritten_body, .{
+                break :blk try self.worker.io.write(self.fd, unwritten_body, .beginning, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.write_response),
                     .cb = Connection.handleMsg,

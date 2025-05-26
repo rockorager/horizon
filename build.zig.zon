@@ -15,8 +15,8 @@
             .hash = "tls-0.1.0-ER2e0pU3BQB-UD2_s90uvppceH_h4KZxtHCrCct8L054",
         },
         .ourio = .{
-            .url = "git+https://github.com/rockorager/ourio#54a2eae0fe28d5258b0982ea66b77e3d340e376c",
-            .hash = "ourio-0.0.0-_s-z0cQPAgAbjkkQLaiiDRRRYUZlSyYLQhXwZ_J32dj2",
+            .url = "git+https://github.com/rockorager/ourio#495efe91938c8348b221e5c193c803401557d6be",
+            .hash = "ourio-0.0.0-_s-z0aQJAgALOY0bWk9jLZ-L-yMjs9NUCZqbxvg5rXfF",
         },
     },
 
