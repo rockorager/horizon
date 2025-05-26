@@ -831,10 +831,9 @@ test "server" {
         }
 
         pub fn serveHttp(
-            ptr: ?*anyopaque,
             ctx: *hz.Context,
         ) anyerror!void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const self: *@This() = @ptrCast(@alignCast(ctx.userdata));
             self.got_request = true;
             try ctx.response.any().print("hello world", .{});
             try ctx.response.flush();

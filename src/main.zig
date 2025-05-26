@@ -42,7 +42,7 @@ pub const Context = struct {
 
     userdata: ?*anyopaque = null,
     pattern: []const u8 = "",
-    handlers: []const HandleFn = &.{},
+    handlers: []const *const fn (*Context) anyerror!void = &.{},
     idx: usize = 0,
     request: Request = .{},
     response: Response,
