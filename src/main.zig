@@ -46,8 +46,12 @@ pub const Context = struct {
     direction: enum { wind, unwind } = .wind,
 
     pub const Value = union(enum) {
-        int: i64,
-        bytes: []const u8,
+        int: i128,
+        string: []const u8,
+        list: []const []const u8,
+        bool: bool,
+        @"enum": u128,
+        pointer: ?*anyopaque,
     };
 
     pub fn put(self: *Context, key: []const u8, value: Value) Allocator.Error!void {

@@ -38,7 +38,7 @@ pub fn main() !void {
 
 fn requestLogger(_: ?*anyopaque, ctx: *horizon.Context) anyerror!void {
     if (ctx.get("request_start_time")) |v| {
-        std.log.err("status={} request took {d} microseconds", .{ ctx.response.status.?, std.time.microTimestamp() - v.int });
+        std.log.err("status={} request took {d} microseconds", .{ ctx.response.status.?, std.time.microTimestamp() - @as(i64, @intCast(v.int)) });
     } else {
         try ctx.put("request_start_time", .{ .int = std.time.microTimestamp() });
     }
