@@ -44,7 +44,6 @@ fn requestLogger(ctx: *horizon.Context) anyerror!void {
 }
 
 fn handleRoot(ctx: *horizon.Context) anyerror!void {
-    const rel = if (std.mem.eql(u8, "/", ctx.request.path())) "/index.html" else ctx.request.path();
-    const path = try std.fmt.allocPrintZ(ctx.arena, "/home/tim/repos/github.com/rockorager/rockorager.dev/public{s}", .{rel});
-    return ctx.serveFile(path);
+    const root = "/home/tim/repos/github.com/rockorager/rockorager.dev/public";
+    return ctx.serveFile(root, ctx.request.path());
 }

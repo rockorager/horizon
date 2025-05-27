@@ -10,6 +10,7 @@ const posix = std.posix;
 pub const Router = @import("Router.zig");
 pub const Server = @import("Server.zig");
 pub const mime = @import("mime.zig");
+pub const path = @import("path.zig");
 
 pub const Handler = struct {
     ptr: ?*anyopaque = null,
@@ -110,17 +111,21 @@ pub const Context = struct {
         return extractParam(self.pattern, self.request.path(), key);
     }
 
-    pub fn serveFile(self: *Context, path: [:0]const u8) !void {
-        _ = try self.io.open(path, .{ .CLOEXEC = true }, 0, .{
-            .cb = Context.serveFileCompletions,
-            .ptr = self,
-            .msg = @intFromEnum(ServeFileMsg.open),
-        });
+    pub fn serveFile(self: *Context, root: []const u8, unsafe_path: []const u8) !void {
+        const resolved = path.resolve(self.arena, root, unsafe_path) catch |err| {
+            switch (err) {
+                error.InvalidPath => {
+                    self.response.setStatus(.forbidden);
+                    return self.response.flush();
+                },
+                error.OutOfMemory => return err,
+            }
+        };
 
         self.response.body = .{ .file = .{ .fd = -1, .size = 0 } };
 
         const stat = try self.arena.create(io.Statx);
-        _ = try self.io.stat(path, stat, .{
+        _ = try self.io.stat(resolved, stat, .{
             .cb = Context.serveFileCompletions,
             .ptr = self,
             .msg = @intFromEnum(ServeFileMsg.stat),
@@ -135,35 +140,24 @@ pub const Context = struct {
         const result = task.result.?;
 
         switch (msg) {
-            .open => {
-                const fd = result.open catch |err| {
-                    switch (err) {
-                        error.FileNotFound => return notFound(self),
-                        else => {
-                            std.log.err("error={}", .{err});
-                            @panic("TODO");
-                        },
-                    }
-                };
-
-                self.response.body.file.fd = fd;
-
-                try self.put("serveFile.opened", .{ .bool = true });
-            },
-
             .stat => {
-                // TODO: If-Modified-Since / 304 Not Modified and Last-Modified handling
                 // TODO: Range / Accept-Range, Content-Range handling
-                // TODO: Range / Accept-Range, Content-Range handling
-                const statx = result.statx catch |err| {
-                    switch (err) {
-                        else => {
-                            std.log.err("error={}", .{err});
-                            @panic("TODO");
-                        },
-                    }
-                };
+                const statx = result.statx catch return notFound(self);
 
+                if (posix.S.ISDIR(statx.mode)) {
+                    // We automatically try to serve index.html
+                    const newpath = try std.fs.path.joinZ(
+                        self.arena,
+                        &.{ task.req.statx.path, "index.html" },
+                    );
+                    _ = try self.io.stat(newpath, statx, .{
+                        .cb = Context.serveFileCompletions,
+                        .ptr = self,
+                        .msg = @intFromEnum(ServeFileMsg.stat),
+                    });
+
+                    return;
+                }
                 self.response.body.file.size = statx.size;
 
                 // Last-Modified
@@ -219,21 +213,29 @@ pub const Context = struct {
                 const cl = try std.fmt.allocPrint(self.arena, "{d}", .{statx.size});
                 try self.response.setHeader("Content-Length", cl);
 
-                try self.put("serveFile.statx.done", .{ .bool = true });
+                _ = try self.io.open(task.req.statx.path, .{ .CLOEXEC = true }, 0, .{
+                    .cb = Context.serveFileCompletions,
+                    .ptr = self,
+                    .msg = @intFromEnum(ServeFileMsg.open),
+                });
             },
-        }
 
-        if (self.get("serveFile.statx.done") != null and self.get("serveFile.opened") != null) {
-            self.direction = .unwind;
-            return self.next();
+            .open => {
+                const fd = result.open catch return notFound(self);
+
+                self.response.body.file.fd = fd;
+
+                self.direction = .unwind;
+                return self.next();
+            },
         }
     }
 };
 
-fn extractParam(pattern: []const u8, path: []const u8, key: []const u8) ?[]const u8 {
+fn extractParam(pattern: []const u8, raw_path: []const u8, key: []const u8) ?[]const u8 {
     if (key.len == 0) return null;
     var iter = std.mem.splitScalar(u8, pattern, '/');
-    var path_iter = std.mem.splitScalar(u8, path, '/');
+    var path_iter = std.mem.splitScalar(u8, raw_path, '/');
     while (iter.next()) |segment| {
         const val = path_iter.next() orelse return null;
         if (!std.mem.startsWith(u8, segment, "{")) continue;
@@ -393,8 +395,11 @@ pub const Response = struct {
         const self: *Response = @constCast(@ptrCast(@alignCast(ptr)));
         switch (self.body) {
             .file => |file| {
-                // If we had set a file, we close the descriptor here
-                posix.close(file.fd);
+                if (file.fd >= 0) {
+                    const ctx: *Context = @alignCast(@fieldParentPtr("response", self));
+                    const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", ctx));
+                    _ = try conn.worker.io.close(file.fd, .{});
+                }
                 self.body = .{ .dynamic = .empty };
             },
             .static => self.body = .{ .dynamic = .empty },
@@ -469,6 +474,7 @@ test {
     _ = @import("Router.zig");
     _ = @import("Server.zig");
     _ = @import("mime.zig");
+    _ = @import("path.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
 }
