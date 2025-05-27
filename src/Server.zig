@@ -133,8 +133,8 @@ fn handleMsg(io: *ourio.Ring, task: ourio.Task) anyerror!void {
             switch (builtin.os.tag) {
                 .linux => {
                     const fd = self.worker.io.backend.pollableFd() catch unreachable;
-                    var buf: [8]u8 = undefined;
-                    _ = posix.read(fd, &buf) catch |err| {
+                    var count: u64 = 0;
+                    _ = posix.read(fd, std.mem.asBytes(&count)) catch |err| {
                         switch (err) {
                             error.WouldBlock => return,
                             else => {},
@@ -244,9 +244,9 @@ fn handleMsg(io: *ourio.Ring, task: ourio.Task) anyerror!void {
         },
     }
 
-    // We reap and submit our main worker ring here. It's possible that in this function our eventfd
-    // won't wake up when we send a msg_ring message. Both of these calls are nonblocking, and we
-    // only are in this function if we are shutting down, so we don't care too much about perf
+    // HACK: This first submit shouldn't be needed. But without it, we seem to idle out when
+    // connections happen on this worker.
+    try self.worker.io.backend.submit(&self.worker.io.submission_q);
     try self.worker.io.backend.reapCompletions(&self.worker.io);
     try self.worker.io.backend.submit(&self.worker.io.submission_q);
 }

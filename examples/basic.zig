@@ -18,8 +18,9 @@ pub fn main() !void {
     var io = try ourio.Ring.init(gpa, 64);
     defer io.deinit();
 
+    const addr = std.net.Address.parseIp4("127.0.0.1", 8083) catch unreachable;
     var server: horizon.Server = undefined;
-    try server.init(gpa, .{});
+    try server.init(gpa, .{ .addr = addr });
     defer server.deinit(gpa);
 
     var router: horizon.Router = .{};
@@ -44,6 +45,5 @@ fn requestLogger(ctx: *horizon.Context) anyerror!void {
 }
 
 fn handleRoot(ctx: *horizon.Context) anyerror!void {
-    const root = "/home/tim/repos/github.com/rockorager/rockorager.dev/public";
-    return ctx.serveFile(root, ctx.request.path());
+    return ctx.serveFile("/var/www/rockorager.dev", ctx.request.path());
 }
