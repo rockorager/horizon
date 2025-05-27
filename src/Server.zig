@@ -562,10 +562,10 @@ pub const Connection = struct {
                         // Keep the worker alive since we are now handling this request
                         self.worker.keep_alive += 1;
 
-                        // validate the request
-                        if (try self.ctx.request.isValid(&self.ctx.response)) {
-                            // Call the handler
+                        if (self.ctx.request.isValid()) {
                             try self.worker.handler.serveHttp(&self.ctx);
+                        } else |_| {
+                            try hz.errorResponse(&self.ctx, .bad_request, "Bad request", .{});
                         }
                     },
 

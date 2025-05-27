@@ -305,13 +305,7 @@ pub const Request = struct {
 
     /// Returns the HTTP method of this request
     pub fn method(self: Request) http.Method {
-        assert(self.receivedHeader());
-        // GET / HTTP/1.1
-        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n") orelse unreachable;
-        const line = self.bytes.items[0..idx];
-        const space = std.mem.indexOfScalar(u8, line, ' ') orelse @panic("TODO: bad request");
-        const val = http.Method.parse(line[0..space]);
-        return @enumFromInt(val);
+        return self.fallibleMethod() catch unreachable;
     }
 
     pub fn contentLength(self: Request) ?u64 {
@@ -339,17 +333,25 @@ pub const Request = struct {
     }
 
     /// Validates a request
-    pub fn isValid(self: Request, w: *Response) !bool {
-        _ = w;
-        const m = self.method();
-        if (m.requestHasBody()) {
-            // We require a content length
-            if (self.contentLength() == null) {
-                // try errorResponse(w, .bad_request, "Content-Length is required", .{});
-                return false;
-            }
+    pub fn isValid(self: Request) error{BadRequest}!void {
+        const m = try self.fallibleMethod();
+
+        if (!m.requestHasBody()) return;
+
+        // We require a content length
+        if (self.contentLength() == null) {
+            return error.BadRequest;
         }
-        return true;
+    }
+
+    fn fallibleMethod(self: Request) error{BadRequest}!http.Method {
+        assert(self.receivedHeader());
+        // GET / HTTP/1.1
+        const idx = std.mem.indexOf(u8, self.bytes.items, "\r\n") orelse unreachable;
+        const line = self.bytes.items[0..idx];
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.BadRequest;
+        const val = http.Method.parse(line[0..space]);
+        return @enumFromInt(val);
     }
 };
 
