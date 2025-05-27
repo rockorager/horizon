@@ -29,7 +29,7 @@ pub fn serveHttp(ctx: *horizon.Context) anyerror!void {
     ctx.userdata = self.userdata;
 
     const method = ctx.request.method();
-    const path = ctx.request.path();
+    const path = try std.fs.path.resolve(ctx.arena, &.{ctx.request.path()});
     for (self.routes.items) |route| {
         if (route.method == method and route.match(path)) {
             ctx.pattern = route.pattern;
@@ -76,6 +76,9 @@ pub fn addRoute(
     pattern: []const u8,
     handlers: []const horizon.HandleFn,
 ) Allocator.Error!void {
+    const path = try std.fs.path.resolve(gpa, &.{pattern});
+    defer gpa.free(path);
+    assert(std.mem.eql(u8, path, pattern));
     try self.routes.append(gpa, .{ .handlers = handlers, .method = method, .pattern = pattern });
     std.sort.pdq(Route, self.routes.items, {}, Route.lessThan);
 }
