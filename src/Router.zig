@@ -108,11 +108,10 @@ pub const Route = struct {
             const route_segment = route.next() orelse {
                 return p.next() == null;
             };
+            if (std.mem.eql(u8, route_segment, "*")) return true;
             const path_segment = p.next() orelse return false;
 
             if (startsWith(u8, route_segment, "{")) continue;
-
-            if (std.mem.eql(u8, route_segment, "*")) return true;
 
             if (!eqlIgnoreCase(route_segment, path_segment)) return false;
         }
@@ -216,4 +215,5 @@ test "Route: match" {
     try expect(Route._match("/root/{p}/abc", "/root/foo/abc"));
     try expect(!Route._match("/root/{p}/abc", "/root/foo/foo"));
     try expect(Route._match("/*", "/root/foo/foo"));
+    try expect(Route._match("/*", "/"));
 }

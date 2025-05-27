@@ -27,7 +27,7 @@ pub fn main() !void {
 
     try router.use(gpa, requestLogger);
 
-    try router.get(gpa, "/", &.{handleRoot});
+    try router.get(gpa, "/*", &.{handleRoot});
 
     try server.listenAndServe(&io, router.handler());
     std.log.debug("listening at {}", .{server.addr});
@@ -44,7 +44,7 @@ fn requestLogger(ctx: *horizon.Context) anyerror!void {
 }
 
 fn handleRoot(ctx: *horizon.Context) anyerror!void {
-    try ctx.response.any().print("root", .{});
-    ctx.response.setStatus(.ok);
-    return ctx.response.flush();
+    const rel = if (std.mem.eql(u8, "/", ctx.request.path())) "/index.html" else ctx.request.path();
+    const path = try std.fmt.allocPrintZ(ctx.arena, "/home/tim/repos/github.com/rockorager/rockorager.dev/public{s}", .{rel});
+    return ctx.serveFile(path);
 }

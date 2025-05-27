@@ -471,6 +471,7 @@ pub const Connection = struct {
     fd: posix.socket_t,
     write_buf: std.ArrayListUnmanaged(u8) = .empty,
     vecs: [2]posix.iovec_const = undefined,
+    pipe: ?[2]posix.fd_t = null,
     written: usize = 0,
 
     deadline: i64,
@@ -537,6 +538,8 @@ pub const Connection = struct {
         reading_headers,
         reading_body,
         write_response,
+        sendfile_lhs,
+        sendfile_rhs,
         close,
         destroy,
     };
@@ -634,7 +637,104 @@ pub const Connection = struct {
                 }
             },
 
+            .sendfile_lhs => {
+                const n = result.splice catch {
+                    // On error we are done and can let the worker softclose if it wants
+                    self.worker.keep_alive -= 1;
+                    continue :state .close;
+                };
+
+                const file = self.ctx.response.body.file;
+
+                if (n < task.req.splice.nbytes) {
+                    const w = self.pipe.?[1];
+
+                    const new_offset = n + task.req.splice.offset;
+                    const new_nbytes = task.req.splice.nbytes - new_offset;
+
+                    const null_offset: i64 = -1;
+                    const lhs = try self.worker.io.splice(
+                        file.fd,
+                        new_offset,
+                        w,
+                        @bitCast(null_offset),
+                        new_nbytes,
+                        .{
+                            .ptr = self,
+                            .msg = @intFromEnum(Connection.Msg.sendfile_lhs),
+                            .cb = Connection.handleMsg,
+                        },
+                    );
+
+                    if (self.worker.timeout.write > 0) {
+                        try lhs.setDeadline(&self.worker.io, .{ .sec = self.deadline });
+                    }
+
+                    return;
+                }
+
+                _ = try io.close(file.fd, .{});
+            },
+
+            .sendfile_rhs => {
+                const n = result.splice catch {
+                    // On error we are done and can let the worker softclose if it wants
+                    self.worker.keep_alive -= 1;
+                    continue :state .close;
+                };
+
+                if (n < task.req.splice.nbytes) {
+                    const r = self.pipe.?[0];
+
+                    const new_nbytes = task.req.splice.nbytes - n;
+
+                    const null_offset: i64 = -1;
+                    const rhs = try self.worker.io.splice(
+                        r,
+                        @bitCast(null_offset),
+                        self.fd,
+                        @bitCast(null_offset),
+                        new_nbytes,
+                        .{
+                            .ptr = self,
+                            .msg = @intFromEnum(Connection.Msg.sendfile_rhs),
+                            .cb = Connection.handleMsg,
+                        },
+                    );
+
+                    if (self.worker.timeout.write > 0) {
+                        try rhs.setDeadline(&self.worker.io, .{ .sec = self.deadline });
+                    }
+
+                    return;
+                }
+
+                self.worker.keep_alive -= 1;
+
+                // If the worker is quitting, we can close this connection
+                if (self.worker.state == .shutting_down or !self.ctx.request.keepAlive()) {
+                    continue :state .close;
+                }
+
+                // Keep the connection alive
+                self.reset();
+                const new_task = try io.recv(self.fd, &self.buf, .{
+                    .ptr = self,
+                    .msg = @intFromEnum(Connection.Msg.reading_headers),
+                    .cb = Connection.handleMsg,
+                });
+                if (self.worker.timeout.idle > 0) {
+                    self.deadline = std.time.timestamp() + self.worker.timeout.idle;
+                    try new_task.setDeadline(io, .{ .sec = self.deadline });
+                }
+            },
+
             .close => {
+                if (self.pipe) |pipe| {
+                    _ = try io.close(pipe[0], .{});
+                    _ = try io.close(pipe[1], .{});
+                    self.pipe = null;
+                }
                 _ = try io.close(self.fd, .{
                     .ptr = self,
                     .msg = @intFromEnum(Connection.Msg.destroy),
@@ -684,12 +784,17 @@ pub const Connection = struct {
         }
 
         if (resp.headers.get("Content-Length") == null) {
-            writer.print("Content-Length: {d}\r\n", .{resp.body.len()}) catch unreachable;
+            switch (status) {
+                .not_modified => {},
+                else => {
+                    writer.print("Content-Length: {d}\r\n", .{resp.body.len()}) catch unreachable;
+                },
+            }
         }
 
         if (resp.headers.get("Content-Type") == null) {
             const ct = switch (resp.body) {
-                .file => unreachable,
+                .file => "text/plain", // TODO: fix this
                 .static => |s| sniff.detectContentType(s),
                 .dynamic => |*d| sniff.detectContentType(d.items),
             };
@@ -741,7 +846,7 @@ pub const Connection = struct {
 
         const headers = self.write_buf.items;
         const body = switch (self.ctx.response.body) {
-            .file => @panic("TODO"),
+            .file => "",
             .static => |s| s,
             .dynamic => |*d| d.items,
         };
@@ -780,6 +885,9 @@ pub const Connection = struct {
             },
 
             .body_only => blk: {
+                if (self.ctx.response.body == .file) {
+                    return self.sendFile();
+                }
                 const offset = self.written - headers.len;
                 const unwritten_body = body[offset..];
                 break :blk try self.worker.io.write(self.fd, unwritten_body, .beginning, .{
@@ -792,6 +900,48 @@ pub const Connection = struct {
 
         if (self.worker.timeout.write > 0) {
             try new_task.setDeadline(&self.worker.io, .{ .sec = self.deadline });
+        }
+    }
+
+    fn sendFile(self: *Connection) !void {
+        if (self.pipe == null) {
+            self.pipe = try posix.pipe2(.{ .CLOEXEC = true });
+        }
+
+        const r = self.pipe.?[0];
+        const w = self.pipe.?[1];
+
+        const file = self.ctx.response.body.file;
+
+        const null_offset: i64 = -1;
+        const lhs = try self.worker.io.splice(
+            file.fd,
+            0,
+            w,
+            @bitCast(null_offset),
+            file.size,
+            .{
+                .ptr = self,
+                .msg = @intFromEnum(Connection.Msg.sendfile_lhs),
+                .cb = Connection.handleMsg,
+            },
+        );
+        const rhs = try self.worker.io.splice(
+            r,
+            @bitCast(null_offset),
+            self.fd,
+            @bitCast(null_offset),
+            file.size,
+            .{
+                .ptr = self,
+                .msg = @intFromEnum(Connection.Msg.sendfile_rhs),
+                .cb = Connection.handleMsg,
+            },
+        );
+
+        if (self.worker.timeout.write > 0) {
+            try lhs.setDeadline(&self.worker.io, .{ .sec = self.deadline });
+            try rhs.setDeadline(&self.worker.io, .{ .sec = self.deadline });
         }
     }
 

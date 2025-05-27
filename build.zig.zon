@@ -7,16 +7,16 @@
 
     .dependencies = .{
         .zeit = .{
-            .url = "git+https://github.com/rockorager/zeit#175cf91a641790799e9d676878a9fe814aaed134",
-            .hash = "zeit-0.6.0-5I6bk5daAgC-P60TjxRqW0bYknfCGxJp-03eS9UjGrO7",
+            .url = "git+https://github.com/rockorager/zeit#5429d2a108053d9ae9de00035dc1749b926b7649",
+            .hash = "zeit-0.6.0-5I6bk697AgAjrCWnmInbXTZ98avC1JtELxiYd-YU9cc2",
         },
         .tls = .{
             .url = "git+https://github.com/ianic/tls.zig#8250aa9184fbad99983b32411bbe1a5d2fd6f4b7",
             .hash = "tls-0.1.0-ER2e0pU3BQB-UD2_s90uvppceH_h4KZxtHCrCct8L054",
         },
         .ourio = .{
-            .url = "git+https://github.com/rockorager/ourio#d599f7cdfe73dd27092c895177b74b93352b38cb",
-            .hash = "ourio-0.0.0-_s-z0a0KAgAlimq5OBhm7_NzB1KQSU86FyUeCmo0QHsV",
+            .url = "git+https://github.com/rockorager/ourio#43a814434b46e0e85871f6dfe2ec4e96ef40b691",
+            .hash = "ourio-0.0.0-_s-z0VwWAgADPKVvsWQ2QVV36QNtTfP8YAJYjALnZh1w",
         },
     },
 

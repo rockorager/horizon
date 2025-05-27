@@ -1,5 +1,6 @@
 const std = @import("std");
 const io = @import("ourio");
+const zeit = @import("zeit");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -8,6 +9,7 @@ const posix = std.posix;
 
 pub const Router = @import("Router.zig");
 pub const Server = @import("Server.zig");
+pub const mime = @import("mime.zig");
 
 pub const Handler = struct {
     ptr: ?*anyopaque = null,
@@ -69,11 +71,10 @@ pub const Context = struct {
     pub fn next(self: *Context) anyerror!void {
         switch (self.direction) {
             .wind => {
+                assert(self.idx < self.handlers.len);
                 const handler = self.handlers[self.idx];
 
-                if (self.idx == self.handlers.len - 1) {
-                    self.direction = .unwind;
-                } else {
+                if (self.idx < self.handlers.len - 1) {
                     self.idx += 1;
                 }
 
@@ -107,6 +108,125 @@ pub const Context = struct {
 
     pub fn param(self: Context, key: []const u8) ?[]const u8 {
         return extractParam(self.pattern, self.request.path(), key);
+    }
+
+    pub fn serveFile(self: *Context, path: [:0]const u8) !void {
+        _ = try self.io.open(path, .{ .CLOEXEC = true }, 0, .{
+            .cb = Context.serveFileCompletions,
+            .ptr = self,
+            .msg = @intFromEnum(ServeFileMsg.open),
+        });
+
+        self.response.body = .{ .file = .{ .fd = -1, .size = 0 } };
+
+        const stat = try self.arena.create(io.Statx);
+        _ = try self.io.stat(path, stat, .{
+            .cb = Context.serveFileCompletions,
+            .ptr = self,
+            .msg = @intFromEnum(ServeFileMsg.stat),
+        });
+    }
+
+    const ServeFileMsg = enum { open, stat };
+
+    fn serveFileCompletions(_: *io.Ring, task: io.Task) anyerror!void {
+        const self = task.userdataCast(Context);
+        const msg = task.msgToEnum(ServeFileMsg);
+        const result = task.result.?;
+
+        switch (msg) {
+            .open => {
+                const fd = result.open catch |err| {
+                    switch (err) {
+                        error.FileNotFound => return notFound(self),
+                        else => {
+                            std.log.err("error={}", .{err});
+                            @panic("TODO");
+                        },
+                    }
+                };
+
+                self.response.body.file.fd = fd;
+
+                try self.put("serveFile.opened", .{ .bool = true });
+            },
+
+            .stat => {
+                // TODO: If-Modified-Since / 304 Not Modified and Last-Modified handling
+                // TODO: Range / Accept-Range, Content-Range handling
+                // TODO: Range / Accept-Range, Content-Range handling
+                const statx = result.statx catch |err| {
+                    switch (err) {
+                        else => {
+                            std.log.err("error={}", .{err});
+                            @panic("TODO");
+                        },
+                    }
+                };
+
+                self.response.body.file.size = statx.size;
+
+                // Last-Modified
+                {
+                    const inst = zeit.instant(.{ .source = .{
+                        .unix_timestamp = statx.mtime.sec,
+                    } }) catch unreachable;
+                    const time = inst.time();
+
+                    const days = zeit.daysFromCivil(.{
+                        .year = time.year,
+                        .month = time.month,
+                        .day = time.day,
+                    });
+                    const weekday = zeit.weekdayFromDays(days);
+
+                    const last_mod = try std.fmt.allocPrint(
+                        self.arena,
+                        "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT",
+                        .{
+                            weekday.shortName(),
+                            time.day,
+                            time.month.shortName(),
+                            time.year,
+                            time.hour,
+                            time.minute,
+                            time.second,
+                        },
+                    );
+                    try self.response.setHeader("Last-Modified", last_mod);
+                }
+
+                // If-Modified-Since
+                {
+                    if (self.request.getHeader("If-Modified-Since")) |since| blk: {
+                        const since_inst = zeit.instant(.{ .source = .{ .rfc1123 = since } }) catch
+                            break :blk;
+                        if (statx.mtime.sec < since_inst.unixTimestamp()) {
+                            self.response.setStatus(.not_modified);
+                            return self.response.flush();
+                        }
+                    }
+                }
+
+                self.response.setStatus(.ok);
+                const ct: []const u8 = blk: {
+                    const ext = std.fs.path.extension(task.req.statx.path);
+                    break :blk mime.typeByExtension.get(ext) orelse
+                        "application/octet-stream";
+                };
+                try self.response.setHeader("Content-Type", ct);
+
+                const cl = try std.fmt.allocPrint(self.arena, "{d}", .{statx.size});
+                try self.response.setHeader("Content-Length", cl);
+
+                try self.put("serveFile.statx.done", .{ .bool = true });
+            },
+        }
+
+        if (self.get("serveFile.statx.done") != null and self.get("serveFile.opened") != null) {
+            self.direction = .unwind;
+            return self.next();
+        }
     }
 };
 
@@ -348,6 +468,7 @@ pub fn errorResponse(
 test {
     _ = @import("Router.zig");
     _ = @import("Server.zig");
+    _ = @import("mime.zig");
     _ = @import("pool.zig");
     _ = @import("sniff.zig");
 }
