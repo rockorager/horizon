@@ -103,7 +103,6 @@ pub const Context = struct {
 
     pub fn readBody(self: *Context) !void {
         const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
-        assert(conn.request.body() == null);
         try conn.readBody();
     }
 
@@ -310,11 +309,11 @@ pub const Request = struct {
 
     pub fn contentLength(self: Request) ?u64 {
         const value = self.getHeader("Content-Length") orelse return null;
-        return std.fmt.parseUnsigned(u64, value, 10) catch @panic("TODO: bad content length");
+        return std.fmt.parseUnsigned(u64, value, 10) catch return null;
     }
 
-    pub fn host(self: Request) []const u8 {
-        return self.getHeader("Host") orelse @panic("TODO: no host header");
+    pub fn host(self: Request) ?[]const u8 {
+        return self.getHeader("Host");
     }
 
     pub fn keepAlive(self: Request) bool {
