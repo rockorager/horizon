@@ -19,18 +19,24 @@ pub fn main() !void {
     defer io.deinit();
 
     const addr = std.net.Address.parseIp4("127.0.0.1", 8083) catch unreachable;
-    var server: horizon.Server = undefined;
-    try server.init(gpa, .{ .addr = addr });
-    defer server.deinit(gpa);
 
     var router: horizon.Router = .{};
     defer router.deinit(gpa);
 
-    try router.use(gpa, requestLogger);
+    // try router.use(gpa, requestLogger);
 
     try router.get(gpa, "/*", &.{handleRoot});
 
-    try server.listenAndServe(&io, router.handler());
+    var server: horizon.Server = .{
+        .gpa = gpa,
+        .addr = addr,
+        .handler = router.handler(),
+    };
+    // var server: horizon.Server = undefined;
+    // try server.init(gpa, .{ .addr = addr, .workers = 2 });
+    defer server.deinit();
+
+    try server.listenAndServe(&io);
     std.log.debug("listening at {}", .{server.addr});
     try io.run(.until_done);
 }

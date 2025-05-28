@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const http = std.http;
 const posix = std.posix;
 
+pub const Connection = @import("Connection.zig");
 pub const Router = @import("Router.zig");
 pub const Server = @import("Server.zig");
 pub const mime = @import("mime.zig");
@@ -84,7 +85,7 @@ pub const Context = struct {
 
             .unwind => {
                 if (self.idx == 0) {
-                    const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", self));
+                    const conn: *Connection = @alignCast(@fieldParentPtr("ctx", self));
                     try conn.prepareResponse();
                     try conn.sendResponse();
                     return;
@@ -398,8 +399,8 @@ pub const Response = struct {
             .file => |file| {
                 if (file.fd >= 0) {
                     const ctx: *Context = @alignCast(@fieldParentPtr("response", self));
-                    const conn: *Server.Connection = @alignCast(@fieldParentPtr("ctx", ctx));
-                    _ = try conn.worker.io.close(file.fd, .{});
+                    const conn: *Connection = @alignCast(@fieldParentPtr("ctx", ctx));
+                    _ = try conn.server.io.close(file.fd, .{});
                 }
                 self.body = .{ .dynamic = .empty };
             },
