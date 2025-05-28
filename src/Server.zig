@@ -49,6 +49,9 @@ pub fn deinit(self: *Server) void {
 }
 
 pub fn listenAndServe(self: *Server, io: *ourio.Ring) !void {
+    const limit = try posix.getrlimit(posix.rlimit_resource.NOFILE);
+    try posix.setrlimit(posix.rlimit_resource.NOFILE, .{ .cur = limit.max, .max = limit.max });
+
     self.io = io;
     const flags = posix.SOCK.STREAM | posix.SOCK.CLOEXEC;
 
